@@ -87,6 +87,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | `/harness continue [指示]` | エスカレーション後、カウンタをリセットしてループを継続（新しいセッション） |
 | `/harness rejoin` | 保留したバグ修正フローの結果を実装フローへ合流 |
 | `/harness abort` | フローを中止 |
+| `/harness models` | 各プロセスに適用されるモデル・思考レベルを表示 |
 | `/harness config` | 有効な設定を表示 |
 
 ### エージェント用ツール（拡張が登録）
@@ -128,7 +129,13 @@ pi -e ~/piHarness/extensions/harness/index.ts
   "issueLabels": [],
   "ensureLabels": true,
   "testOutputLines": 120,
-  "autoHandoff": true
+  "autoHandoff": true,
+  "models": {
+    "default": "anthropic/claude-sonnet-5",
+    "requirements": { "model": "anthropic/claude-opus-5-5", "thinking": "high" },
+    "review": { "model": "anthropic/claude-opus-5-5", "thinking": "high" },
+    "implement": { "thinking": "medium" }
+  }
 }
 ```
 
@@ -146,6 +153,32 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | `ensureLabels` | true | 存在しないラベルを自動作成 |
 | `testOutputLines` | 120 | モデルに渡すテスト出力の末尾行数（全文はログに保存） |
 | `autoHandoff` | true | プロセス完了時に自動で新しいセッションを開始する。false なら `/harness next` で手動開始 |
+| `models` | {} | プロセスごとのモデル・思考レベル（下記） |
+
+### プロセスごとのモデル（`models`）
+
+各プロセスは独立したセッションなので、プロセスごとに別のモデルと思考レベルを使えます。
+新しいセッションの開始時に、そのプロセスの設定が適用されます。設定は Pi の既定モデルを変えず、そのセッションにだけ効きます。
+
+| キー | 対象プロセス |
+|------|-------------|
+| `default` | 個別指定のないプロセス全体 |
+| `requirements` | 要件定義（ヒアリング・ドキュメント作成） |
+| `issues` | Issue 登録 |
+| `plan` | Issue/コード読込・テスト/実装プラン作成 |
+| `implement` | TDD 実装 |
+| `review` | コードレビュー（各周回） |
+| `fix` | レビュー指摘修正（各周回） |
+| `bugfix` | バグ修正 |
+
+- 値は `"provider/model-id"` の文字列、または `{ "model": "provider/model-id", "thinking": "high" }`。
+  `model-id` だけでも、プロバイダーが一意に決まれば指定できます。
+- `thinking` は `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` から選びます。モデルの対応範囲に丸められます。
+- プロセス個別の指定にない項目は `default` の値を使います。どちらにもなければ Pi の既定値のままです。
+- 指定したモデルが見つからない場合や、認証が未設定の場合は、警告を出して既定のモデルで続行します。
+- `/harness models` で各プロセスに実際に使われるモデルを確認できます。利用可能なモデルの一覧は `pi --list-models` で確認できます。
+
+例えば「計画とレビューは高性能モデル、実装は速いモデル」「ラズパイ上のローカル LLM（Ollama など）は Issue 登録のような軽いプロセスだけ」といった使い分けができます。
 
 成果物の md ファイルは Issue ごとの作業記録としてコミットしても構いません。状態ファイルとテストログは `.gitignore` を推奨します:
 

@@ -107,6 +107,8 @@ export interface HarnessState {
 	itemDir?: string;
 	/** プロセスが切り替わり、新しいセッションでの開始を待っている */
 	pendingHandoff?: PendingHandoff;
+	/** 拡張が作成した新しいセッションの開始処理中（そのプロセス用のモデルを適用する目印） */
+	kickoff?: ProcessKind;
 	/** エスカレーション・バグ修正の通し番号（成果物のファイル名に使用） */
 	counters: { escalations: number; bugs: number };
 	topic?: string;

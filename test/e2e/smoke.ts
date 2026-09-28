@@ -5,7 +5,7 @@
  *   npm run test:e2e
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
@@ -30,7 +30,13 @@ writeFileSync(
 	}),
 );
 
-const faux = fauxProvider();
+const faux = fauxProvider({ models: [{ id: "worker" }, { id: "reviewer", reasoning: true }] });
+// プロセスごとのモデル設定: レビューだけ別モデル + 高い思考レベル、それ以外は default
+mkdirSync(join(project, ".pi"), { recursive: true });
+writeFileSync(
+	join(project, ".pi/harness.json"),
+	JSON.stringify({ models: { default: "faux/worker", review: { model: "faux/reviewer", thinking: "high" } } }),
+);
 const call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 const done = (text: string) => fauxAssistantMessage(text);
 
@@ -258,7 +264,18 @@ assert.match(r.at(-1) ?? "", /2 件の Issue をMarkdown として docs\/issues\
 assert.deepEqual(readdirSync(join(project, "docs/issues")).sort(), ["01-センサー読み取り.md", "02-sqlite-保存.md"]);
 assert.match(readFileSync(join(project, "docs/issues/02-sqlite-保存.md"), "utf8"), /## 依存関係[\s\S]*- センサー読み取り/);
 
+// プロセスごとのモデル: レビューセッション（4, 6, 合流後のレビュー）だけ reviewer + thinking high
+const reviewSessions = new Set([4, 6, bugSession + 1]);
+sessionsSeen.forEach((session, i) => {
+	const no = i + 1;
+	if (no === 1) return; // pi 起動直後のセッション（ハーネス外）
+	const expected = reviewSessions.has(no) ? "reviewer" : "worker";
+	assert.equal(session.model?.id, expected, `セッション ${no} のモデル`);
+	if (reviewSessions.has(no)) assert.equal(session.thinkingLevel, "high", `セッション ${no} の思考レベル`);
+});
+
 const state = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8"));
+assert.equal(state.kickoff, undefined);
 assert.equal(state.phase, "req_done");
 assert.equal(state.pendingHandoff, undefined);
 

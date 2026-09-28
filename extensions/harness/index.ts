@@ -16,7 +16,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type HarnessConfig, loadConfig, saveConfigPatch } from "./config.ts";
+import { findModel, type HarnessConfig, loadConfig, resolveProcessModel, saveConfigPatch } from "./config.ts";
 import { checkBash, checkWrite, type GuardPaths, isHarnessFile, STATE_FILE } from "./guard.ts";
 import { buildContext } from "./guidance.ts";
 import {
@@ -57,6 +57,7 @@ import {
 	markDirty,
 	PHASE_LABELS,
 	type Phase,
+	type ProcessKind,
 	processOf,
 	recordIssues,
 	recordReview,
@@ -170,8 +171,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 		const kickoff = kickoffMessage(state, exists, note);
 		writeItemFile(ctx, pathsOf(state).handoff, handoffRecord(state, exists), true);
 		const pending = state.pendingHandoff;
-		setState(clearHandoff(state), ctx);
-		const proc = processOf(state);
+		const proc = processOf(state) ?? undefined;
+		// 新しいセッションの session_start でこのプロセス用のモデルを適用するための目印
+		setState({ ...clearHandoff(state), kickoff: proc }, ctx);
 		const title = `${state.issue?.number ? `#${state.issue.number} ` : ""}${proc ? PROCESS_LABELS[proc] : ""}`;
 		const result = await ctx.newSession({
 			withSession: async (next) => {
@@ -184,7 +186,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		});
 		if (result.cancelled) {
 			// 新セッションが開始されなかった場合は、次回 /harness next で再試行できるよう待ち状態に戻す
-			if (pending) setState({ ...state, pendingHandoff: pending }, ctx);
+			setState({ ...state, kickoff: undefined, ...(pending ? { pendingHandoff: pending } : {}) }, ctx);
 			ctx.ui.notify("新しいセッションの開始がキャンセルされました。/harness next で再開できます。", "warning");
 		}
 	}
@@ -240,8 +242,54 @@ export default function piHarness(pi: ExtensionAPI): void {
 	// セッション・イベント
 	// -----------------------------------------------------------------------
 
+	/**
+	 * プロセスに設定されたモデル・思考レベルを現在のセッションに適用する。
+	 * 設定が無ければ何もしない（Pi の既定モデルのまま）。失敗しても処理は続け、警告だけ出す。
+	 */
+	async function applyProcessModel(ctx: ExtensionContext, proc: ProcessKind): Promise<string | undefined> {
+		const setting = resolveProcessModel(cfgOf(ctx).models, proc);
+		const applied: string[] = [];
+		if (setting.model) {
+			// getAvailable() は起動直後に認証状態の反映が遅れることがあるため、全カタログから探して認証は setModel に判定させる
+			const { model, error } = findModel(setting.model, ctx.modelRegistry.getAll());
+			if (!model) {
+				ctx.ui.notify(`[piHarness] ${PROCESS_LABELS[proc]}: ${error} 既定のモデルを使用します。`, "warning");
+			} else if (!(await setModelWhenReady(ctx, model))) {
+				ctx.ui.notify(`[piHarness] ${PROCESS_LABELS[proc]}: ${setting.model} の認証が設定されていません。既定のモデルを使用します。`, "warning");
+			} else {
+				applied.push(`${model.provider}/${model.id}`);
+			}
+		}
+		if (setting.thinking) {
+			pi.setThinkingLevel(setting.thinking);
+			applied.push(`thinking: ${pi.getThinkingLevel()}`);
+		}
+		return applied.length ? applied.join(", ") : undefined;
+	}
+
+	/**
+	 * pi.setModel は認証状態のスナップショットで判定するが、新しいセッションの直後はスナップショットの更新が
+	 * 非同期で遅れることがある。失敗したら非同期の認証解決で本当に未設定か確かめ、設定済みなら少し待って再試行する。
+	 */
+	async function setModelWhenReady(ctx: ExtensionContext, model: Parameters<typeof pi.setModel>[0]): Promise<boolean> {
+		if (await pi.setModel(model)) return true;
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model).catch(() => ({ ok: false as const }));
+		if (!auth.ok) return false;
+		for (let i = 0; i < 30; i++) {
+			await new Promise((r) => setTimeout(r, 100));
+			if (await pi.setModel(model)) return true;
+		}
+		return false;
+	}
+
 	pi.on("session_start", async (_e, ctx) => {
 		state = loadState(ctx);
+		if (state.kickoff) {
+			const proc = state.kickoff;
+			setState({ ...state, kickoff: undefined }, ctx);
+			const applied = await applyProcessModel(ctx, proc);
+			if (applied) ctx.ui.notify(`piHarness: ${PROCESS_LABELS[proc]} のモデル → ${applied}`, "info");
+		}
 		refreshUI(ctx);
 		const { warnings } = loadConfig(ctx.cwd);
 		for (const w of warnings) ctx.ui.notify(`[piHarness] ${w}`, "warning");
@@ -763,11 +811,11 @@ export default function piHarness(pi: ExtensionAPI): void {
 		},
 	});
 
-	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "continue", "rejoin", "abort", "config"];
+	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "continue", "rejoin", "abort", "models", "config"];
 
 	pi.registerCommand("harness", {
 		description:
-			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | continue [指示] | rejoin | abort | config",
+			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | continue [指示] | rejoin | abort | models | config",
 		getArgumentCompletions: (prefix) => SUBCOMMANDS.filter((s) => s.startsWith(prefix.trim())).map((s) => ({ value: s, label: s })),
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = args.trim().split(/\s+/);
@@ -778,8 +826,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 				switch (sub) {
 					case "status": {
 						const body = isActive(state) ? buildContext(state, cfg, processIO(state, existsIn(ctx))) : "アクティブなフローはありません。";
+						const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(未設定)";
 						const recent = state.log.slice(-8).map((l) => `  ${l.at.slice(11, 19)} ${l.event}`).join("\n");
-						ctx.ui.notify(`${body}\n\n最近のイベント:\n${recent || "  なし"}`, "info");
+						ctx.ui.notify(`${body}\n現在のモデル: ${current}（thinking: ${pi.getThinkingLevel()}）\n\n最近のイベント:\n${recent || "  なし"}`, "info");
 						return;
 					}
 					case "next": {
@@ -837,6 +886,23 @@ export default function piHarness(pi: ExtensionAPI): void {
 						if (ctx.hasUI && !(await ctx.ui.confirm("フローを中止しますか？", `${state.flow} / ${PHASE_LABELS[state.phase]}`))) return;
 						setState(finishFlow(state, text || "ユーザーが中止"), ctx);
 						ctx.ui.notify("フローを中止しました。", "info");
+						return;
+					}
+					case "models": {
+						const catalogue = ctx.modelRegistry.getAll();
+						const rows = (["requirements", "issues", "plan", "implement", "review", "fix", "bugfix"] as ProcessKind[]).map((proc) => {
+							const setting = resolveProcessModel(cfg.models, proc);
+							const found = setting.model ? findModel(setting.model, catalogue) : undefined;
+							const model = !setting.model
+								? "(Pi の既定)"
+								: !found?.model
+									? `${setting.model} ⚠ ${found?.error ?? ""}`
+									: ctx.modelRegistry.hasConfiguredAuth(found.model)
+										? setting.model
+										: `${setting.model} ⚠ 認証が未設定`;
+							return `  ${PROCESS_LABELS[proc].padEnd(12, "　")} ${model}${setting.thinking ? `  thinking: ${setting.thinking}` : ""}`;
+						});
+						ctx.ui.notify(`プロセスごとのモデル（.pi/harness.json の models）:\n${rows.join("\n")}`, "info");
 						return;
 					}
 					case "config": {

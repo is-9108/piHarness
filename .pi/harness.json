@@ -11,5 +11,6 @@
   "workDir": ".pi/harness",
   "issueLabels": [],
   "ensureLabels": true,
-  "autoHandoff": true
+  "autoHandoff": true,
+  "models": {}
 }
