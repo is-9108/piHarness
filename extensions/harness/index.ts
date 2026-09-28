@@ -86,7 +86,7 @@ import {
 	withHandoff,
 } from "./state.ts";
 import { slugify, tailLines, timestamp } from "./text.ts";
-import { HARNESS_TOOLS, toolsForProcess } from "./tools.ts";
+import { toolsForProcess } from "./tools.ts";
 import { compactionInstructions, shouldCompact } from "./compaction.ts";
 
 const CONTEXT_MESSAGE = "harness-context";
@@ -140,7 +140,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	function refreshUI(ctx: ExtensionContext): void {
 		const line = statusLine(state);
-		ctx.ui.setStatus("harness", line ? `🧭 ${line}` : undefined);
+		// フロー外では、話しかけて開始できることを示す
+		ctx.ui.setStatus("harness", line ? `🧭 ${line}` : "🧭 piHarness: 作りたいもの・実装したい Issue・直したい不具合を話しかけてください");
 	}
 
 	const gitRun =
@@ -435,7 +436,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) {
 			return reply(
 				`${detail}\n\n[ESCALATED] 作業を止め、状況（試したこと・失敗の原因仮説・選択肢）をユーザーに報告してください。` +
-					"ユーザーは /harness continue（ループ継続）, /bugfix（独立したバグ修正フロー）, /harness abort（中止）から選べます。",
+					"ユーザーはチャットで「ループを続けて」「バグ修正して」「やめたい」のように伝えるか、/harness continue・/bugfix・/harness abort で選べます。",
 				true,
 			);
 		}
@@ -465,7 +466,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		}
 		return reply(
 			`${detail}\n\nユーザー判断: 手動で対応（フロー一時停止）。作業を止め、ここまでの状況を簡潔に報告してください。` +
-				"再開は /harness continue、バグ修正フローは /bugfix です。",
+				"再開・バグ修正・中止はチャットで伝えてもらえば、確認のうえ実行します（/harness continue・/bugfix・/harness abort でも可）。",
 			true,
 		);
 	}
@@ -527,15 +528,10 @@ export default function piHarness(pi: ExtensionAPI): void {
 		return false;
 	}
 
-	/** 現在のプロセスに必要なツールだけを有効にする（フロー外では全ツールを戻す） */
+	/** 現在のプロセスに必要なツールだけを有効にする（フロー外では状態確認と自然言語からの開始だけ） */
 	function applyProcessTools(): void {
 		const proc = isActive(state) && !state.pendingHandoff ? processOf(state) : null;
 		const registered = pi.getAllTools().map((t) => t.name);
-		if (!proc) {
-			const missing = HARNESS_TOOLS.filter((t) => registered.includes(t) && !pi.getActiveTools().includes(t));
-			if (missing.length) pi.setActiveTools([...pi.getActiveTools(), ...missing]);
-			return;
-		}
 		pi.setActiveTools(toolsForProcess(pi.getActiveTools(), registered, proc));
 	}
 
@@ -679,7 +675,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 			else interruptedForCompaction = false;
 		}
 		if (!state.pendingHandoff) return;
-		if (cfgOf(ctx).autoHandoff) {
+		if (cfgOf(ctx).autoHandoff || forceHandoff) {
+			forceHandoff = false;
 			pi.sendUserMessage("/harness next", { expandPromptTemplates: true });
 		} else {
 			ctx.ui.notify(`次のプロセス「${PROCESS_LABELS[state.pendingHandoff.to]}」は /harness next で新しいセッションとして開始します。`, "info");
@@ -737,12 +734,135 @@ export default function piHarness(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "harness_status",
 		label: "Harness Status",
-		description: "piHarness のワークフロー状態（フロー・フェーズ・プロセスの入出力成果物・ループ回数・次にやること）を取得する。",
-		promptSnippet: "Show piHarness workflow state (process, artifacts, loop counters, next action)",
-		parameters: Type.Object({}),
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			if (!isActive(state)) return reply("piHarness: アクティブなフローはありません。/req, /impl, /bugfix で開始できます。");
+		description:
+			"piHarness の状態を取得する。view: state = フロー・フェーズ・成果物・ループ回数・次にやること（既定）/ issues = 登録した Issue の進み具合 / usage = モデル利用量。ユーザーに「今どうなっている？」「進み具合は？」「どれくらい使った？」と聞かれたときに使う。",
+		promptSnippet: "Show piHarness state, issue progress or model usage",
+		parameters: Type.Object({
+			view: Type.Optional(StringEnum(["state", "issues", "usage"] as const, { description: "表示する内容（既定: state）" })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (params.view === "issues") {
+				await refreshRegistryFromGitHub(ctx, cfgOf(ctx));
+				return reply(progressTable(loadRegistry(ctx)));
+			}
+			if (params.view === "usage") {
+				if (!state.itemDir) return reply("利用量の記録はまだありません。");
+				return reply(usageMarkdown(loadUsage(ctx, state.itemDir), PROCESS_LABELS));
+			}
+			if (!isActive(state)) return reply("piHarness: 進行中のフローはありません。ユーザーの依頼に応じて harness_control で要件定義・実装・バグ修正を開始できます（開始前にユーザーの確認を取ります）。");
 			return reply(buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx))));
+		},
+	});
+
+	/** ツールから開始したフローは autoHandoff の設定にかかわらず新しいセッションで始める（ユーザーが確認済みのため） */
+	let forceHandoff = false;
+
+	pi.registerTool({
+		name: "harness_control",
+		label: "Harness Control",
+		description:
+			"ユーザーの自然言語の依頼から piHarness のフローを開始・操作する。実行前に必ずユーザーへ確認ダイアログを出し、承認された場合だけ実行する。" +
+			"action: start_requirements（新しい機能・アプリを作りたい、要件を固めたい）/ start_implement（Issue を実装したい。issue に番号・URL・docs/issues/*.md、指定が無ければ next = 次に着手できる Issue）/ " +
+			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ continue_loop（エスカレーション後にループを続けたい）/ rejoin（バグ修正を実装フローへ合流させたい）/ abort（フローをやめたい）。",
+		promptSnippet: "Start or control a piHarness flow from the user's natural-language request (always confirmed by the user)",
+		promptGuidelines: [
+			"ユーザーが作りたいもの・実装したい Issue・直したい不具合を話したら、自分で作業を始めず harness_control で対応するフローの開始を提案する（ツールがユーザーに確認する）。",
+			"依頼の意図がどのフローか曖昧なときは、harness_control を呼ぶ前にユーザーに聞く。ユーザーが取り消したら、無理に進めず意図を確認する。",
+		],
+		parameters: Type.Object({
+			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "continue_loop", "rejoin", "abort"] as const),
+			request: Type.String({ description: "ユーザーの依頼の要約（確認ダイアログに表示する）" }),
+			topic: Type.Optional(Type.String({ description: "start_requirements: 作りたいもののテーマ" })),
+			issue: Type.Optional(Type.String({ description: "start_implement: Issue 番号・URL・docs/issues/*.md・next" })),
+			description: Type.Optional(Type.String({ description: "start_bugfix: バグの症状・再現手順" })),
+		}),
+		executionMode: "sequential",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!ctx.hasUI) {
+				throw new Error("ユーザーの確認が必要なため、確認ダイアログを出せない環境では実行できません。/req・/impl・/bugfix・/harness コマンドを案内してください。");
+			}
+			const cfg = cfgOf(ctx);
+			const inProgress = isActive(state) && !["impl_done", "req_done", "bug_done"].includes(state.phase);
+			const current = inProgress ? `${state.flow} / ${PHASE_LABELS[state.phase]}${state.issue ? `（${describeIssue(state.issue)}）` : ""}` : "";
+			let title: string;
+			const lines: string[] = [];
+			let run: () => Promise<Prepared>;
+			let replaces = false;
+
+			switch (params.action) {
+				case "start_requirements": {
+					const topic = params.topic?.trim() ?? "";
+					title = "要件定義を開始しますか？";
+					lines.push(`テーマ: ${topic || "（未指定。ヒアリングで確認します）"}`, "新しいセッションでヒアリング（質問）から始めます。");
+					run = async () => prepareRequirements(ctx, topic);
+					replaces = inProgress;
+					break;
+				}
+				case "start_implement": {
+					const target = await resolveImplementTarget(ctx, cfg, params.issue?.trim() || "next");
+					if ("error" in target) return reply(target.error);
+					title = "Issue の実装を開始しますか？";
+					lines.push(`Issue: ${describeIssue(target.issue)}${target.issue.url ? ` ${target.issue.url}` : ""}`, "新しいセッションで Issue とコードの読み込み → テスト/実装プランの作成から始めます。");
+					run = async () => prepareImplement(ctx, cfg, target.issue, target.body);
+					replaces = inProgress;
+					break;
+				}
+				case "start_bugfix": {
+					const description = params.description?.trim() || state.escalation?.detail || params.request;
+					const joins = joinsImplementFlow();
+					title = "バグ修正を開始しますか？";
+					lines.push(`バグ: ${description}`, joins ? `完了後、実装フロー（${describeIssue(state.issue)}）のレビューへ合流します。` : "単独のバグ修正として新しいセッションで始めます。");
+					run = async () => prepareBugfix(ctx, cfg, description);
+					replaces = inProgress && !joins && state.flow !== "bugfix";
+					break;
+				}
+				case "continue_loop": {
+					if (state.phase !== "escalated") return reply("エスカレーション中ではないため、ループの継続はできません。");
+					title = "ループを継続しますか？";
+					lines.push(state.escalation?.detail ?? "", "修正ループのカウンタをリセットして続けます。");
+					run = async () => {
+						setState(resumeAfterEscalation(state, limitsOf(cfg)), ctx);
+						if (sessionProcess !== processOf(state)) {
+							// 別のセッションから再開する場合は、そのプロセスを新しいセッションで開き直す
+							const proc = processOf(state);
+							if (proc) setState({ ...state, pendingHandoff: { from: proc, to: proc, at: new Date().toISOString() } }, ctx);
+							return { ok: true, message: "ループを継続します。" };
+						}
+						return { ok: true, message: "ループを継続します（カウンタをリセット）。これまでと異なるアプローチで原因を再分析してから修正してください。" };
+					};
+					break;
+				}
+				case "rejoin": {
+					if (state.phase !== "bug_done" || !state.suspended) return reply("合流できるバグ修正フローがありません。");
+					title = "実装フローへ合流しますか？";
+					lines.push(`合流先: ${describeIssue(state.suspended.issue)}`, "新しいセッションでフルレビューから再開します。");
+					run = async () => {
+						setState(rejoinImplement(state, limitsOf(cfg)), ctx);
+						return { ok: true, message: "実装フローへ合流します。" };
+					};
+					break;
+				}
+				case "abort": {
+					if (!isActive(state)) return reply("進行中のフローはありません。");
+					title = "フローを中止しますか？";
+					lines.push(`中止するフロー: ${current || `${state.flow} / ${PHASE_LABELS[state.phase]}`}`, "成果物ファイルは残ります。");
+					run = async () => {
+						setState(finishFlow(state, "ユーザーが中止（自然言語）"), ctx);
+						return { ok: true, message: "フローを中止しました。" };
+					};
+					break;
+				}
+			}
+			if (replaces) lines.push("", `⚠ 進行中のフロー（${current}）は中断されます（成果物は残ります）。`);
+			lines.push("", `依頼: ${params.request}`);
+
+			// 開始・操作の前に必ずユーザーの確認を取る
+			if (!(await ctx.ui.confirm(title, lines.join("\n")))) {
+				return reply("ユーザーが取り消しました。何も実行していません。ユーザーの意図を確認してください。");
+			}
+			const result = await run();
+			if (state.pendingHandoff) forceHandoff = true;
+			return reply(result.message, !result.ok || params.action === "abort");
 		},
 	});
 
@@ -830,7 +950,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				}
 				let rejoin = true;
 				if (ctx.hasUI) {
-					const options = ["実装フローへ合流する（新しいセッションでコードレビューから再開）", "ここで止める（後で /harness rejoin）"];
+					const options = ["実装フローへ合流する（新しいセッションでコードレビューから再開）", "ここで止める（後で「合流して」と伝えるか /harness rejoin）"];
 					rejoin = (await ctx.ui.select("バグ修正が完了しました。実装フローへ合流しますか？", options)) === options[0];
 				}
 				if (!rejoin) return reply("バグ修正完了。ユーザーは合流を保留しました。状況を報告して待機してください。", true);
@@ -847,6 +967,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 		description:
 			"人間の承認ゲート。要件定義書（kind: requirements）またはテスト/実装プラン（kind: plan）の承認をユーザーに依頼し、結果を返す。承認されるまで次のプロセスへは進めない。",
 		promptSnippet: "Ask the human to approve requirements or the test/implementation plan (hard gate)",
+		promptGuidelines: [
+			"承認待ちの間にユーザーがチャットで承認・修正を伝えたら、発言だけで承認扱いにせず harness_request_approval をもう一度呼んで確認ダイアログで確定する。",
+		],
 		parameters: Type.Object({
 			kind: StringEnum(["requirements", "plan"] as const),
 			summary: Type.String({ description: "承認者向けの要約（目的・スコープ・主要な決定事項・リスク）" }),
@@ -870,7 +993,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			if (!ctx.hasUI) {
 				return reply(
 					`${warning ? `${warning}\n` : ""}${label}の承認待ちです。ドキュメント (${documents.join(", ")}) と要約をユーザーに提示し、` +
-						"/harness approve [コメント] または /harness revise <修正内容> の入力を待ってください。",
+						"ユーザーがチャットで承認・修正を伝えたら harness_request_approval を再度呼んで確認ダイアログで確定する（/harness approve・/harness revise でも可）。",
 					true,
 				);
 			}
@@ -879,7 +1002,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const choice = await ctx.ui.select(title, options);
 			if (choice === undefined) {
 				return reply(
-					`${label}の承認は保留されました。ユーザーがドキュメントを確認中です。作業を止め、/harness approve または /harness revise を待ってください。`,
+					`${label}の承認は保留されました。ユーザーがドキュメントを確認中です。作業を止めて待ち、ユーザーがチャットで承認・修正を伝えたら harness_request_approval を再度呼んで確定してください（/harness approve・/harness revise でも可）。`,
 					true,
 				);
 			}
@@ -1177,6 +1300,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 		return ctx.ui.confirm("進行中のフローがあります", `現在: ${state.flow} / ${PHASE_LABELS[state.phase]}\n破棄して ${next} を開始しますか？`);
 	}
 
+	type Prepared = { ok: boolean; message: string };
+
+	/** 要件定義フローの状態を用意する（セッションはまだ開始しない。呼び出し側が開始する） */
+	function prepareRequirements(ctx: ExtensionContext, topic: string): Prepared {
+		const dir = newItemDir(ctx, `req-${timestamp().slice(0, 10)}-${slugify(topic || "requirements", 30)}`);
+		setState(startRequirements(state, topic, limitsOf(cfgOf(ctx)), dir), ctx);
+		return { ok: true, message: `要件定義フローを開始します（テーマ: ${topic || "未指定"}）。` };
+	}
+
 	pi.registerCommand("req", {
 		description: "要件定義フローを新しいセッションで開始する（ヒアリング → 要件定義書 → 承認 → Issue 登録。各工程は別セッション）",
 		handler: async (args, ctx) => {
@@ -1184,8 +1316,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			if (!(await confirmReplace(ctx, "要件定義フロー"))) return;
 			let topic = args.trim();
 			if (!topic && ctx.hasUI) topic = (await ctx.ui.input("何を作りたいですか？（テーマ・背景）"))?.trim() ?? "";
-			const dir = newItemDir(ctx, `req-${timestamp().slice(0, 10)}-${slugify(topic || "requirements", 30)}`);
-			setState(startRequirements(state, topic, limitsOf(cfgOf(ctx)), dir), ctx);
+			prepareRequirements(ctx, topic);
 			await startProcessSession(ctx);
 		},
 	});
@@ -1239,6 +1370,84 @@ export default function piHarness(pi: ExtensionAPI): void {
 		saveRegistry(ctx, reg);
 	}
 
+	/** 実装する Issue を決める（"next" なら依存関係から選ぶ） */
+	async function resolveImplementTarget(
+		ctx: ExtensionContext,
+		cfg: HarnessConfig,
+		arg: string,
+	): Promise<{ issue: IssueRef; body?: string } | { error: string }> {
+		if (arg === "next") {
+			await refreshRegistryFromGitHub(ctx, cfg);
+			const reg = loadRegistry(ctx);
+			const { issue: next, blocked, inProgress } = nextIssue(reg);
+			if (!next) {
+				const why = inProgress.length
+					? `実装中: ${inProgress.map((i) => i.id).join(", ")}`
+					: blocked.length
+						? `依存待ち: ${blocked.map((b) => `${b.issue.id}（${b.waitingFor.join(", ")} 待ち）`).join(", ")}`
+						: "未着手の Issue はありません。";
+				return { error: `着手できる Issue がありません。${why}\n\n${progressTable(reg)}` };
+			}
+			arg = next.number ? String(next.number) : (next.file ?? "");
+		}
+		const resolved = await resolveIssue(ctx, cfg, arg);
+		return resolved ?? { error: "Issue 番号・URL・docs/issues/*.md のいずれか、または next を指定してください。" };
+	}
+
+	/** 実装フローの状態を用意する: 作業ブランチ・差分の基準・Issue 本文（セッションはまだ開始しない） */
+	async function prepareImplement(ctx: ExtensionContext, cfg: HarnessConfig, issue: IssueRef, body: string | undefined): Promise<Prepared> {
+		let git: GitInfo | undefined;
+		const run = gitRun(ctx);
+		if (cfg.git.enabled && (await isGitRepo(run))) {
+			const dirty = await dirtyFiles(run, gitExcludes(ctx, cfg));
+			if (dirty.length && cfg.git.dirtyStart !== "allow") {
+				const list = dirty.slice(0, 10).join("\n") + (dirty.length > 10 ? `\n…ほか ${dirty.length - 10} 件` : "");
+				if (cfg.git.dirtyStart === "refuse") return { ok: false, message: `未コミットの変更があるため開始できません（git.dirtyStart: refuse）:\n${list}` };
+				if (ctx.hasUI && !(await ctx.ui.confirm("未コミットの変更があります", `${list}\n\nこの変更は作業ブランチに持ち込まれ、レビューの差分にも含まれます。続けますか？`))) {
+					return { ok: false, message: "未コミットの変更があるため、ユーザーが開始を取り消しました。" };
+				}
+			}
+			// 作成元: 設定 → 現在のブランチ。ただし別の作業ブランチ（前の Issue）上にいる場合は既定ブランチから切る
+			const target = branchName(cfg.git.branchPrefix, issue);
+			let startFrom = cfg.git.baseBranch;
+			const cur = await currentBranch(run);
+			if (!startFrom && cur && cur !== target && cfg.git.branchPrefix && cur.startsWith(cfg.git.branchPrefix)) {
+				const def = await defaultBranch(run);
+				if (def) {
+					startFrom = def;
+					if (ctx.hasUI) {
+						const options = [`${def} から作成する（推奨）`, `現在の作業ブランチ ${cur} から作成する（積み上げ）`];
+						const choice = await ctx.ui.select(`別の作業ブランチ ${cur} 上にいます。${target} をどこから作成しますか？`, options);
+						if (choice === undefined) return { ok: false, message: "ブランチの作成元が選ばれなかったため、開始を取り消しました。" };
+						if (choice === options[1]) startFrom = cur;
+					}
+				}
+			}
+			try {
+				git = await prepareBranch(run, target, startFrom);
+			} catch (e) {
+				return { ok: false, message: `[piHarness] ${(e as Error).message}` };
+			}
+		}
+
+		const base = issue.number ? `issue-${issue.number}` : `issue-${slugify((issue.file ?? issue.title).replace(/\.md$/, "").split("/").pop() ?? "local", 40)}`;
+		setState({ ...startImplement(state, issue, limitsOf(cfg), newItemDir(ctx, base)), git }, ctx);
+		saveRegistry(ctx, setStatus(loadRegistry(ctx), issue, "in_progress"));
+		writeItemFile(
+			ctx,
+			pathsOf(state).issue,
+			issue.file
+				? `# ${issue.title}\n\n元ファイル: ${issue.file}\n\n${body ?? ""}\n`
+				: body !== undefined
+					? `# #${issue.number} ${issue.title}\n\nURL: ${issue.url}\n\n${body}\n`
+					: `# Issue #${issue.number}\n\n（本文を自動取得できませんでした。\`gh issue view ${issue.number}\` や docs/issues/ から内容を確認し、このファイルに本文を保存してください）\n`,
+		);
+		return {
+			ok: true,
+			message: `${describeIssue(issue)} の実装フローを開始します。${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}`,
+		};
+	}
+
 	pi.registerCommand("impl", {
 		description: "TDD 実装フローを新しいセッションで開始する: /impl <Issue番号 | Issue URL | docs/issues/*.md | next>",
 		getArgumentCompletions: (prefix) => ("next".startsWith(prefix.trim()) ? [{ value: "next", label: "next（次に着手できる Issue）" }] : null),
@@ -1247,83 +1456,35 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const cfg = cfgOf(ctx);
 			let arg = args.trim();
 			if (!arg && ctx.hasUI) arg = (await ctx.ui.input("実装する Issue（番号 / URL / docs/issues/*.md / next）"))?.trim() ?? "";
-			if (arg === "next") {
-				await refreshRegistryFromGitHub(ctx, cfg);
-				const reg = loadRegistry(ctx);
-				const { issue: next, blocked, inProgress } = nextIssue(reg);
-				if (!next) {
-					const why = inProgress.length
-						? `実装中: ${inProgress.map((i) => i.id).join(", ")}`
-						: blocked.length
-							? `依存待ち: ${blocked.map((b) => `${b.issue.id}（${b.waitingFor.join(", ")} 待ち）`).join(", ")}`
-							: "未着手の Issue はありません。";
-					ctx.ui.notify(`着手できる Issue がありません。${why}\n\n${progressTable(reg)}`, "info");
-					return;
-				}
-				arg = next.number ? String(next.number) : (next.file ?? "");
-				ctx.ui.notify(`次の Issue: ${next.id} ${next.title}`, "info");
-			}
-			const resolved = await resolveIssue(ctx, cfg, arg);
-			if (!resolved) {
-				ctx.ui.notify("Issue 番号・URL・docs/issues/*.md のいずれか、または next を指定してください: /impl 12", "error");
+			const target = await resolveImplementTarget(ctx, cfg, arg);
+			if ("error" in target) {
+				ctx.ui.notify(target.error, "info");
 				return;
 			}
-			const { issue, body } = resolved;
-			if (!(await confirmReplace(ctx, `${describeIssue(issue)} の実装フロー`))) return;
-
-			// Git: 作業ブランチを用意し、レビューの差分基準となる開始時点のコミットを記録する
-			let git: GitInfo | undefined;
-			const run = gitRun(ctx);
-			if (cfg.git.enabled && (await isGitRepo(run))) {
-				const dirty = await dirtyFiles(run, gitExcludes(ctx, cfg));
-				if (dirty.length && cfg.git.dirtyStart !== "allow") {
-					const list = dirty.slice(0, 10).join("\n") + (dirty.length > 10 ? `\n…ほか ${dirty.length - 10} 件` : "");
-					if (cfg.git.dirtyStart === "refuse") {
-						ctx.ui.notify(`未コミットの変更があるため開始できません（git.dirtyStart: refuse）:\n${list}`, "error");
-						return;
-					}
-					if (ctx.hasUI && !(await ctx.ui.confirm("未コミットの変更があります", `${list}\n\nこの変更は作業ブランチに持ち込まれ、レビューの差分にも含まれます。続けますか？`))) return;
-				}
-				// 作成元: 設定 → 現在のブランチ。ただし別の作業ブランチ（前の Issue）上にいる場合は既定ブランチから切る
-				const target = branchName(cfg.git.branchPrefix, issue);
-				let startFrom = cfg.git.baseBranch;
-				const cur = await currentBranch(run);
-				if (!startFrom && cur && cur !== target && cfg.git.branchPrefix && cur.startsWith(cfg.git.branchPrefix)) {
-					const def = await defaultBranch(run);
-					if (def) {
-						startFrom = def;
-						if (ctx.hasUI) {
-							const options = [`${def} から作成する（推奨）`, `現在の作業ブランチ ${cur} から作成する（積み上げ）`];
-							const choice = await ctx.ui.select(`別の作業ブランチ ${cur} 上にいます。${target} をどこから作成しますか？`, options);
-							if (choice === undefined) return;
-							if (choice === options[1]) startFrom = cur;
-						}
-					}
-				}
-				try {
-					git = await prepareBranch(run, target, startFrom);
-				} catch (e) {
-					ctx.ui.notify(`[piHarness] ${(e as Error).message}`, "error");
-					return;
-				}
-			}
-
-			const base = issue.number ? `issue-${issue.number}` : `issue-${slugify((issue.file ?? issue.title).replace(/\.md$/, "").split("/").pop() ?? "local", 40)}`;
-			setState({ ...startImplement(state, issue, limitsOf(cfg), newItemDir(ctx, base)), git }, ctx);
-			saveRegistry(ctx, setStatus(loadRegistry(ctx), issue, "in_progress"));
-			writeItemFile(
-				ctx,
-				pathsOf(state).issue,
-				issue.file
-					? `# ${issue.title}\n\n元ファイル: ${issue.file}\n\n${body ?? ""}\n`
-					: body !== undefined
-						? `# #${issue.number} ${issue.title}\n\nURL: ${issue.url}\n\n${body}\n`
-						: `# Issue #${issue.number}\n\n（本文を自動取得できませんでした。\`gh issue view ${issue.number}\` や docs/issues/ から内容を確認し、このファイルに本文を保存してください）\n`,
-			);
-			if (git?.branch) ctx.ui.notify(`作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）`, "info");
-			await startProcessSession(ctx);
+			if (!(await confirmReplace(ctx, `${describeIssue(target.issue)} の実装フロー`))) return;
+			const prepared = await prepareImplement(ctx, cfg, target.issue, target.body);
+			ctx.ui.notify(prepared.message, prepared.ok ? "info" : "error");
+			if (prepared.ok) await startProcessSession(ctx);
 		},
 	});
+
+	function joinsImplementFlow(): boolean {
+		return state.flow === "implement" || state.escalation?.flow === "implement";
+	}
+
+	/** バグ修正フローの状態を用意する（実装フロー中なら退避して完了後に合流。セッションはまだ開始しない） */
+	async function prepareBugfix(ctx: ExtensionContext, cfg: HarnessConfig, description: string): Promise<Prepared> {
+		setState(startBugfix(state, description, limitsOf(cfg), newItemDir(ctx, `bug-${timestamp()}`)), ctx);
+		// 単独のバグ修正では現在の HEAD を差分の基準にする（ブランチは切らない）
+		if (!state.git && cfg.git.enabled && (await isGitRepo(gitRun(ctx)))) {
+			const head = await headSha(gitRun(ctx));
+			if (head) setState({ ...state, git: { base: head, branch: await currentBranch(gitRun(ctx)) } }, ctx);
+		}
+		return {
+			ok: true,
+			message: `バグ修正フローを開始します${state.suspended ? `（完了後 ${describeIssue(state.suspended.issue)} の実装フローへ合流）` : ""}。`,
+		};
+	}
 
 	pi.registerCommand("bugfix", {
 		description: "独立したバグ修正フローを新しいセッションで開始する（完了後、中断中の実装フローへ合流）: /bugfix <バグの説明>",
@@ -1335,14 +1496,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 				description = (await ctx.ui.input("バグの内容（症状・再現手順）", state.escalation?.detail ?? ""))?.trim() ?? "";
 			}
 			if (!description) description = state.escalation?.detail ?? "";
-			const joinsImplement = state.flow === "implement" || state.escalation?.flow === "implement";
-			if (!joinsImplement && state.flow !== "bugfix" && !(await confirmReplace(ctx, "バグ修正フロー"))) return;
-			setState(startBugfix(state, description, limitsOf(cfg), newItemDir(ctx, `bug-${timestamp()}`)), ctx);
-			// 単独のバグ修正では現在の HEAD を差分の基準にする（ブランチは切らない）
-			if (!state.git && cfg.git.enabled && (await isGitRepo(gitRun(ctx)))) {
-				const head = await headSha(gitRun(ctx));
-				if (head) setState({ ...state, git: { base: head, branch: await currentBranch(gitRun(ctx)) } }, ctx);
-			}
+			if (!joinsImplementFlow() && state.flow !== "bugfix" && !(await confirmReplace(ctx, "バグ修正フロー"))) return;
+			await prepareBugfix(ctx, cfg, description);
 			await startProcessSession(ctx);
 		},
 	});
