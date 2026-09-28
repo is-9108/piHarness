@@ -323,6 +323,8 @@ git リポジトリであれば自動で有効になります。
 
 ## 開発
 
+piHarness 自体を変更するときの構成・守ること・Pi の落とし穴は [AGENTS.md](AGENTS.md) にまとめています（このリポジトリで pi を起動すると自動で読み込まれます）。
+
 ```bash
 npm install
 npm run typecheck   # tsc
