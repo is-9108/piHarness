@@ -131,14 +131,16 @@ async function run(prompt: string, responses: ReturnType<typeof done>[]): Promis
 }
 
 function firstUserText(session: AgentSession): string {
-	return JSON.stringify(session.messages.find((m) => m.role === "user"));
+	const m = session.messages.find((x) => x.role === "user") as { content?: string | { type: string; text?: string }[] } | undefined;
+	if (!m) return "";
+	return typeof m.content === "string" ? m.content : (m.content ?? []).map((c) => c.text ?? "").join("\n");
 }
 
 const item = ".pi/harness/issue-1";
 const p = (f: string) => `${item}/${f}`;
 
 const skills = runtime.services.resourceLoader.getSkills().skills.map((s) => s.name).sort();
-assert.deepEqual(skills, ["harness-bugfix", "harness-requirements", "harness-review", "harness-tdd"]);
+assert.deepEqual(skills, ["harness-bugfix", "harness-fix", "harness-hearing", "harness-issues", "harness-plan", "harness-requirements", "harness-review", "harness-review-light", "harness-tdd"]);
 
 // ---------------------------------------------------------------------------
 // 実装フロー: 各プロセスが新しいセッションで実行される
@@ -155,7 +157,8 @@ let r = await run("/impl 1", [
 assert.match(r[3], /^2:write \[ERROR\]: .*piHarness 本体/);
 assert.match(readFileSync(join(root, "skills/harness-tdd/SKILL.md"), "utf8"), /^---\nname: harness-tdd/);
 assert.equal(sessionNo, 2, "/impl でプラン作成用の新しいセッションが作られる");
-assert.match(firstUserText(runtime.session), /TDD 実装フロー（piHarness）/, "スキルが展開される");
+assert.match(firstUserText(runtime.session), /<skill name="harness-plan"/, "プロセス専用のスキルが展開される");
+assert.doesNotMatch(firstUserText(runtime.session), /Red → Green|レビュー指摘の修正/, "他のプロセスの手順は含まれない");
 assert.match(firstUserText(runtime.session), /会話は引き継がれていません/);
 assert.match(firstUserText(runtime.session), /issue-1\/issue\.md — 対象 Issue の本文/);
 assert.match(r[1], /^2:write \[ERROR\]: .*承認されるまで/);
@@ -204,6 +207,14 @@ assert.match(errorsOf(5)[1], /テストを弱める可能性のある変更を�
 const s3Runs = toolTexts.filter((_, i) => toolResults[i].startsWith("3:harness_run_tests"));
 assert.match(s3Runs[1], /LINT_FAIL[\s\S]*→ FAIL[\s\S]*結果: FAIL[\s\S]*修正ループ 1\/3/, "チェックコマンドの失敗で green 判定が失敗する");
 assert.match(s3Runs[2], /結果: PASS/);
+assert.doesNotMatch(s3Runs[2], /出力の末尾/, "合格時はテスト出力を返さない");
+assert.match(s3Runs[2], /出力は省略/);
+assert.match(s3Runs[0], /テストの出力の末尾/, "Red 確認では失敗理由を確認できる分だけ返す");
+assert.equal(
+	sessionsSeen[2].messages.filter((m) => (m as { customType?: string }).customType === "harness-context").length,
+	0,
+	"開始メッセージと重複する状態表示は注入しない",
+);
 assert.ok(r.some((x) => /^4:harness_record_review: レビュー 1 周目/.test(x)));
 assert.ok(r.some((x) => /^6:harness_record_review: レビュー 2 周目（軽量）/.test(x)));
 assert.match(readFileSync(join(project, p("test-changes.md")), "utf8"), /\[skip_added\] test\/feature\.test\.js[\s\S]*#9 のセンサー実装待ち/);
@@ -227,9 +238,23 @@ const s3 = firstUserText(sessionsSeen[2]);
 assert.match(s3, /承認時のユーザーコメント: 境界値も見ておいて/);
 assert.doesNotMatch(s3, /# プラン/, "前セッションの会話・内容は開始メッセージに含まれない（ファイルパスのみ）");
 assert.equal(sessionsSeen[2].messages.filter((m) => m.role === "user").length, 1);
-assert.match(firstUserText(sessionsSeen[3]), /harness-review|コードレビュー（piHarness）/);
-assert.match(firstUserText(sessionsSeen[5]), /review-1\.md — レビュー 1 周目の記録/);
-assert.match(firstUserText(sessionsSeen[5]), /fix-1\.md — レビュー 1 周目の指摘への対応記録/);
+assert.match(firstUserText(sessionsSeen[3]), /<skill name="harness-review"/);
+assert.match(firstUserText(sessionsSeen[5]), /<skill name="harness-review-light"/, "2 周目は軽量レビュー用のスキル");
+assert.match(firstUserText(sessionsSeen[4]), /<skill name="harness-fix"/);
+// プロセスごとに必要なツールだけが有効
+const toolsOf = (i: number) => sessionsSeen[i].getActiveToolNames();
+assert.ok(!toolsOf(3).includes("write") && !toolsOf(3).includes("edit"), "レビューでは書き込みツールを外す");
+assert.ok(toolsOf(3).includes("harness_record_review") && !toolsOf(3).includes("harness_run_tests"));
+assert.ok(toolsOf(2).includes("harness_run_tests") && !toolsOf(2).includes("harness_record_review") && !toolsOf(2).includes("harness_create_issues"));
+assert.ok(toolsOf(2).includes("write") && toolsOf(2).includes("bash"));
+assert.match(firstUserText(sessionsSeen[5]), /review-1\.md — 前回（1 周目）のレビュー記録/);
+assert.match(firstUserText(sessionsSeen[5]), /delta-2\.diff — 前回レビュー以降の差分/);
+const delta = readFileSync(join(project, p("delta-2.diff")), "utf8");
+assert.match(delta, /^\+module\.exports = 2$/m, "前回レビュー以降の修正だけが差分に入る");
+assert.match(delta, /test\/feature\.test\.js/, "新規ファイルも含む");
+assert.doesNotMatch(delta, /\.pi\/harness/, "成果物は含まない");
+assert.match(firstUserText(sessionsSeen[5]), /fix-1\.md — 前回の指摘への対応記録/);
+assert.match(firstUserText(sessionsSeen[5]), /## 参照（必要なときだけ読む）\n- \.pi\/harness\/issue-1\/implementation\.md/, "軽量レビューでは実装レポート等は参照扱い");
 assert.ok(JSON.stringify(planSession.messages).includes("PLAN-SESSION-MARKER"));
 for (const later of sessionsSeen.slice(2)) {
 	assert.ok(!JSON.stringify(later.messages).includes("PLAN-SESSION-MARKER"), "後続セッションにプラン作成セッションの会話が含まれない");
@@ -274,7 +299,7 @@ r = await run("/bugfix BROKEN ファイルが残る", [
 for (const x of r) console.log("  ", x);
 const bugSession = beforeEsc + 2;
 assert.equal(sessionNo, bugSession + 1);
-assert.match(firstUserText(sessionsSeen[bugSession - 1]), /バグ修正フロー（piHarness）/);
+assert.match(firstUserText(sessionsSeen[bugSession - 1]), /<skill name="harness-bugfix"/);
 assert.match(firstUserText(sessionsSeen[bugSession - 1]), /escalation-1\.md — エスカレーション記録 #1/);
 assert.deepEqual(
 	r.filter((x) => x.includes("[ERROR]")).map((x) => x.replace(/: .*/, "")),
@@ -307,7 +332,7 @@ r = await run("/req 温度ロガー", [
 	call("write", { path: `${reqItem}/hearing.md`, content: "# 確定事項（保存期間: 30 日）" }),
 	call("harness_phase", { to: "req_document" }), // → 要件定義書作成セッション（2 回目）
 	call("write", { path: "docs/requirements/logger.md", content: "# 要件" }),
-	call("harness_create_issues", { issues: [{ title: "a", body: issueBody }], dryRun: true }), // 承認前 → 拒否
+	call("harness_create_issues", { issues: [{ title: "a", body: issueBody, size: "S" }], dryRun: true }), // 承認前 → 拒否
 	call("harness_request_approval", { kind: "requirements", summary: "s", documents: ["docs/requirements/logger.md"] }),
 ]);
 assert.ok(existsSync(join(project, reqItem, "hearing.md")));
@@ -321,8 +346,8 @@ assert.deepEqual(
 );
 assert.match(r.find((x) => x.startsWith(`${hearing1}:harness_phase [ERROR]`)) ?? "", /hearing\.md/);
 assert.match(r.find((x) => x.startsWith(`${hearing1 + 1}:harness_phase [ERROR]`)) ?? "", /open-questions\.md/);
-assert.match(firstUserText(sessionsSeen[hearing1 - 1]), /「1\. ヒアリング」から/);
-assert.match(firstUserText(sessionsSeen[hearing1]), /「2\. ドキュメント作成」から/);
+assert.match(firstUserText(sessionsSeen[hearing1 - 1]), /<skill name="harness-hearing"/);
+assert.match(firstUserText(sessionsSeen[hearing1]), /<skill name="harness-requirements"/);
 assert.match(firstUserText(sessionsSeen[hearing1]), /hearing\.md — ヒアリングで確定した仕様のまとめ/);
 assert.match(firstUserText(sessionsSeen[hearing1 + 1]), /open-questions\.md — 要件定義書作成で見つかった未確定の論点/);
 assert.doesNotMatch(firstUserText(sessionsSeen[hearing1 + 2]), /open-questions\.md — 要件定義書作成で見つかった/, "回答済みの未確定論点は退避され、次の要件定義書作成には渡らない");
@@ -330,8 +355,8 @@ const reqSession = sessionNo;
 r = await run("/harness approve", [
 	call("harness_create_issues", {
 		issues: [
-			{ title: "センサー読み取り", body: issueBody, labels: ["feature"] },
-			{ title: "SQLite 保存", body: issueBody, dependsOn: [0] },
+			{ title: "センサー読み取り", body: issueBody, labels: ["feature"], size: "S" },
+			{ title: "SQLite 保存", body: issueBody, dependsOn: [0], size: "M" },
 		],
 		dryRun: true,
 	}),

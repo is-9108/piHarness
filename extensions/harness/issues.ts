@@ -6,12 +6,32 @@ import { slugify } from "./text.ts";
 export interface IssueDraft {
 	title: string;
 	body: string;
+	/** 規模の見積もり: S = 〜100 行 / M = 〜300 行 / L = それ以上（既定では L は分割が必要） */
+	size?: "S" | "M" | "L";
 	labels?: string[];
 	/** 依存する Issue（同じリクエスト内の 0 始まりインデックス。自分より前のものに限る） */
 	dependsOn?: number[];
 }
 
-export function validateDrafts(drafts: IssueDraft[]): string[] {
+export interface IssueLimits {
+	maxAcceptanceCriteria: number;
+	allowedSizes: ("S" | "M" | "L")[];
+}
+
+/** 本文の「受け入れ条件」セクションにあるチェック項目の数 */
+export function countAcceptanceCriteria(body: string): number {
+	const lines = body.split("\n");
+	const start = lines.findIndex((l) => /^#{1,6}\s*.*(受け入れ条件|Acceptance Criteria)/i.test(l));
+	if (start < 0) return 0;
+	let count = 0;
+	for (const line of lines.slice(start + 1)) {
+		if (/^#{1,6}\s/.test(line)) break;
+		if (/^\s*[-*]\s+\[[ xX]\]/.test(line)) count++;
+	}
+	return count;
+}
+
+export function validateDrafts(drafts: IssueDraft[], limits?: IssueLimits): string[] {
 	const errors: string[] = [];
 	if (drafts.length === 0) errors.push("issues が空です。");
 	drafts.forEach((d, i) => {
@@ -24,6 +44,15 @@ export function validateDrafts(drafts: IssueDraft[]): string[] {
 		}
 		if (!/受け入れ条件|Acceptance Criteria/i.test(d.body ?? "")) {
 			errors.push(`issues[${i}] "${d.title}": 本文に「受け入れ条件」セクションがありません。`);
+		}
+		if (limits) {
+			if (d.size && !limits.allowedSizes.includes(d.size)) {
+				errors.push(`issues[${i}] "${d.title}": 規模 ${d.size} は大きすぎます（許可: ${limits.allowedSizes.join(" / ")}）。より小さな振る舞いに分割してください。`);
+			}
+			const ac = countAcceptanceCriteria(d.body ?? "");
+			if (ac > limits.maxAcceptanceCriteria) {
+				errors.push(`issues[${i}] "${d.title}": 受け入れ条件が ${ac} 個あります（上限 ${limits.maxAcceptanceCriteria}）。1 Issue = 1 振る舞いになるよう分割してください。`);
+			}
 		}
 	});
 	return errors;

@@ -140,6 +140,8 @@ export interface HarnessState {
 		max: number;
 		history: ReviewRound[];
 		lastFindings: ReviewFinding[];
+		/** 直近のレビュー時点の作業ツリーのスナップショット（git tree）。軽量レビューの差分の起点 */
+		snapshot?: string;
 	};
 	escalation?: Escalation;
 	suspended?: SuspendedImplement;
@@ -574,6 +576,7 @@ export function rejoinImplement(prev: HarnessState, limits: Limits): HarnessStat
 	s.review.round = 0;
 	s.review.max = limits.maxReviewLoops;
 	s.review.lastFindings = [];
+	s.review.snapshot = undefined;
 	return withLog(s, "バグ修正完了 → 実装フロー (impl_review) へ合流");
 }
 

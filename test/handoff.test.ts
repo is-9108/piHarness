@@ -142,8 +142,8 @@ describe("成果物による引き継ぎ", () => {
 		const dio = processIO(transition(h, "req_document"), all);
 		assert.equal(dio?.process, "requirements");
 		assert.equal(dio?.inputs[0].path, R.hearing);
-		assert.match(kickoffMessage(h, all), /「1\. ヒアリング」から/);
-		assert.match(kickoffMessage(transition(h, "req_document"), all), /「2\. ドキュメント作成」から/);
+		assert.match(kickoffMessage(h, all), /^\/skill:harness-hearing /);
+		assert.match(kickoffMessage(transition(h, "req_document"), all), /^\/skill:harness-requirements /);
 	});
 
 	it("各プロセスの出力が無ければ次へ進めない", () => {
@@ -188,7 +188,6 @@ describe("成果物による引き継ぎ", () => {
 		const s = planApproved();
 		const msg = kickoffMessage(s, all);
 		assert.match(msg, /^\/skill:harness-tdd \[piHarness\]/);
-		assert.match(msg, /3\. TDD 実装/);
 		assert.match(msg, /会話は引き継がれていません/);
 		assert.match(msg, new RegExp(`- ${P.plan.replace(/\./g, "\\.")} — 承認済み`));
 		assert.match(msg, /承認時のユーザーコメント: OK/);

@@ -19,12 +19,12 @@ const NEXT: Record<Phase, string> = {
 	impl_context:
 		"Issue の内容と関連コード・既存テスト・規約を読み込む。読み終えたら harness_phase で impl_plan へ。まだコードは変更しない。",
 	impl_plan:
-		"skill harness-tdd のテンプレートでテストプランと実装プランを作業ディレクトリの plan.md に作成し、harness_request_approval (kind: plan) で承認を得る。",
+		"skill harness-plan のテンプレートでテストプランと実装プランを作業ディレクトリの plan.md に作成し、harness_request_approval (kind: plan) で承認を得る。",
 	impl_plan_approval: "プランの承認待ち。承認されるまでコードを変更しない。",
 	impl_tdd:
 		"承認済みプランに従い TDD（Red → Green → Refactor）で実装する。Red は harness_run_tests (expect: red)、Green は (expect: green)。全体が green になり未テスト変更が無くなったら、実装レポート implementation.md を書いて harness_phase で impl_review へ。",
 	impl_review:
-		"skill harness-review に従ってコードレビューを行い、harness_record_review で結果を記録する。レビュー中はコードを変更しない。",
+		"開始時のスキル（フル / 軽量レビュー）に従ってコードレビューを行い、harness_record_review で結果を記録する。レビュー中はコードを変更しない。",
 	impl_fix_review:
 		"ブロッキング指摘を修正し harness_run_tests (expect: green) で全テストを合格させ、指摘ごとの対応を fix-<周回>.md に書いてから harness_phase で impl_review へ戻る。",
 	impl_done: "実装フロー完了。変更内容・テスト結果・残った軽微な指摘をユーザーに報告する。",
@@ -39,7 +39,7 @@ const NEXT: Record<Phase, string> = {
 
 export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO): string {
 	const lines: string[] = [];
-	lines.push("[piHarness ワークフロー制御中]");
+	lines.push("[piHarness ワークフロー制御中]（最新の状態。以前の状態表示より優先する）");
 	lines.push(`フロー: ${s.flow} / フェーズ: ${s.phase}（${PHASE_LABELS[s.phase]}）`);
 	if (io) {
 		lines.push(`プロセス: ${PROCESS_LABELS[io.process]}（このセッションの担当範囲。前のプロセスとの連携は成果物ファイルのみ）`);

@@ -79,7 +79,13 @@ export interface HarnessConfig {
 	git: GitSettings;
 	/** テストを弱める変更（テスト削除・スキップ追加・アサーション減少）を検知して理由の記録を求めるか */
 	testIntegrity: boolean;
+	/** しきい値による自動圧縮 */
+	compaction: { enabled: boolean; thresholdPercent: number };
+	/** Issue・プランの大きさの上限（1 セッションで扱える大きさに保つ） */
+	issueLimits: { maxAcceptanceCriteria: number; allowedSizes: IssueSize[]; maxPlanTestCases: number };
 }
+
+export type IssueSize = "S" | "M" | "L";
 
 export const DEFAULT_GIT: GitSettings = {
 	enabled: true,
@@ -106,6 +112,8 @@ export const DEFAULT_CONFIG: HarnessConfig = {
 	models: {},
 	git: DEFAULT_GIT,
 	testIntegrity: true,
+	compaction: { enabled: true, thresholdPercent: 60 },
+	issueLimits: { maxAcceptanceCriteria: 5, allowedSizes: ["S", "M"], maxPlanTestCases: 12 },
 };
 
 export const CONFIG_PATH = ".pi/harness.json";
@@ -151,6 +159,8 @@ export function mergeConfig(raw: Partial<HarnessConfig>, warnings: string[] = []
 	}
 	c.git = normalizeGit(raw.git as unknown, warnings);
 	if (typeof c.testIntegrity !== "boolean") c.testIntegrity = DEFAULT_CONFIG.testIntegrity;
+	c.compaction = normalizeCompaction(raw.compaction as unknown, warnings);
+	c.issueLimits = normalizeIssueLimits(raw.issueLimits as unknown, warnings);
 	return c;
 }
 
@@ -197,6 +207,47 @@ export function saveConfigPatch(cwd: string, patch: Partial<HarnessConfig>): voi
 	}
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, `${JSON.stringify({ ...current, ...patch }, null, 2)}\n`);
+}
+
+export function normalizeCompaction(raw: unknown, warnings: string[] = []): HarnessConfig["compaction"] {
+	const out = { ...DEFAULT_CONFIG.compaction };
+	if (raw === undefined || raw === null) return out;
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		warnings.push("compaction はオブジェクトで指定してください。既定値を使用します。");
+		return out;
+	}
+	const r = raw as Record<string, unknown>;
+	if (r.enabled !== undefined) {
+		if (typeof r.enabled === "boolean") out.enabled = r.enabled;
+		else warnings.push("compaction.enabled は true / false で指定してください。");
+	}
+	if (r.thresholdPercent !== undefined) {
+		const n = r.thresholdPercent;
+		if (typeof n === "number" && n >= 20 && n <= 95) out.thresholdPercent = n;
+		else warnings.push("compaction.thresholdPercent は 20〜95 の数値で指定してください。");
+	}
+	return out;
+}
+
+export function normalizeIssueLimits(raw: unknown, warnings: string[] = []): HarnessConfig["issueLimits"] {
+	const out = { ...DEFAULT_CONFIG.issueLimits, allowedSizes: [...DEFAULT_CONFIG.issueLimits.allowedSizes] };
+	if (raw === undefined || raw === null) return out;
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		warnings.push("issueLimits はオブジェクトで指定してください。既定値を使用します。");
+		return out;
+	}
+	const r = raw as Record<string, unknown>;
+	for (const key of ["maxAcceptanceCriteria", "maxPlanTestCases"] as const) {
+		if (r[key] === undefined) continue;
+		if (Number.isInteger(r[key]) && (r[key] as number) >= 1) out[key] = r[key] as number;
+		else warnings.push(`issueLimits.${key} は 1 以上の整数で指定してください。`);
+	}
+	if (r.allowedSizes !== undefined) {
+		const v = r.allowedSizes;
+		if (Array.isArray(v) && v.length && v.every((x) => x === "S" || x === "M" || x === "L")) out.allowedSizes = v as IssueSize[];
+		else warnings.push('issueLimits.allowedSizes は ["S", "M"] のように S / M / L の配列で指定してください。');
+	}
+	return out;
 }
 
 export function normalizeGit(raw: unknown, warnings: string[] = []): GitSettings {

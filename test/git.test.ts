@@ -4,7 +4,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { branchName, commitAll, currentBranch, diffSince, dirtyFiles, fingerprint, isGitRepo, prepareBranch, type Run } from "../extensions/harness/git.ts";
+import { branchName, diffTrees, snapshotTree, commitAll, currentBranch, diffSince, dirtyFiles, fingerprint, isGitRepo, prepareBranch, type Run } from "../extensions/harness/git.ts";
 
 function repo(): { dir: string; run: Run; git: (...a: string[]) => string } {
 	const dir = mkdtempSync(join(tmpdir(), "pih-git-"));
@@ -105,6 +105,27 @@ describe("git", () => {
 		assert.match(git("log", "-1", "--format=%b"), /Closes #1/);
 		assert.deepEqual(await dirtyFiles(run, EX), []);
 		assert.match(git("status", "--porcelain"), /\.pi\//, "成果物は未コミットのまま");
+	});
+
+	it("作業ツリーのスナップショット間の差分（未追跡ファイルを含み、インデックスは汚さない）", async () => {
+		const { dir, run, git } = repo();
+		const idx = join(dir, "..", `idx-${Date.now()}`);
+		writeFileSync(join(dir, "a.js"), "v1\n");
+		const t1 = await snapshotTree(run, idx, EX);
+		assert.match(t1 ?? "", /^[0-9a-f]{40}$/);
+		assert.equal(await snapshotTree(run, idx, EX), t1, "変更が無ければ同じ tree");
+		writeFileSync(join(dir, "a.js"), "v2\n");
+		writeFileSync(join(dir, "new.js"), "n\n");
+		mkdirSync(join(dir, ".pi/harness"), { recursive: true });
+		writeFileSync(join(dir, ".pi/harness/x.md"), "x");
+		const t2 = await snapshotTree(run, idx, EX);
+		const d = await diffTrees(run, t1!, t2!);
+		assert.match(d, /^-v1$/m);
+		assert.match(d, /^\+v2$/m);
+		assert.match(d, /new\.js/);
+		assert.doesNotMatch(d, /\.pi\/harness/);
+		assert.equal(await diffTrees(run, t2!, t2!), "");
+		assert.equal(git("diff", "--cached", "--name-only"), "", "ユーザーのインデックスは変わらない");
 	});
 
 	it("base からの差分に未追跡ファイルと削除を含める", async () => {

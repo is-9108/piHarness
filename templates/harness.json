@@ -3,7 +3,10 @@
   "testTimeoutSec": 900,
   "maxTestLoops": 3,
   "maxReviewLoops": 3,
-  "blockingSeverities": ["blocker", "major"],
+  "blockingSeverities": [
+    "blocker",
+    "major"
+  ],
   "docsDir": "docs",
   "workDir": ".pi/harness",
   "issueLabels": [],
@@ -19,5 +22,17 @@
     "draft": false,
     "dirtyStart": "ask"
   },
-  "models": {}
+  "models": {},
+  "compaction": {
+    "enabled": true,
+    "thresholdPercent": 60
+  },
+  "issueLimits": {
+    "maxAcceptanceCriteria": 5,
+    "allowedSizes": [
+      "S",
+      "M"
+    ],
+    "maxPlanTestCases": 12
+  }
 }

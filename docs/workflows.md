@@ -29,7 +29,7 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
     ├── issue.md               # /impl 時に gh issue view で取得した本文
     ├── plan.md                # テスト/実装プラン（承認対象）
     ├── implementation.md      # 実装レポート
-    ├── review-1.md, fix-1.md, review-2.md …
+    ├── review-1.md, fix-1.md, delta-2.diff, review-2.md …
     ├── escalation-1.md, bug-1.md
     ├── test-changes.md        # テストの削除・スキップ等とその理由（あれば）
     ├── usage.json             # セッションごとのモデル利用量
@@ -126,7 +126,8 @@ flowchart LR
 
 - 重大度 `blocker` / `major`（設定可）の指摘がブロッキングです。`minor` / `nit` は報告のみで完了を妨げません。
 - 1 周目はフルレビュー（requirements / correctness / tests / security / performance / maintainability / operability）。
-- 2 周目以降は軽量レビュー（前回指摘の解消確認 + 新規差分の重大な問題のみ）。
+- 2 周目以降は軽量レビュー（前回指摘の解消確認 + 新規差分の重大な問題のみ）。レビューのたびに作業ツリーのスナップショットを記録し、
+  軽量レビューには前回レビュー以降の差分 `delta-N.diff` と前回の指摘・対応記録だけを渡します（実装レポート等は参照扱い）。
 - レビュー記録は作業ディレクトリの `review-<N>.md` に保存され、各周回のレビュー・修正はそれぞれ新しいセッションで行います。
 - `maxReviewLoops`（既定 3）周してもブロッキング指摘が残るとエスカレーションします。
 

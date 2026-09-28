@@ -114,7 +114,7 @@ describe("install スクリプト", () => {
 		await loader.reload();
 		assert.deepEqual(
 			loader.getSkills().skills.map((s) => s.name).sort(),
-			["harness-bugfix", "harness-requirements", "harness-review", "harness-tdd"],
+			["harness-bugfix", "harness-fix", "harness-hearing", "harness-issues", "harness-plan", "harness-requirements", "harness-review", "harness-review-light", "harness-tdd"],
 		);
 		const ext = loader.getExtensions();
 		assert.deepEqual(ext.errors, []);

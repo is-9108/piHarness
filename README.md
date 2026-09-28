@@ -150,10 +150,17 @@ pi -e ~/piHarness/extensions/harness/index.ts
 
 | Skill | 内容 |
 |-------|------|
-| `harness-requirements` | ヒアリングのチェックリスト、ヒアリング結果/要件定義書/設計概要/Issue 分割案テンプレート、Issue 分割ルール |
-| `harness-tdd` | Issue・コード読込、プランテンプレート、TDD サイクル、失敗時の分析手順 |
-| `harness-review` | 多角的フルレビュー / 軽量レビューの手順、重大度基準、観点チェックリスト |
-| `harness-bugfix` | 再現 → 根本原因分析 → 修正 → 合流、バグレポートテンプレート |
+| `harness-hearing` | 要件ヒアリング（質問の観点、hearing.md テンプレート） |
+| `harness-requirements` | 要件定義書・設計概要・Issue 分割案の作成と承認（テンプレート、Issue 分割ルール） |
+| `harness-issues` | Issue 登録（Issue 本文テンプレート） |
+| `harness-plan` | Issue・コード読込とテスト/実装プラン（plan.md テンプレート） |
+| `harness-tdd` | TDD 実装（Red/Green/Refactor、失敗時の分析、implementation.md テンプレート） |
+| `harness-review` | フルレビュー（観点、重大度、観点チェックリスト） |
+| `harness-review-light` | 軽量レビュー（前回指摘の解消と差分の確認） |
+| `harness-fix` | レビュー指摘の修正（fix-N.md テンプレート） |
+| `harness-bugfix` | バグ修正（再現 → 根本原因分析 → 修正 → 合流、バグレポートテンプレート） |
+
+各スキルは piHarness が新しいセッションの開始時に呼び出します（モデルが自分で選ぶ一覧には載せていません）。
 
 ## 設定（対象プロジェクトの `.pi/harness.json`）
 
@@ -176,6 +183,8 @@ pi -e ~/piHarness/extensions/harness/index.ts
   "testOutputLines": 120,
   "autoHandoff": true,
   "testIntegrity": true,
+  "compaction": { "enabled": true, "thresholdPercent": 60 },
+  "issueLimits": { "maxAcceptanceCriteria": 5, "allowedSizes": ["S", "M"], "maxPlanTestCases": 12 },
   "git": {
     "enabled": true,
     "branchPrefix": "issue-",
@@ -213,8 +222,28 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | `testOutputLines` | 120 | モデルに渡すテスト出力の末尾行数（全文はログに保存） |
 | `autoHandoff` | true | プロセス完了時に自動で新しいセッションを開始する。false なら `/harness next` で手動開始 |
 | `testIntegrity` | true | テストを弱める変更を検知して理由の記録を求める（下記） |
+| `compaction` | 有効・60% | コンテキスト使用率がしきい値を超えたら区切りで圧縮し、スキルと成果物の一覧を送り直して再開（下記） |
+| `issueLimits` | AC 5 個・S/M・テスト 12 件 | Issue とプランの大きさの上限（下記） |
 | `git` | 下記 | Git 連携（作業ブランチ・差分の基準・コミット・PR） |
 | `models` | {} | プロセスごとのモデル・思考レベル（下記） |
+
+### トークン消費の効率化
+
+| 工夫 | 内容 |
+|---|---|
+| プロセス専用のスキル | セッションごとに、そのプロセスの手順だけを書いた小さなスキル（約 2〜3KB）を読み込む。スキルは明示的に呼び出すので、全セッションのシステムプロンプトにスキル一覧も載せない |
+| 軽量レビューは差分だけ | 2 周目以降のレビューは、前回レビュー時点の作業ツリーのスナップショットからの差分（`delta-N.diff`）・前回の指摘・対応記録だけを読む |
+| 入力の必読 / 参照の区別 | 開始メッセージで「最初に読むもの」と「必要なときだけ読むもの」を分ける（例: 指摘修正では実装レポートやプランは参照扱い） |
+| ツールの絞り込み | プロセスに必要なツールだけを有効にする（例: ヒアリングは質問・遷移・状態のみ、レビューは書き込みツールなし） |
+| テスト出力の省略 | 合格時は結果の要約だけを返す。Red 確認は 40 行、失敗時は `testOutputLines` 行（全文はログ） |
+| キャッシュを壊さない状態表示 | 状態は変わったときだけ追記し、過去の表示を会話から削除しない（プロンプトキャッシュの再利用が途切れない） |
+
+### セッションを小さく保つ（`issueLimits` / `compaction`）
+
+- **Issue の大きさ:** Issue 登録時に規模（S / M のみ）と受け入れ条件の数（5 個まで）を検査し、超えるものは分割を求めます。プラン承認時にテストケースが 12 件を超えていれば、承認ダイアログで分割の検討を促します。
+- **自動圧縮:** コンテキスト使用率がしきい値（既定 60%）を超えると、次の区切り（ツール呼び出しの手前）で一度止めて圧縮し、そのプロセスのスキルと成果物の一覧を送り直して同じセッションで再開します。
+  要約には、完了/残りのテストケース、直近のテスト結果と失敗原因の仮説、変更したファイル、未解決の指摘を残すよう指示します。
+  Pi 自身の自動圧縮（上限直前）が起きた場合も、スキルと成果物の一覧を送り直します。
 
 ### Git 連携（`git`）
 
@@ -298,7 +327,7 @@ git リポジトリであれば自動で有効になります。
 npm install
 npm run typecheck   # tsc
 npm test            # 状態機械・ガード・設定・Git・テスト保護・進み具合・利用量・セットアップスクリプトのユニットテスト (node --test)
-npm run test:e2e    # 偽モデルで実際の Pi セッションランタイムを動かし、3 フローとセッション切り替えを通す E2E
+npm run test:e2e    # 偽モデルで実際の Pi セッションランタイムを動かし、3 フロー・セッション切り替え・自動圧縮を通す E2E
 npm run check       # 上記すべて
 ```
 

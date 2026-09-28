@@ -181,3 +181,21 @@ export async function diffSince(run: Run, base: string, excludes: string[], cwd?
 	}
 	return { nameStatus, patch };
 }
+
+/**
+ * 作業ツリー全体（未追跡ファイルを含み、.gitignore と除外パスを除く）を git の tree オブジェクトとして保存する。
+ * 一時インデックスを使うので、ユーザーのインデックスやブランチには影響しない。
+ */
+export async function snapshotTree(run: Run, indexFile: string, excludes: string[]): Promise<string | undefined> {
+	const script = 'set -e; export GIT_INDEX_FILE="$1"; shift; rm -f "$GIT_INDEX_FILE"; git add -A -- "$@" >/dev/null; git write-tree; rm -f "$GIT_INDEX_FILE"';
+	const r = await run("bash", ["-c", script, "_", indexFile, ".", ...excludeSpecs(excludes)]);
+	const tree = r.stdout.trim();
+	return r.code === 0 && /^[0-9a-f]{40,64}$/.test(tree) ? tree : undefined;
+}
+
+/** 2 つのスナップショット間の差分（統計 + パッチ） */
+export async function diffTrees(run: Run, from: string, to: string): Promise<string> {
+	const stat = (await run("git", ["diff", "--stat", from, to])).stdout;
+	const patch = (await run("git", ["diff", "-M", from, to])).stdout;
+	return patch.trim() ? `${stat.trim()}\n\n${patch}` : "";
+}

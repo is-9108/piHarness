@@ -12,6 +12,7 @@ import {
 	type Phase,
 	type ProcessKind,
 	processOf,
+	reviewMode,
 } from "./state.ts";
 
 export interface ArtifactPaths {
@@ -29,6 +30,7 @@ export interface ArtifactPaths {
 	handoff: string;
 	testChanges: string;
 	usage: string;
+	delta: (round: number) => string;
 	logs: string;
 }
 
@@ -48,6 +50,7 @@ export function artifactPaths(itemDir: string): ArtifactPaths {
 		handoff: join(itemDir, "handoff.md"),
 		testChanges: join(itemDir, "test-changes.md"),
 		usage: join(itemDir, "usage.json"),
+		delta: (r) => join(itemDir, `delta-${r}.diff`),
 		logs: join(itemDir, "logs"),
 	};
 }
@@ -64,7 +67,7 @@ export function requiredArtifact(s: HarnessState, to: Phase): { path: string; te
 	if (!s.itemDir) return undefined;
 	const p = artifactPaths(s.itemDir);
 	if (s.phase === "req_clarify" && to === "req_document") {
-		return { path: p.hearing, template: "skill harness-requirements の templates/hearing.md" };
+		return { path: p.hearing, template: "skill harness-hearing の templates/hearing.md" };
 	}
 	if (s.phase === "req_document" && to === "req_clarify") {
 		return { path: p.openQuestions, template: "未確定の論点を箇条書きにした Markdown" };
@@ -73,7 +76,7 @@ export function requiredArtifact(s: HarnessState, to: Phase): { path: string; te
 		return { path: p.implementation, template: "skill harness-tdd の templates/implementation.md" };
 	}
 	if (s.phase === "impl_fix_review" && to === "impl_review") {
-		return { path: p.fix(s.review.round), template: "skill harness-tdd の templates/fix-report.md" };
+		return { path: p.fix(s.review.round), template: "skill harness-fix の templates/fix-report.md" };
 	}
 	if (s.phase === "bug_fix" && to === "bug_done") {
 		return { path: p.bug(s.counters.bugs), template: "skill harness-bugfix の templates/bug-report.md" };
@@ -92,21 +95,29 @@ export const PROCESS_LABELS: Record<ProcessKind, string> = {
 	bugfix: "バグ修正",
 };
 
-const SKILL_OF: Record<ProcessKind, { skill: string; section?: string }> = {
-	hearing: { skill: "harness-requirements", section: "1. ヒアリング" },
-	requirements: { skill: "harness-requirements", section: "2. ドキュメント作成" },
-	issues: { skill: "harness-requirements", section: "4. Issue 登録" },
-	plan: { skill: "harness-tdd" },
-	implement: { skill: "harness-tdd", section: "3. TDD 実装" },
-	review: { skill: "harness-review" },
-	fix: { skill: "harness-tdd", section: "5. レビュー指摘の修正" },
-	bugfix: { skill: "harness-bugfix" },
+const SKILL_OF: Record<ProcessKind, string> = {
+	hearing: "harness-hearing",
+	requirements: "harness-requirements",
+	issues: "harness-issues",
+	plan: "harness-plan",
+	implement: "harness-tdd",
+	review: "harness-review",
+	fix: "harness-fix",
+	bugfix: "harness-bugfix",
 };
+
+/** プロセスに対応するスキル。レビューは 1 周目（フル）と 2 周目以降（軽量）で別のスキルにして読み込み量を減らす */
+export function skillFor(s: HarnessState, proc: ProcessKind): string {
+	if (proc === "review" && reviewMode(s) === "light") return "harness-review-light";
+	return SKILL_OF[proc];
+}
 
 export interface ProcessIO {
 	process: ProcessKind;
-	/** 読むべき成果物（存在するもののみ） */
+	/** 最初に読むべき成果物（存在するもののみ） */
 	inputs: { path: string; why: string }[];
+	/** 必要なときだけ参照する成果物（存在するもののみ）。読み込み量を抑えるため必読から分けている */
+	references: { path: string; why: string }[];
 	/** このプロセスで作る成果物 */
 	outputs: { path: string; why: string }[];
 }
@@ -117,39 +128,39 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 	if (!proc || !s.itemDir) return undefined;
 	const p = artifactPaths(s.itemDir);
 	const inputs: ProcessIO["inputs"] = [];
+	const references: ProcessIO["references"] = [];
 	const outputs: ProcessIO["outputs"] = [];
-	const add = (path: string | undefined, why: string) => {
-		if (path && exists(path) && !inputs.some((i) => i.path === path)) inputs.push({ path, why });
-	};
-	const reviews = () => {
-		for (let r = 1; r <= s.review.round; r++) {
-			add(p.review(r), `レビュー ${r} 周目の記録`);
-			add(p.fix(r), `レビュー ${r} 周目の指摘への対応記録`);
+	const seen = new Set<string>();
+	const push = (list: ProcessIO["inputs"], path: string | undefined, why: string) => {
+		if (path && exists(path) && !seen.has(path)) {
+			seen.add(path);
+			list.push({ path, why });
 		}
 	};
-	const bugs = () => {
-		for (let n = 1; n <= s.counters.bugs; n++) add(p.bug(n), `バグレポート #${n}`);
+	const add = (path: string | undefined, why: string) => push(inputs, path, why);
+	const ref = (path: string | undefined, why: string) => push(references, path, why);
+	const bugs = (to: typeof add) => {
+		for (let n = 1; n <= s.counters.bugs; n++) to(p.bug(n), `バグレポート #${n}`);
 	};
 
 	switch (proc) {
 		case "hearing":
 			add(p.openQuestions, "要件定義書作成で見つかった未確定の論点（最優先で確認する）");
 			add(p.hearing, "これまでに確定した仕様のまとめ");
-			add(p.qa, "これまでの質問と回答の記録");
-			for (const d of s.artifacts.docs) add(d, "作成中の要件ドキュメント");
+			ref(p.qa, "これまでの質問と回答の生ログ");
+			for (const d of s.artifacts.docs) ref(d, "作成中の要件ドキュメント");
 			outputs.push({ path: p.hearing, why: "確定した仕様のまとめ（要件定義書作成へ進む前に必須）" });
 			break;
 		case "requirements":
 			add(p.hearing, "ヒアリングで確定した仕様のまとめ");
-			add(p.qa, "質問と回答の記録（根拠の確認用）");
 			for (const d of s.artifacts.docs) add(d, "作成中の要件ドキュメント");
+			ref(p.qa, "質問と回答の生ログ（根拠の確認用）");
 			outputs.push({ path: "docs/requirements/<slug>.md ほか", why: "要件定義書・設計概要・Issue 分割案（承認対象）" });
 			outputs.push({ path: p.openQuestions, why: "大きな未確定事項が見つかった場合のみ。ヒアリングへ戻る前に必須" });
 			break;
 		case "issues":
 			for (const d of s.artifacts.docs) add(d, "承認済みの要件ドキュメント（Issue 分割案を含む）");
-			add(p.hearing, "ヒアリングで確定した仕様のまとめ");
-			add(p.qa, "ヒアリング記録");
+			ref(p.hearing, "ヒアリングで確定した仕様のまとめ");
 			outputs.push({ path: "GitHub Issue（または docs/issues/*.md）", why: "機能単位の Issue" });
 			break;
 		case "plan":
@@ -162,44 +173,62 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 			outputs.push({ path: p.implementation, why: "実装レポート（レビュー担当への引き継ぎ。レビューへ進む前に必須）" });
 			break;
 		case "review":
-			add(p.issue, "対象 Issue の本文");
-			add(p.plan, "承認済みのテスト/実装プラン");
-			add(p.implementation, "実装レポート");
-			reviews();
-			bugs();
-			add(p.testChanges, "テストの削除・スキップ・アサーション減少と、その理由（妥当か必ず検証する）");
+			if (reviewMode(s) === "light" && exists(p.review(s.review.round))) {
+				// 軽量レビュー: 前回の指摘・対応記録・前回レビュー以降の差分だけを読む
+				add(p.review(s.review.round), `前回（${s.review.round} 周目）のレビュー記録`);
+				add(p.fix(s.review.round), `前回の指摘への対応記録`);
+				add(p.delta(s.review.round + 1), "前回レビュー以降の差分（これを中心に確認する）");
+				add(p.testChanges, "テストの削除・スキップ等とその理由（新しい記録があれば検証する）");
+				ref(p.implementation, "実装レポート");
+				ref(p.plan, "承認済みのテスト/実装プラン");
+				ref(p.issue, "対象 Issue の本文");
+			} else {
+				add(p.issue, "対象 Issue の本文");
+				add(p.plan, "承認済みのテスト/実装プラン");
+				add(p.implementation, "実装レポート");
+				bugs(add);
+				add(p.testChanges, "テストの削除・スキップ・アサーション減少と、その理由（妥当か必ず検証する）");
+				for (let r = 1; r <= s.review.round; r++) {
+					ref(p.review(r), `レビュー ${r} 周目の記録`);
+					ref(p.fix(r), `レビュー ${r} 周目の指摘への対応記録`);
+				}
+			}
 			outputs.push({ path: p.review(s.review.round + 1), why: "レビュー記録（harness_record_review が書き出す）" });
 			break;
 		case "fix":
 			add(p.review(s.review.round), "修正対象のレビュー記録");
-			add(p.issue, "対象 Issue の本文");
-			add(p.plan, "承認済みのテスト/実装プラン");
-			add(p.implementation, "実装レポート");
-			for (let r = 1; r < s.review.round; r++) add(p.fix(r), `レビュー ${r} 周目の対応記録`);
+			ref(p.implementation, "実装レポート");
+			ref(p.plan, "承認済みのテスト/実装プラン");
+			ref(p.issue, "対象 Issue の本文");
+			for (let r = 1; r < s.review.round; r++) ref(p.fix(r), `レビュー ${r} 周目の対応記録`);
 			outputs.push({ path: p.fix(s.review.round), why: "指摘ごとの対応記録（レビューへ戻る前に必須）" });
 			break;
 		case "bugfix":
-			for (let n = s.counters.escalations; n >= 1; n--) add(p.escalation(n), `エスカレーション記録 #${n}`);
-			add(p.issue, "実装中の Issue の本文");
-			add(p.plan, "承認済みのテスト/実装プラン");
-			add(p.implementation, "実装レポート");
-			if (s.review.round > 0) add(p.review(s.review.round), "直近のレビュー記録");
+			add(p.escalation(s.counters.escalations), `エスカレーション記録 #${s.counters.escalations}`);
 			add(s.test.lastLog, "直近のテストログ");
+			add(p.bug(s.counters.bugs), "作成中のバグレポート");
+			for (let n = s.counters.escalations - 1; n >= 1; n--) ref(p.escalation(n), `エスカレーション記録 #${n}`);
+			ref(p.issue, "実装中の Issue の本文");
+			ref(p.plan, "承認済みのテスト/実装プラン");
+			ref(p.implementation, "実装レポート");
+			if (s.review.round > 0) ref(p.review(s.review.round), "直近のレビュー記録");
 			outputs.push({ path: p.bug(s.counters.bugs), why: "バグレポート（完了前に必須）" });
 			break;
 	}
-	return { process: proc, inputs, outputs };
+	return { process: proc, inputs, references, outputs };
 }
+
+/** セッション開始メッセージの目印（拡張が状態表示の重複注入を避けるために使う） */
+export const KICKOFF_MARKER = "[piHarness] プロセス「";
 
 /** 新しいセッションの最初のメッセージ（スキルを展開し、入力/出力の成果物を明示する） */
 export function kickoffMessage(s: HarnessState, exists: (path: string) => boolean, userNote?: string): string {
 	const io = processIO(s, exists);
 	if (!io) throw new Error("アクティブなプロセスがありません。");
-	const { skill, section } = SKILL_OF[io.process];
+	const skill = skillFor(s, io.process);
 	const lines: string[] = [];
 	// Pi は "/skill:<name> <引数>" の最初の空白でスキル名を区切るため、改行ではなく空白で続ける
-	lines.push(`/skill:${skill} [piHarness] プロセス「${PROCESS_LABELS[io.process]}」をこの新しいセッションで開始します。`);
-	if (section) lines.push(`SKILL.md の「${section}」から始めてください。`);
+	lines.push(`/skill:${skill} ${KICKOFF_MARKER}${PROCESS_LABELS[io.process]}」をこの新しいセッションで開始します。`);
 	lines.push("前のプロセスの会話は引き継がれていません。以下の成果物だけを入力として作業してください（推測で補わない）。");
 	lines.push("");
 	if (s.topic) lines.push(`テーマ: ${s.topic}`);
@@ -211,6 +240,11 @@ export function kickoffMessage(s: HarnessState, exists: (path: string) => boolea
 	lines.push("");
 	lines.push("## 入力（最初にすべて読むこと）");
 	lines.push(...(io.inputs.length ? io.inputs.map((i) => `- ${i.path} — ${i.why}`) : ["- （なし）"]));
+	if (io.references.length) {
+		lines.push("");
+		lines.push("## 参照（必要なときだけ読む）");
+		lines.push(...io.references.map((i) => `- ${i.path} — ${i.why}`));
+	}
 	lines.push("");
 	lines.push("## このプロセスの成果物");
 	lines.push(...io.outputs.map((o) => `- ${o.path} — ${o.why}`));

@@ -13,8 +13,8 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { findModel, type HarnessConfig, loadConfig, PROCESS_KINDS, resolveProcessModel, saveConfigPatch } from "./config.ts";
@@ -22,11 +22,12 @@ import { checkBash, checkWrite, type GuardPaths, isHarnessFile, isInside, STATE_
 import { buildContext } from "./guidance.ts";
 import { emptyRegistry, type IssueRegistry, nextIssue, progressTable, registerIssues, setStatus } from "./progress.ts";
 import { analyzeTestDiff, findingsMarkdown, signature as integritySignature } from "./integrity.ts";
-import { commitAll, currentBranch, defaultBranch, diffSince, dirtyFiles, fingerprint, type GitInfo, headSha, isGitRepo, prepareBranch, branchName, type Run } from "./git.ts";
+import { commitAll, currentBranch, defaultBranch, diffTrees, snapshotTree, diffSince, dirtyFiles, fingerprint, type GitInfo, headSha, isGitRepo, prepareBranch, branchName, type Run } from "./git.ts";
 import { type UsageFile, sumSession, summarize as summarizeUsage, upsertSession, usageMarkdown } from "./usage.ts";
 import {
 	artifactPaths,
 	escalationMarkdown,
+	KICKOFF_MARKER,
 	handoffRecord,
 	kickoffMessage,
 	PROCESS_LABELS,
@@ -85,8 +86,12 @@ import {
 	withHandoff,
 } from "./state.ts";
 import { slugify, tailLines, timestamp } from "./text.ts";
+import { HARNESS_TOOLS, toolsForProcess } from "./tools.ts";
+import { compactionInstructions, shouldCompact } from "./compaction.ts";
 
 const CONTEXT_MESSAGE = "harness-context";
+/** Red 確認（期待どおりの失敗）で返す出力の行数。失敗理由が「未実装」かを確かめられれば十分 */
+const RED_OUTPUT_LINES = 40;
 /** piHarness 自身のディレクトリ（プロジェクト内に clone して使う場合、エージェントに書き換えさせない） */
 const HARNESS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ALL_PHASES = Object.keys(PHASE_LABELS) as Phase[];
@@ -203,11 +208,30 @@ export default function piHarness(pi: ExtensionAPI): void {
 		});
 	}
 
+	function tempIndexFile(): string {
+		return join(tmpdir(), `pi-harness-index-${process.pid}-${Date.now()}`);
+	}
+
+	/** 軽量レビューの開始前に、前回レビュー時点からの差分を delta-N.diff として書き出す */
+	async function writeReviewDelta(ctx: ExtensionContext): Promise<void> {
+		if (processOf(state) !== "review" || reviewMode(state) !== "light" || !state.review.snapshot || !state.itemDir) return;
+		const run = gitRun(ctx);
+		const current = await snapshotTree(run, tempIndexFile(), gitExcludes(ctx, cfgOf(ctx)));
+		if (!current) return;
+		const diff = await diffTrees(run, state.review.snapshot, current);
+		writeItemFile(
+			ctx,
+			pathsOf(state).delta(state.review.round + 1),
+			diff || `# 前回レビュー（${state.review.round} 周目）以降、コードの変更はありません\n`,
+		);
+	}
+
 	/**
 	 * 現在のプロセスを新しいセッションで開始する（コマンドからのみ呼べる）。
 	 * 引き継ぎ内容を handoff.md に記録してから state.json を保存し、新セッションで開始メッセージを送る。
 	 */
 	async function startProcessSession(ctx: ExtensionCommandContext, note?: string): Promise<void> {
+		await writeReviewDelta(ctx);
 		const exists = existsIn(ctx);
 		const kickoff = kickoffMessage(state, exists, note);
 		writeItemFile(ctx, pathsOf(state).handoff, handoffRecord(state, exists), true);
@@ -503,6 +527,18 @@ export default function piHarness(pi: ExtensionAPI): void {
 		return false;
 	}
 
+	/** 現在のプロセスに必要なツールだけを有効にする（フロー外では全ツールを戻す） */
+	function applyProcessTools(): void {
+		const proc = isActive(state) && !state.pendingHandoff ? processOf(state) : null;
+		const registered = pi.getAllTools().map((t) => t.name);
+		if (!proc) {
+			const missing = HARNESS_TOOLS.filter((t) => registered.includes(t) && !pi.getActiveTools().includes(t));
+			if (missing.length) pi.setActiveTools([...pi.getActiveTools(), ...missing]);
+			return;
+		}
+		pi.setActiveTools(toolsForProcess(pi.getActiveTools(), registered, proc));
+	}
+
 	pi.on("session_start", async (_e, ctx) => {
 		state = loadState(ctx);
 		sessionProcess = undefined;
@@ -513,6 +549,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const applied = await applyProcessModel(ctx, proc);
 			if (applied) ctx.ui.notify(`piHarness: ${PROCESS_LABELS[proc]} のモデル → ${applied}`, "info");
 		}
+		applyProcessTools();
 		refreshUI(ctx);
 		const { warnings } = loadConfig(ctx.cwd);
 		for (const w of warnings) ctx.ui.notify(`[piHarness] ${w}`, "warning");
@@ -521,36 +558,126 @@ export default function piHarness(pi: ExtensionAPI): void {
 		}
 	});
 
-	// 現在のプロセス・入出力成果物・次の行動をエージェントに伝える
-	pi.on("before_agent_start", async (_e, ctx) => {
+	/** このセッションで最後にエージェントへ伝えた状態（同じ内容は二度送らない） */
+	let lastInjected: string | undefined;
+
+	// 現在のプロセス・入出力成果物・次の行動をエージェントに伝える。
+	// プロンプトキャッシュを壊さないよう、状態が変わったときだけ追記し、過去の状態表示は削除しない。
+	pi.on("before_agent_start", async (event, ctx) => {
 		if (!isActive(state)) return;
 		const proc = processOf(state);
 		if (proc && !pi.getSessionName()) {
 			const who = state.issue?.number ? `#${state.issue.number} ` : state.topic ? `${state.topic} ` : "";
 			pi.setSessionName(`[harness] ${who}${PROCESS_LABELS[proc]}`);
 		}
-		return {
-			message: {
-				customType: CONTEXT_MESSAGE,
-				content: buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx))),
-				display: false,
-			},
-		};
+		const content = buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx)));
+		// セッション開始メッセージには同じ情報（入出力・次の行動）が含まれているので送らない
+		const isKickoff = event.prompt.includes(KICKOFF_MARKER);
+		if (reminderPending && !isKickoff) {
+			const why = reminderPending;
+			reminderPending = undefined;
+			lastInjected = content;
+			return { message: { customType: CONTEXT_MESSAGE, content: `${expandedResume(ctx, why)}\n\n${content}`, display: false } };
+		}
+		reminderPending = isKickoff ? undefined : reminderPending;
+		if (isKickoff || content === lastInjected) {
+			lastInjected = content;
+			return;
+		}
+		lastInjected = content;
+		return { message: { customType: CONTEXT_MESSAGE, content, display: false } };
 	});
 
-	// 古いフェーズ情報がコンテキストに積み重ならないよう、最新のもの以外を除去する
-	pi.on("context", async (event) => {
-		const isCtx = (m: AgentMessage) => (m as { customType?: string }).customType === CONTEXT_MESSAGE;
-		let lastIndex = -1;
-		event.messages.forEach((m, i) => {
-			if (isCtx(m)) lastIndex = i;
+	// -----------------------------------------------------------------------
+	// しきい値による自動圧縮
+	// -----------------------------------------------------------------------
+
+	/** しきい値を超えたので、次の安全な区切りで圧縮する */
+	let compactRequested = false;
+	/** 圧縮のためにツール呼び出しを止めて実行を中断した（圧縮後に自動で再開する） */
+	let interruptedForCompaction = false;
+	let compacting = false;
+	let ownCompaction = false;
+	/** 次のユーザー入力時に、圧縮で消えたスキル本文と成果物の一覧を注入する */
+	let reminderPending: string | undefined;
+
+	/** 圧縮で消えたスキル本文と成果物の一覧（/skill: で展開される） */
+	function resumeMessage(ctx: ExtensionContext, why: string): string {
+		return kickoffMessage(
+			state,
+			existsIn(ctx),
+			`${why}会話は要約されています。要約の作業状態と上記の成果物を確認し、中断したところから作業を続けてください（最初からやり直さない）。`,
+		).replace("をこの新しいセッションで開始します。", "を再開します。");
+	}
+
+	/** before_agent_start で注入する用: スキル本文をファイルから読んで展開済みの形にする */
+	function expandedResume(ctx: ExtensionContext, why: string): string {
+		const text = resumeMessage(ctx, why);
+		const m = text.match(/^\/skill:(\S+) /);
+		if (!m) return text;
+		const file = join(HARNESS_ROOT, "skills", m[1], "SKILL.md");
+		const body = existsSync(file) ? readFileSync(file, "utf8").replace(/^---\n[\s\S]*?\n---\n/, "").trim() : "";
+		return `${body}\n\n${text.slice(m[0].length)}`;
+	}
+
+	function startCompaction(ctx: ExtensionContext, percent: number): void {
+		const cfg = cfgOf(ctx);
+		const resume = interruptedForCompaction;
+		interruptedForCompaction = false;
+		compacting = true;
+		ownCompaction = true;
+		ctx.ui.notify(`piHarness: コンテキスト使用率 ${percent}% のため圧縮します（しきい値 ${cfg.compaction.thresholdPercent}%）`, "info");
+		ctx.compact({
+			customInstructions: compactionInstructions(state),
+			onComplete: () => {
+				compacting = false;
+				if (!isActive(state) || state.pendingHandoff) return;
+				const why = `コンテキスト使用率が ${percent}% に達したため`;
+				if (resume) {
+					pi.sendUserMessage(resumeMessage(ctx, why), { deliverAs: "followUp", expandPromptTemplates: true });
+				} else {
+					reminderPending = why;
+				}
+			},
+			onError: (e) => {
+				compacting = false;
+				ownCompaction = false;
+				ctx.ui.notify(`[piHarness] 圧縮に失敗しました: ${e.message}`, "warning");
+				if (resume && isActive(state)) {
+					pi.sendUserMessage("コンテキストの圧縮に失敗しました。そのまま作業を続けてください。", { deliverAs: "followUp" });
+				}
+			},
 		});
-		if (lastIndex < 0) return;
-		return { messages: event.messages.filter((m, i) => !isCtx(m) || (i === lastIndex && isActive(state))) };
+	}
+
+	let requestedPercent = 0;
+
+	// ターンの区切りでしきい値を確認し、超えていれば圧縮を予約する（実行中の圧縮は中断を伴うため、次の区切りで止める）
+	pi.on("turn_end", async (_e, ctx) => {
+		const usage = ctx.getContextUsage();
+		if (compactRequested || !shouldCompact(state, usage, cfgOf(ctx).compaction, compacting)) return;
+		compactRequested = true;
+		requestedPercent = Math.round(usage?.percent ?? 0);
+	});
+
+	// Pi 自身の自動圧縮（上限直前・オーバーフロー時）でも、消えたスキル本文と成果物の一覧を送り直す
+	pi.on("session_compact", async (_e, ctx) => {
+		if (ownCompaction) {
+			ownCompaction = false;
+			return;
+		}
+		if (!isActive(state) || state.pendingHandoff) return;
+		if (ctx.isIdle()) reminderPending = "Pi がコンテキストを自動圧縮したため";
+		else pi.sendUserMessage(resumeMessage(ctx, "Pi がコンテキストを自動圧縮したため"), { deliverAs: "steer", expandPromptTemplates: true });
 	});
 
 	// プロセスが終わったら、エージェントが止まった時点で次のプロセスを新しいセッションで開始する
 	pi.on("agent_settled", async (_e, ctx) => {
+		if (compactRequested) {
+			compactRequested = false;
+			if (!state.pendingHandoff && !compacting) startCompaction(ctx, requestedPercent);
+			else interruptedForCompaction = false;
+		}
 		if (!state.pendingHandoff) return;
 		if (cfgOf(ctx).autoHandoff) {
 			pi.sendUserMessage("/harness next", { expandPromptTemplates: true });
@@ -571,6 +698,14 @@ export default function piHarness(pi: ExtensionAPI): void {
 			if (d.block) return { block: true, reason: d.reason };
 		}
 		if (!isActive(state)) return;
+		if (compactRequested && !state.pendingHandoff) {
+			interruptedForCompaction = true;
+			return {
+				block: true,
+				reason: "[piHarness] コンテキストが大きくなったため、ここで一度止めて圧縮します。圧縮後に再開の指示が届くので、今は何もせず待ってください。",
+				terminate: true,
+			};
+		}
 		if (state.pendingHandoff && !event.toolName.startsWith("harness_")) {
 			return {
 				block: true,
@@ -731,15 +866,16 @@ export default function piHarness(pi: ExtensionAPI): void {
 			setState(beginApproval(state, kind, documents), ctx);
 
 			const label = kind === "requirements" ? "要件定義" : "テスト/実装プラン";
+			const warning = kind === "plan" ? planSizeWarning(ctx, cfgOf(ctx)) : undefined;
 			if (!ctx.hasUI) {
 				return reply(
-					`${label}の承認待ちです。ドキュメント (${documents.join(", ")}) と要約をユーザーに提示し、` +
+					`${warning ? `${warning}\n` : ""}${label}の承認待ちです。ドキュメント (${documents.join(", ")}) と要約をユーザーに提示し、` +
 						"/harness approve [コメント] または /harness revise <修正内容> の入力を待ってください。",
 					true,
 				);
 			}
 			const options = ["承認する", "修正を依頼する", "却下する（フローを中止）"];
-			const title = `【${label}の承認依頼】\n${params.summary.slice(0, 1500)}\n\n対象: ${documents.join(", ")}`;
+			const title = `【${label}の承認依頼】\n${warning ? `${warning}\n` : ""}${params.summary.slice(0, 1500)}\n\n対象: ${documents.join(", ")}`;
 			const choice = await ctx.ui.select(title, options);
 			if (choice === undefined) {
 				return reply(
@@ -755,6 +891,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 			return reply(approvalMessage(kind, decision, comment), decision === "rejected");
 		},
 	});
+
+	/** プランのテストケースが多すぎる場合の警告（1 セッションで扱える大きさを超えそうなら Issue の分割を促す） */
+	function planSizeWarning(ctx: ExtensionContext, cfg: HarnessConfig): string | undefined {
+		const file = join(ctx.cwd, pathsOf(state).plan);
+		if (!existsSync(file)) return undefined;
+		const cases = readFileSync(file, "utf8").match(/^\|\s*T\d+\s*\|/gm)?.length ?? 0;
+		if (cases <= cfg.issueLimits.maxPlanTestCases) return undefined;
+		return `⚠ テストケースが ${cases} 件あります（目安 ${cfg.issueLimits.maxPlanTestCases} 件以下）。1 セッションで扱うには大きいため、Issue の分割を検討してください。`;
+	}
 
 	function approvalMessage(kind: ApprovalKind, decision: ApprovalDecision, comment?: string): string {
 		const c = comment ? `\nユーザーのコメント: ${comment}` : "";
@@ -817,15 +962,17 @@ export default function piHarness(pi: ExtensionAPI): void {
 				`# phase=${state.phase} expect=${params.expect}\n# reason: ${params.reason ?? ""}\n` +
 					runs.map((r) => `\n$ ${r.command}\n# exit=${r.code} killed=${r.killed} ${r.secs}s\n\n${r.output}`).join("\n"),
 			);
-			// 失敗したコマンド（無ければテスト）の出力末尾をモデルに渡す
+			// モデルに渡す出力は必要な分だけ: 合格時は要約のみ、Red 確認は失敗理由の確認に足る分、失敗時は失敗したコマンドの末尾
 			const shown = runs.find((r) => !ok(r)) ?? runs[0];
-			const { text: tail, truncated } = tailLines(shown.output, cfg.testOutputLines);
+			const lines = passed ? 0 : params.expect === "red" ? Math.min(cfg.testOutputLines, RED_OUTPUT_LINES) : cfg.testOutputLines;
 			const summary = runs
 				.map((r) => `$ ${r.command}\n  → ${ok(r) ? "PASS" : "FAIL"} (exit ${r.code}${r.killed ? ", タイムアウト/中断" : ""}, ${r.secs}s)`)
 				.join("\n");
-			const header =
-				`${summary}\n結果: ${passed ? "PASS" : "FAIL"}\n全ログ: ${log}\n\n` +
-				`[${shown.label}の出力${truncated ? `・先頭 ${truncated} 行を省略` : ""}: ${shown.command}]\n${tail}\n\n`;
+			let header = `${summary}\n結果: ${passed ? "PASS" : "FAIL"}\n全ログ: ${log}${lines ? "" : "（出力は省略。必要ならログを読む）"}\n\n`;
+			if (lines) {
+				const { text: tail, truncated } = tailLines(shown.output, lines);
+				header += `[${shown.label}の出力の末尾${truncated ? `・先頭 ${truncated} 行を省略` : ""}: ${shown.command}]\n${tail}\n\n`;
+			}
 			// 実行後の作業ツリーの指紋（合格後に bash 経由でファイルが変わってもレビューへ進めないようにする）
 			const fp = passed && params.expect === "green" ? await fingerprint(gitRun(ctx), ctx.cwd, gitExcludes(ctx, cfg)) : undefined;
 
@@ -887,7 +1034,10 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const cfg = cfgOf(ctx);
 			const mode = reviewMode(state);
 			const findings = params.findings as ReviewFinding[];
-			const { state: next, outcome } = recordReview(state, findings, params.summary, cfg.blockingSeverities);
+			const { state: recorded, outcome } = recordReview(state, findings, params.summary, cfg.blockingSeverities);
+			// レビューした時点の作業ツリーを記録し、次の軽量レビューでは「ここからの差分」だけを見せる
+			const snapshot = state.git ? await snapshotTree(gitRun(ctx), tempIndexFile(), gitExcludes(ctx, cfg)) : undefined;
+			const next = snapshot ? { ...recorded, review: { ...recorded.review, snapshot } } : recorded;
 			const report = writeItemFile(ctx, pathsOf(state).review(outcome.round), reviewMarkdown(outcome.round, mode, params.summary, findings, cfg));
 			setState(next, ctx);
 			switch (outcome.kind) {
@@ -932,6 +1082,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				Type.Object({
 					title: Type.String(),
 					body: Type.String({ description: "Markdown 本文（背景・スコープ・受け入れ条件・テスト観点・参照ドキュメント）" }),
+					size: StringEnum(["S", "M", "L"] as const, { description: "規模の見積もり: S = 〜100 行 / M = 〜300 行 / L = それ以上（L は分割が必要）" }),
 					labels: Type.Optional(Type.Array(Type.String())),
 					dependsOn: Type.Optional(Type.Array(Type.Number(), { description: "依存する Issue（この配列内の 0 始まりインデックス）" })),
 				}),
@@ -946,7 +1097,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			const cfg = cfgOf(ctx);
 			const drafts = params.issues as IssueDraft[];
-			const errors = validateDrafts(drafts);
+			const errors = validateDrafts(drafts, cfg.issueLimits);
 			if (errors.length) throw new Error(`Issue 案に問題があります:\n- ${errors.join("\n- ")}`);
 
 			if (ctx.hasUI) {
