@@ -60,7 +60,12 @@ const WHY: Partial<Record<Phase, string>> = {
 	bug_done: "バグ修正フローは完了しています。",
 };
 
+export const STATE_FILE = "state.json";
+
 export function checkWrite(state: HarnessState, path: string | undefined, p: GuardPaths): GuardDecision {
+	if (path && isInside(path, `${p.workDir}/${STATE_FILE}`, p.cwd)) {
+		return { block: true, reason: "[piHarness] ワークフロー状態ファイルは直接編集できません。harness_* ツールを使用してください。" };
+	}
 	if (!state.flow || state.phase === "idle" || !path) return { block: false };
 	const roots = writableRoots(state.phase, p);
 	if (!roots) return { block: false };

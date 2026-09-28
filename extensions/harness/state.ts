@@ -87,10 +87,28 @@ export interface SuspendedImplement {
 	issue?: IssueRef;
 }
 
+/**
+ * セッションを分ける単位。プロセスが変わるときは新しいセッションを開始し、
+ * 前のプロセスとの連携は成果物（md ファイル）だけで行う。
+ */
+export type ProcessKind = "requirements" | "issues" | "plan" | "implement" | "review" | "fix" | "bugfix";
+
+export interface PendingHandoff {
+	from: ProcessKind | null;
+	to: ProcessKind;
+	at: string;
+}
+
 export interface HarnessState {
-	version: 1;
+	version: 2;
 	flow: FlowKind | null;
 	phase: Phase;
+	/** 作業項目ごとの成果物ディレクトリ（cwd からの相対パス。例: .pi/harness/issue-12） */
+	itemDir?: string;
+	/** プロセスが切り替わり、新しいセッションでの開始を待っている */
+	pendingHandoff?: PendingHandoff;
+	/** エスカレーション・バグ修正の通し番号（成果物のファイル名に使用） */
+	counters: { escalations: number; bugs: number };
 	topic?: string;
 	issue?: IssueRef;
 	approvals: Partial<Record<ApprovalKind, ApprovalRecord>>;
@@ -103,6 +121,8 @@ export interface HarnessState {
 		/** 最後のテスト実行以降に edit/write でファイルが変更されたか */
 		dirty: boolean;
 		runs: number;
+		/** 直近のテストログ（cwd からの相対パス） */
+		lastLog?: string;
 	};
 	review: {
 		/** 実施済みレビュー周回数 */
@@ -135,9 +155,10 @@ export function now(): string {
 
 export function initialState(limits: Limits = DEFAULT_LIMITS): HarnessState {
 	return {
-		version: 1,
+		version: 2,
 		flow: null,
 		phase: "idle",
+		counters: { escalations: 0, bugs: 0 },
 		approvals: {},
 		test: { failures: 0, max: limits.maxTestLoops, dirty: false, runs: 0 },
 		review: { round: 0, max: limits.maxReviewLoops, history: [], lastFindings: [] },
@@ -171,8 +192,9 @@ export function isActive(s: HarnessState): boolean {
 // フロー開始
 // ---------------------------------------------------------------------------
 
-export function startRequirements(prev: HarnessState, topic: string, limits: Limits): HarnessState {
+export function startRequirements(prev: HarnessState, topic: string, limits: Limits, itemDir: string): HarnessState {
 	const s = initialState(limits);
+	s.itemDir = itemDir;
 	s.flow = "requirements";
 	s.phase = "req_clarify";
 	s.topic = topic;
@@ -180,8 +202,9 @@ export function startRequirements(prev: HarnessState, topic: string, limits: Lim
 	return withLog(s, `要件定義フロー開始: ${topic || "(テーマ未指定)"}`);
 }
 
-export function startImplement(prev: HarnessState, issue: IssueRef, limits: Limits): HarnessState {
+export function startImplement(prev: HarnessState, issue: IssueRef, limits: Limits, itemDir: string): HarnessState {
 	const s = initialState(limits);
+	s.itemDir = itemDir;
 	s.flow = "implement";
 	s.phase = "impl_context";
 	s.issue = issue;
@@ -192,7 +215,7 @@ export function startImplement(prev: HarnessState, issue: IssueRef, limits: Limi
 /**
  * バグ修正フローを開始する。実装フロー中（エスカレーション含む）であれば、その状態を退避し完了後に合流する。
  */
-export function startBugfix(prev: HarnessState, description: string, limits: Limits): HarnessState {
+export function startBugfix(prev: HarnessState, description: string, limits: Limits, standaloneItemDir: string): HarnessState {
 	const s = clone(prev);
 	const fromImplement =
 		prev.flow === "implement" || (prev.phase === "escalated" && prev.escalation?.flow === "implement");
@@ -206,11 +229,15 @@ export function startBugfix(prev: HarnessState, description: string, limits: Lim
 	} else {
 		s.suspended = undefined;
 	}
+	// 実装フローからの起動なら同じ作業ディレクトリに bug-N.md を置く
+	if (!s.suspended || !s.itemDir) s.itemDir = standaloneItemDir;
+	if (!(prev.flow === "bugfix" && prev.bug)) s.counters.bugs += 1;
 	s.flow = "bugfix";
 	s.phase = "bug_reproduce";
 	s.escalation = undefined;
 	s.bug = { description, startedAt: now() };
-	s.test = { failures: 0, max: limits.maxTestLoops, dirty: false, runs: 0 };
+	// 直近のテストログはバグ修正セッションの入力になるため引き継ぐ
+	s.test = { failures: 0, max: limits.maxTestLoops, dirty: false, runs: 0, lastLog: prev.test.lastLog };
 	return withLog(s, `バグ修正フロー開始: ${description || "(説明なし)"}`);
 }
 
@@ -364,6 +391,7 @@ export function recordTestRun(
 	prev: HarnessState,
 	expect: "red" | "green",
 	passed: boolean,
+	log?: string,
 ): { state: HarnessState; outcome: TestOutcome } {
 	if (!TEST_PHASES.includes(prev.phase)) {
 		throw new TransitionError(`現在のフェーズ (${prev.phase}) ではテストループは実行できません。`);
@@ -373,6 +401,7 @@ export function recordTestRun(
 	s.test.lastExpect = expect;
 	s.test.lastResult = passed ? "pass" : "fail";
 	s.test.dirty = false;
+	if (log) s.test.lastLog = log;
 
 	if (expect === "red") {
 		if (passed) return { state: withLog(s, "Red 期待のテストが合格（テストが不十分）"), outcome: { kind: "red_unexpected_pass" } };
@@ -469,6 +498,7 @@ export function escalate(prev: HarnessState, reason: EscalationReason, detail: s
 	if (!prev.flow) throw new TransitionError("アクティブなフローがありません。");
 	const s = clone(prev);
 	s.escalation = { reason, flow: prev.flow, phase: prev.phase, detail, at: now() };
+	s.counters.escalations += 1;
 	s.phase = "escalated";
 	return withLog(s, `エスカレーション (${reason}): ${detail}`);
 }
@@ -523,7 +553,59 @@ export function finishFlow(prev: HarnessState, reason: string): HarnessState {
 	s.flow = null;
 	s.phase = "idle";
 	s.escalation = undefined;
+	s.pendingHandoff = undefined;
 	return withLog(s, `フロー終了: ${reason}`);
+}
+
+// ---------------------------------------------------------------------------
+// プロセス（= セッション）境界
+// ---------------------------------------------------------------------------
+
+const PROCESS_OF: Record<Exclude<Phase, "idle" | "escalated">, ProcessKind> = {
+	req_clarify: "requirements",
+	req_document: "requirements",
+	req_approval: "requirements",
+	req_issues: "issues",
+	req_done: "issues",
+	impl_context: "plan",
+	impl_plan: "plan",
+	impl_plan_approval: "plan",
+	impl_tdd: "implement",
+	impl_review: "review",
+	impl_fix_review: "fix",
+	impl_done: "review",
+	bug_reproduce: "bugfix",
+	bug_analyze: "bugfix",
+	bug_fix: "bugfix",
+	bug_done: "bugfix",
+};
+
+/** フェーズが属するプロセス。エスカレーション中はエスカレーション元のプロセスに留まる */
+export function processOf(s: Pick<HarnessState, "phase" | "escalation">): ProcessKind | null {
+	if (s.phase === "idle") return null;
+	if (s.phase === "escalated") return s.escalation ? (PROCESS_OF[s.escalation.phase as keyof typeof PROCESS_OF] ?? null) : null;
+	return PROCESS_OF[s.phase];
+}
+
+/**
+ * 状態変化がプロセス境界をまたぐ場合、新しいセッションでの開始待ち (pendingHandoff) を設定する。
+ * 同じプロセス内の変化、フローの終了・完了フェーズへの到達では設定しない。
+ */
+export function withHandoff(prev: HarnessState, next: HarnessState): HarnessState {
+	const from = processOf(prev);
+	const to = processOf(next);
+	if (!to || !next.flow || from === to) return next;
+	if (next.phase === "impl_done" || next.phase === "req_done") return next;
+	const s = clone(next);
+	s.pendingHandoff = { from, to, at: now() };
+	return withLog(s, `プロセス切替待ち: ${from ?? "-"} → ${to}（新しいセッションで開始）`);
+}
+
+export function clearHandoff(prev: HarnessState): HarnessState {
+	if (!prev.pendingHandoff) return prev;
+	const s = clone(prev);
+	s.pendingHandoff = undefined;
+	return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +644,7 @@ export function statusLine(s: HarnessState): string {
 	if (s.flow !== "requirements") parts.push(`test ${s.test.failures}/${s.test.max}`);
 	if (s.flow === "implement") parts.push(`review ${s.review.round}/${s.review.max}`);
 	if (s.test.dirty) parts.push("未テスト変更あり");
+	if (s.pendingHandoff) parts.push(`次セッション待ち→${s.pendingHandoff.to}`);
 	return parts.join(" | ");
 }
 

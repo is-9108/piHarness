@@ -28,6 +28,8 @@ export interface HarnessConfig {
 	ensureLabels: boolean;
 	/** モデルに返すテスト出力の最大行数（全文はログファイルに保存） */
 	testOutputLines: number;
+	/** プロセス完了時に自動で新しいセッションを開始するか（false なら /harness next で手動開始） */
+	autoHandoff: boolean;
 }
 
 export const DEFAULT_CONFIG: HarnessConfig = {
@@ -40,6 +42,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
 	issueLabels: [],
 	ensureLabels: true,
 	testOutputLines: 120,
+	autoHandoff: true,
 };
 
 export const CONFIG_PATH = ".pi/harness.json";
@@ -77,6 +80,7 @@ export function mergeConfig(raw: Partial<HarnessConfig>, warnings: string[] = []
 		c.blockingSeverities = DEFAULT_CONFIG.blockingSeverities;
 	}
 	if (!Array.isArray(c.issueLabels)) c.issueLabels = [];
+	if (typeof c.autoHandoff !== "boolean") c.autoHandoff = DEFAULT_CONFIG.autoHandoff;
 	return c;
 }
 

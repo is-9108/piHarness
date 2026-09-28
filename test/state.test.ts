@@ -28,7 +28,7 @@ const blocker: ReviewFinding = { severity: "blocker", perspective: "correctness"
 const nit: ReviewFinding = { severity: "nit", perspective: "style", title: "naming", detail: "..." };
 
 function toTdd(): HarnessState {
-	let s = startImplement(initialState(), { number: 1, title: "x" }, L);
+	let s = startImplement(initialState(), { number: 1, title: "x" }, L, ".pi/harness/issue-1");
 	s = transition(s, "impl_plan");
 	s = beginApproval(s, "plan", [".pi/harness/plans/issue-1.md"]);
 	return applyApproval(s, "plan", "approved", undefined, [".pi/harness/plans/issue-1.md"]);
@@ -42,7 +42,7 @@ function toReview(): HarnessState {
 
 describe("要件定義フロー", () => {
 	it("承認されるまで Issue 登録できない", () => {
-		let s = startRequirements(initialState(), "在庫管理", L);
+		let s = startRequirements(initialState(), "在庫管理", L, ".pi/harness/req-x");
 		assert.equal(s.phase, "req_clarify");
 		assert.equal(canCreateIssues(s), false);
 		s = transition(s, "req_document");
@@ -59,7 +59,7 @@ describe("要件定義フロー", () => {
 	});
 
 	it("修正依頼で要件定義書作成へ戻り、却下で終了する", () => {
-		let s = transition(startRequirements(initialState(), "t", L), "req_document");
+		let s = transition(startRequirements(initialState(), "t", L, ".pi/harness/req-x"), "req_document");
 		s = beginApproval(s, "requirements", ["d.md"]);
 		s = applyApproval(s, "requirements", "revise", "スコープ見直し", ["d.md"]);
 		assert.equal(s.phase, "req_document");
@@ -70,21 +70,21 @@ describe("要件定義フロー", () => {
 	});
 
 	it("ヒアリング中に承認依頼はできない", () => {
-		const s = startRequirements(initialState(), "t", L);
+		const s = startRequirements(initialState(), "t", L, ".pi/harness/req-x");
 		assert.throws(() => beginApproval(s, "requirements", ["d.md"]), TransitionError);
 	});
 });
 
 describe("実装フロー: 承認ゲート", () => {
 	it("プラン承認前に TDD フェーズへは進めない", () => {
-		const s = transition(startImplement(initialState(), { title: "x" }, L), "impl_plan");
+		const s = transition(startImplement(initialState(), { title: "x" }, L, ".pi/harness/issue-1"), "impl_plan");
 		assert.throws(() => transition(s, "impl_tdd"), TransitionError);
 		assert.throws(() => recordTestRun(s, "green", true), TransitionError);
 	});
 
 	it("承認でTDDへ、修正依頼でプラン作成へ戻る", () => {
 		assert.equal(toTdd().phase, "impl_tdd");
-		let s = transition(startImplement(initialState(), { title: "x" }, L), "impl_plan");
+		let s = transition(startImplement(initialState(), { title: "x" }, L, ".pi/harness/issue-1"), "impl_plan");
 		s = beginApproval(s, "plan", ["p.md"]);
 		s = applyApproval(s, "plan", "revise", "テスト観点不足", ["p.md"]);
 		assert.equal(s.phase, "impl_plan");
@@ -210,7 +210,7 @@ describe("バグ修正フロー", () => {
 	}
 
 	it("エスカレーションから起動すると実装フローを退避し、完了後に impl_review へ合流する", () => {
-		let s = startBugfix(escalatedImpl(), "境界値で落ちる", L);
+		let s = startBugfix(escalatedImpl(), "境界値で落ちる", L, ".pi/harness/bug-x");
 		assert.equal(s.flow, "bugfix");
 		assert.equal(s.phase, "bug_reproduce");
 		assert.equal(s.suspended?.phase, "impl_tdd");
@@ -233,19 +233,19 @@ describe("バグ修正フロー", () => {
 	});
 
 	it("バグ修正フロー内の修正ループも 3 回で再エスカレーションし、再起動しても合流先を保持する", () => {
-		let s = startBugfix(escalatedImpl(), "bug", L);
+		let s = startBugfix(escalatedImpl(), "bug", L, ".pi/harness/bug-x");
 		s = transition(transition(s, "bug_analyze"), "bug_fix");
 		for (let i = 0; i < 3; i++) s = recordTestRun(s, "green", false).state;
 		assert.equal(s.phase, "escalated");
 		assert.equal(s.escalation?.reason, "bugfix_loop");
-		s = startBugfix(s, "bug 再挑戦", L);
+		s = startBugfix(s, "bug 再挑戦", L, ".pi/harness/bug-x");
 		assert.equal(s.suspended?.issue?.number, 1);
 		s = resumeAfterEscalation(escalate(transition(s, "bug_analyze"), "manual", "x"), L);
 		assert.equal(s.phase, "bug_analyze");
 	});
 
 	it("単独起動のバグ修正フローには合流先がない", () => {
-		let s = startBugfix(initialState(), "単独バグ", L);
+		let s = startBugfix(initialState(), "単独バグ", L, ".pi/harness/bug-x");
 		assert.equal(s.suspended, undefined);
 		s = transition(transition(s, "bug_analyze"), "bug_fix");
 		s = transition(recordTestRun(s, "green", true).state, "bug_done");
@@ -253,7 +253,7 @@ describe("バグ修正フロー", () => {
 	});
 
 	it("原因分析フェーズからコード修正を飛ばして完了できない", () => {
-		const s = transition(startBugfix(initialState(), "b", L), "bug_analyze");
+		const s = transition(startBugfix(initialState(), "b", L, ".pi/harness/bug-x"), "bug_analyze");
 		assert.throws(() => transition(s, "bug_done"), TransitionError);
 	});
 });

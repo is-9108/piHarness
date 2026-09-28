@@ -1,6 +1,6 @@
 # テスト/実装プラン: #<Issue番号> <タイトル>
 
-- Issue: <URL>
+- Issue: <URL>（本文: 作業ディレクトリの issue.md）
 - 関連要件: FR-xxx（`docs/requirements/<slug>.md`）
 - テストコマンド: `<testCommand>`
 

@@ -11,6 +11,10 @@ AI エージェントに次の 3 つのフローを「手順書」だけでな�
 
 ループ上限に達するとエージェントは自走をやめ、ユーザーに判断（ループ継続 / バグ修正フロー / 手動対応 / 中止）を求めます。
 
+**各プロセス（要件定義 / Issue 登録 / プラン作成 / TDD 実装 / レビュー / 指摘修正 / バグ修正）は独立したセッションで実行され、
+プロセス間の連携は成果物の md ファイル（`plan.md`, `implementation.md`, `review-N.md`, `fix-N.md`, `bug-N.md` など）だけで行います。**
+プロセスが完了すると自動で次のセッションが開始されます。
+
 詳しいフロー図と仕様は [docs/workflows.md](docs/workflows.md)、設計は [docs/architecture.md](docs/architecture.md) を参照してください。
 
 ## 必要なもの（Raspberry Pi）
@@ -61,7 +65,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
   → 質問に答える → 承認ダイアログで「承認する」 → Issue 登録の確認
 
 /impl 12
-  → プランを確認して承認 → あとは自動で TDD・テスト・レビュー
+  → プランを確認して承認 → あとは自動で TDD・テスト・レビュー（プロセスごとに新しいセッション）
   → 3 周で解決しなければエスカレーションダイアログ
 
 /bugfix センサー未接続時に例外で落ちる
@@ -75,11 +79,12 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | `/req [テーマ]` | 要件定義フローを開始 |
 | `/impl <番号 \| URL>` | TDD 実装フローを開始（`gh issue view` で本文を取得） |
 | `/bugfix [説明]` | バグ修正フローを開始（実装フロー中/エスカレーション中なら完了後に合流） |
-| `/harness status` | 現在のフロー・フェーズ・ループ回数・最近のイベント |
+| `/harness status` | 現在のフロー・フェーズ・プロセスの入出力成果物・ループ回数・最近のイベント |
+| `/harness next [指示]` | 次のプロセス（または中断中の現在のプロセス）を新しいセッションで開始（`autoHandoff: false` 時や pi 再起動後） |
 | `/harness approve [コメント]` | 承認待ちのドキュメント/プランを承認（ダイアログを閉じた場合や RPC 利用時） |
 | `/harness revise <修正内容>` | 修正を依頼 |
 | `/harness reject` | 却下してフローを中止 |
-| `/harness continue [指示]` | エスカレーション後、カウンタをリセットしてループを継続 |
+| `/harness continue [指示]` | エスカレーション後、カウンタをリセットしてループを継続（新しいセッション） |
 | `/harness rejoin` | 保留したバグ修正フローの結果を実装フローへ合流 |
 | `/harness abort` | フローを中止 |
 | `/harness config` | 有効な設定を表示 |
@@ -122,7 +127,8 @@ pi -e ~/piHarness/extensions/harness/index.ts
   "issueRepo": "owner/repo",
   "issueLabels": [],
   "ensureLabels": true,
-  "testOutputLines": 120
+  "testOutputLines": 120,
+  "autoHandoff": true
 }
 ```
 
@@ -134,11 +140,19 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | `maxReviewLoops` | 3 | レビューループ上限 |
 | `blockingSeverities` | blocker, major | 修正必須とみなす重大度 |
 | `docsDir` | docs | 要件定義書などの出力先 |
-| `workDir` | .pi/harness | プラン・レビュー記録・テストログ・バグレポートの出力先（`.gitignore` 推奨） |
+| `workDir` | .pi/harness | 状態ファイルと、作業項目ごとの成果物（プラン・実装レポート・レビュー記録・テストログ・バグレポート）の出力先 |
 | `issueRepo` | カレントリポジトリ | Issue 登録先 |
 | `issueLabels` | [] | 全 Issue に付与するラベル |
 | `ensureLabels` | true | 存在しないラベルを自動作成 |
 | `testOutputLines` | 120 | モデルに渡すテスト出力の末尾行数（全文はログに保存） |
+| `autoHandoff` | true | プロセス完了時に自動で新しいセッションを開始する。false なら `/harness next` で手動開始 |
+
+成果物の md ファイルは Issue ごとの作業記録としてコミットしても構いません。状態ファイルとテストログは `.gitignore` を推奨します:
+
+```gitignore
+.pi/harness/state.json
+.pi/harness/**/logs/
+```
 
 ## 開発
 
@@ -146,7 +160,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
 npm install
 npm run typecheck   # tsc
 npm test            # 状態機械・ガード・設定・Issue ヘルパーのユニットテスト (node --test)
-npm run test:e2e    # 偽モデルで実際の Pi セッションを動かし 3 フローを通す E2E
+npm run test:e2e    # 偽モデルで実際の Pi セッションランタイムを動かし、3 フローとセッション切り替えを通す E2E
 npm run check       # 上記すべて
 ```
 

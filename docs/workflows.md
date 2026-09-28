@@ -3,6 +3,50 @@
 piHarness が制御する 3 つのフローの仕様です。フェーズ遷移はすべて `extensions/harness/state.ts` の状態機械で検証され、
 エージェントは `harness_*` ツール経由でしか進められません。
 
+## セッションと成果物
+
+**各プロセスは独立したセッションで実行し、プロセス間の連携は成果物（md ファイル）だけで行います。** 前のプロセスの会話は次のセッションに引き継がれません。
+
+| プロセス（= 1 セッション） | フェーズ | 入力成果物 | 出力成果物 |
+|---|---|---|---|
+| 要件定義 | req_clarify → req_document → req_approval | `qa.md`（ヒアリング記録） | `docs/requirements/*.md`, `docs/design/*.md`, Issue 分割案 |
+| Issue 登録 | req_issues → req_done | 承認済みドキュメント, `qa.md` | GitHub Issue（または `docs/issues/*.md`）, `issues.md` |
+| プラン作成 | impl_context → impl_plan → impl_plan_approval | `issue.md` | `plan.md` |
+| TDD 実装 | impl_tdd | `issue.md`, `plan.md` | コード, `implementation.md` |
+| コードレビュー（周回ごと） | impl_review | `issue.md`, `plan.md`, `implementation.md`, 過去の `review-*.md` / `fix-*.md` / `bug-*.md` | `review-N.md` |
+| レビュー指摘修正（周回ごと） | impl_fix_review | `review-N.md`, `plan.md`, `implementation.md` | コード, `fix-N.md` |
+| バグ修正 | bug_reproduce → bug_analyze → bug_fix | `escalation-N.md`, 直近のテストログ, `issue.md`, `plan.md`, `implementation.md`, 直近の `review-N.md` | コード, `bug-N.md` |
+
+成果物は作業項目ごとのディレクトリに置かれます（Issue 登録先の要件定義書は `docs/`）。
+
+```text
+.pi/harness/
+├── state.json                 # ワークフロー状態（全セッション共通。直接編集は不可）
+├── req-2026-09-28-温度ロガー/   # 要件定義: qa.md, issues.md, handoff.md
+└── issue-12/                  # 実装フロー（バグ修正もここ）
+    ├── issue.md               # /impl 時に gh issue view で取得した本文
+    ├── plan.md                # テスト/実装プラン（承認対象）
+    ├── implementation.md      # 実装レポート
+    ├── review-1.md, fix-1.md, review-2.md …
+    ├── escalation-1.md, bug-1.md
+    ├── handoff.md             # セッション切り替えの履歴（入力/出力の一覧）
+    └── logs/test-*.log        # テストの全文ログ
+```
+
+### セッション切り替えの仕組み
+
+1. ツール（承認・テスト合格後の遷移・レビュー記録など）でプロセス境界をまたぐと、`state.json` に「次のプロセス待ち」が記録され、
+   エージェントには「プロセス完了。これ以上作業せず報告して終了」と返します（以降、`harness_*` 以外のツールはブロック）。
+2. エージェントが停止すると（`agent_settled`）、拡張が `/harness next` を実行します（`autoHandoff: false` なら手動）。
+3. `/harness next` は `handoff.md` に記録を追記し、**新しいセッション**を作成して、スキル + 入力/出力成果物の一覧だけを最初のメッセージとして送ります。
+4. 新しいセッションでは拡張が `state.json` から状態を読み込み、毎ターン現在のプロセスと成果物をエージェントに伝えます。
+
+次のプロセスへ進む前に出力成果物が必須です（`implementation.md` / `fix-N.md` / `bug-N.md` / `plan.md` が無いと遷移を拒否）。
+`/req`, `/impl`, `/bugfix` もそれぞれ新しいセッションで開始します。pi を再起動した場合は `/harness next` で現在のプロセスを新しいセッションとして再開できます。
+
+エスカレーション中の判断（ループ継続を選んだ場合）は同じセッションで続けます。後から `/harness continue` で継続した場合は、
+`escalation-N.md` を入力とする新しいセッションで再開します。
+
 ## 全体像
 
 ```mermaid
@@ -68,7 +112,7 @@ flowchart LR
 - 重大度 `blocker` / `major`（設定可）の指摘がブロッキングです。`minor` / `nit` は報告のみで完了を妨げません。
 - 1 周目はフルレビュー（requirements / correctness / tests / security / performance / maintainability / operability）。
 - 2 周目以降は軽量レビュー（前回指摘の解消確認 + 新規差分の重大な問題のみ）。
-- レビュー記録は `.pi/harness/reviews/issue-<番号>-round-<N>.md` に保存されます。
+- レビュー記録は作業ディレクトリの `review-<N>.md` に保存され、各周回のレビュー・修正はそれぞれ新しいセッションで行います。
 - `maxReviewLoops`（既定 3）周してもブロッキング指摘が残るとエスカレーションします。
 
 ## エスカレーション
@@ -100,5 +144,5 @@ UI がない場合（RPC/print モード）は停止してユーザーに報告�
 
 ## 状態の永続化
 
-- 状態は Pi セッションのカスタムエントリ（`harness-state`）として保存され、セッション再開・ツリー移動（分岐）時に復元されます。
-- プラン・レビュー記録・テストログ・バグレポートは `.pi/harness/` 配下のファイルとして残ります。
+- 状態は `.pi/harness/state.json` に保存され、すべてのセッションで共有されます（セッションの会話やツリー分岐には依存しません）。
+- 同時に進行できるフローは 1 つです（新しいフローを開始すると確認のうえ置き換えます）。

@@ -3,9 +3,13 @@
   "testTimeoutSec": 900,
   "maxTestLoops": 3,
   "maxReviewLoops": 3,
-  "blockingSeverities": ["blocker", "major"],
+  "blockingSeverities": [
+    "blocker",
+    "major"
+  ],
   "docsDir": "docs",
   "workDir": ".pi/harness",
   "issueLabels": [],
-  "ensureLabels": true
+  "ensureLabels": true,
+  "autoHandoff": true
 }

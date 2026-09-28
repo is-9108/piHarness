@@ -59,7 +59,7 @@ describe("config", () => {
 
 describe("guard", () => {
 	it("要件定義中は docs と作業ディレクトリのみ書き込める", () => {
-		const s = startRequirements(initialState(), "t", DEFAULT_LIMITS);
+		const s = startRequirements(initialState(), "t", DEFAULT_LIMITS, ".pi/harness/req-x");
 		assert.equal(checkWrite(s, "docs/requirements/a.md", paths).block, false);
 		assert.equal(checkWrite(s, "/repo/.pi/harness/x.md", paths).block, false);
 		assert.equal(checkWrite(s, "src/index.ts", paths).block, true);
@@ -67,7 +67,7 @@ describe("guard", () => {
 	});
 
 	it("プラン承認前はコードを変更できず、承認後の TDD 中は制限しない", () => {
-		let s = transition(startImplement(initialState(), { title: "x" }, DEFAULT_LIMITS), "impl_plan");
+		let s = transition(startImplement(initialState(), { title: "x" }, DEFAULT_LIMITS, ".pi/harness/issue-1"), "impl_plan");
 		assert.equal(checkWrite(s, "src/a.ts", paths).block, true);
 		assert.equal(checkWrite(s, ".pi/harness/plans/p.md", paths).block, false);
 		s = { ...s, phase: "impl_tdd" };
@@ -80,7 +80,7 @@ describe("guard", () => {
 	});
 
 	it("フロー中の gh issue create は専用ツールへ誘導する", () => {
-		const s = startRequirements(initialState(), "t", DEFAULT_LIMITS);
+		const s = startRequirements(initialState(), "t", DEFAULT_LIMITS, ".pi/harness/req-x");
 		assert.equal(checkBash(s, "gh issue create --title x").block, true);
 		assert.equal(checkBash(s, "gh issue list").block, false);
 	});
@@ -145,7 +145,7 @@ describe("text / guidance", () => {
 	});
 
 	it("コンテキストに現在フェーズと次の行動を含める", () => {
-		const s = startImplement(initialState(), { number: 3, title: "API" }, DEFAULT_LIMITS);
+		const s = startImplement(initialState(), { number: 3, title: "API" }, DEFAULT_LIMITS, ".pi/harness/issue-1");
 		const text = buildContext(s, { ...mergeConfig({}), testCommand: "npm test" });
 		assert.match(text, /impl_context/);
 		assert.match(text, /#3 API/);

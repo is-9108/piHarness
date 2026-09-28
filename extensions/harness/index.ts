@@ -5,17 +5,29 @@
  * 2. TDD 実装フロー   (/impl)   : Issue/コード読込 → テスト/実装プラン → 承認 → TDD → テストループ(3周) → レビューループ(3周)
  * 3. バグ修正フロー   (/bugfix) : エスカレーション時にユーザー判断で起動 → 完了後に実装フローへ合流
  *
- * 状態遷移は state.ts の純粋関数で行い、この拡張はツール/コマンド/イベントとの接続だけを担う。
+ * 各プロセス（要件定義 / Issue 登録 / プラン / 実装 / レビュー / 指摘修正 / バグ修正）は独立したセッションで実行する。
+ * プロセス間の連携は作業ディレクトリの md ファイル（成果物）と state.json だけで行い、会話は引き継がない。
+ *
+ * 状態遷移は state.ts、引き継ぎは handoff.ts の純粋関数で行い、この拡張はツール/コマンド/イベントとの接続だけを担う。
  */
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type HarnessConfig, loadConfig, saveConfigPatch } from "./config.ts";
-import { checkBash, checkWrite, type GuardPaths, isHarnessFile } from "./guard.ts";
+import { checkBash, checkWrite, type GuardPaths, isHarnessFile, STATE_FILE } from "./guard.ts";
 import { buildContext } from "./guidance.ts";
+import {
+	escalationMarkdown,
+	handoffRecord,
+	kickoffMessage,
+	PROCESS_LABELS,
+	pathsOf,
+	processIO,
+	requiredArtifact,
+} from "./handoff.ts";
 import {
 	type IssueDraft,
 	draftFileName,
@@ -34,6 +46,7 @@ import {
 	applyApproval,
 	beginApproval,
 	canCreateIssues,
+	clearHandoff,
 	describeIssue,
 	finishFlow,
 	type HarnessState,
@@ -44,6 +57,7 @@ import {
 	markDirty,
 	PHASE_LABELS,
 	type Phase,
+	processOf,
 	recordIssues,
 	recordReview,
 	recordTestRun,
@@ -58,34 +72,52 @@ import {
 	TEST_PHASES,
 	transition,
 	TransitionError,
+	withHandoff,
 } from "./state.ts";
-import { tailLines, timestamp } from "./text.ts";
+import { slugify, tailLines, timestamp } from "./text.ts";
 
-const STATE_ENTRY = "harness-state";
 const CONTEXT_MESSAGE = "harness-context";
-
 const ALL_PHASES = Object.keys(PHASE_LABELS) as Phase[];
 
 type ToolText = { content: { type: "text"; text: string }[]; details: { phase: Phase }; terminate?: boolean };
 
 export default function piHarness(pi: ExtensionAPI): void {
+	/** state.json のキャッシュ。セッションが変わると拡張は再生成されるため、真実は常にファイル側にある */
 	let state: HarnessState = initialState();
 
 	// -----------------------------------------------------------------------
 	// 共通ヘルパー
 	// -----------------------------------------------------------------------
 
-	const cfgOf = (ctx: ExtensionContext): HarnessConfig => loadConfig(ctx.cwd).config;
+	const cfgOf = (ctx: { cwd: string }): HarnessConfig => loadConfig(ctx.cwd).config;
 	const limitsOf = (cfg: HarnessConfig): Limits => ({ maxTestLoops: cfg.maxTestLoops, maxReviewLoops: cfg.maxReviewLoops });
-	const pathsOf = (ctx: ExtensionContext, cfg: HarnessConfig): GuardPaths => ({
+	const guardPaths = (ctx: ExtensionContext, cfg: HarnessConfig): GuardPaths => ({
 		cwd: ctx.cwd,
 		docsDir: cfg.docsDir,
 		workDir: cfg.workDir,
 	});
+	const stateFile = (ctx: { cwd: string }) => join(ctx.cwd, cfgOf(ctx).workDir, STATE_FILE);
+	const existsIn = (ctx: { cwd: string }) => (path: string) => existsSync(join(ctx.cwd, path));
 
+	function loadState(ctx: ExtensionContext): HarnessState {
+		const file = stateFile(ctx);
+		const fresh = initialState(limitsOf(cfgOf(ctx)));
+		if (!existsSync(file)) return fresh;
+		try {
+			const parsed = JSON.parse(readFileSync(file, "utf8")) as HarnessState;
+			return parsed.version === 2 ? parsed : fresh;
+		} catch (e) {
+			ctx.ui.notify(`[piHarness] ${file} を読み込めませんでした: ${(e as Error).message}`, "error");
+			return fresh;
+		}
+	}
+
+	/** 状態を更新して state.json に保存する。プロセス境界をまたぐ場合は新セッション待ちを記録する */
 	function setState(next: HarnessState, ctx: ExtensionContext): void {
-		state = next;
-		pi.appendEntry(STATE_ENTRY, state);
+		state = withHandoff(state, next);
+		const file = stateFile(ctx);
+		mkdirSync(dirname(file), { recursive: true });
+		writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`);
 		refreshUI(ctx);
 	}
 
@@ -94,40 +126,78 @@ export default function piHarness(pi: ExtensionAPI): void {
 		ctx.ui.setStatus("harness", line ? `🧭 ${line}` : undefined);
 	}
 
-	function reconstruct(ctx: ExtensionContext): void {
-		state = initialState(limitsOf(cfgOf(ctx)));
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "custom" && entry.customType === STATE_ENTRY && entry.data) {
-				state = entry.data as HarnessState;
-			}
-		}
-		refreshUI(ctx);
+	function writeItemFile(ctx: { cwd: string }, rel: string, content: string, append = false): string {
+		const abs = join(ctx.cwd, rel);
+		mkdirSync(dirname(abs), { recursive: true });
+		if (append) appendFileSync(abs, content);
+		else writeFileSync(abs, content);
+		return rel;
+	}
+
+	/** 同じ名前の作業ディレクトリが既にあれば -r2, -r3 … を付けて新しく作る */
+	function newItemDir(ctx: { cwd: string }, base: string): string {
+		const root = cfgOf(ctx).workDir;
+		let dir = join(root, base);
+		for (let i = 2; existsSync(join(ctx.cwd, dir)); i++) dir = join(root, `${base}-r${i}`);
+		return dir;
+	}
+
+	/** プロセス境界に達したときにツール結果へ付け加える文言 */
+	function withHandoffNotice(result: ToolText): ToolText {
+		if (!state.pendingHandoff) return result;
+		const next = PROCESS_LABELS[state.pendingHandoff.to];
+		result.content[0].text +=
+			`\n\n[プロセス完了] 次の「${next}」は新しいセッションで開始されます（会話は引き継がれず、成果物ファイルのみが引き継がれます）。` +
+			"これ以上作業せず、このプロセスの成果を 1〜3 文で報告して終了してください。";
+		result.terminate = true;
+		return result;
 	}
 
 	function reply(text: string, terminate = false): ToolText {
-		return { content: [{ type: "text", text }], details: { phase: state.phase }, ...(terminate ? { terminate } : {}) };
-	}
-
-	function writeWorkFile(ctx: ExtensionContext, cfg: HarnessConfig, rel: string, content: string): string {
-		const path = join(cfg.workDir, rel);
-		const abs = join(ctx.cwd, path);
-		mkdirSync(dirname(abs), { recursive: true });
-		writeFileSync(abs, content);
-		return path;
-	}
-
-	function issueSlug(): string {
-		return state.issue?.number ? `issue-${state.issue.number}` : "work";
+		return withHandoffNotice({
+			content: [{ type: "text", text }],
+			details: { phase: state.phase },
+			...(terminate ? { terminate } : {}),
+		});
 	}
 
 	/**
-	 * ループ上限到達時のエスカレーション。UI があればその場でユーザーに判断を仰ぐ。
-	 * 戻り値はツール結果として返すテキスト。
+	 * 現在のプロセスを新しいセッションで開始する（コマンドからのみ呼べる）。
+	 * 引き継ぎ内容を handoff.md に記録してから state.json を保存し、新セッションで開始メッセージを送る。
+	 */
+	async function startProcessSession(ctx: ExtensionCommandContext, note?: string): Promise<void> {
+		const exists = existsIn(ctx);
+		const kickoff = kickoffMessage(state, exists, note);
+		writeItemFile(ctx, pathsOf(state).handoff, handoffRecord(state, exists), true);
+		const pending = state.pendingHandoff;
+		setState(clearHandoff(state), ctx);
+		const proc = processOf(state);
+		const title = `${state.issue?.number ? `#${state.issue.number} ` : ""}${proc ? PROCESS_LABELS[proc] : ""}`;
+		const result = await ctx.newSession({
+			withSession: async (next) => {
+				next.ui.notify(`piHarness: ${title} を新しいセッションで開始します`, "info");
+				// エージェントの実行完了を待たずにコマンドを終える
+				void next.sendUserMessage(kickoff, { expandPromptTemplates: true }).catch((e: unknown) => {
+					next.ui.notify(`[piHarness] 開始メッセージの送信に失敗しました: ${(e as Error).message}`, "error");
+				});
+			},
+		});
+		if (result.cancelled) {
+			// 新セッションが開始されなかった場合は、次回 /harness next で再試行できるよう待ち状態に戻す
+			if (pending) setState({ ...state, pendingHandoff: pending }, ctx);
+			ctx.ui.notify("新しいセッションの開始がキャンセルされました。/harness next で再開できます。", "warning");
+		}
+	}
+
+	/**
+	 * ループ上限時のエスカレーション。記録ファイルを書き出し、UI があればその場でユーザーに判断を仰ぐ。
 	 */
 	async function handleEscalation(ctx: ExtensionContext, headline: string): Promise<ToolText> {
 		const cfg = cfgOf(ctx);
+		const n = state.counters.escalations;
+		const record = writeItemFile(ctx, pathsOf(state).escalation(n), escalationMarkdown(state, n));
 		const esc = state.escalation;
-		const detail = `${headline}\n理由: ${esc?.detail ?? ""}`;
+		const detail = `${headline}\n理由: ${esc?.detail ?? ""}\nエスカレーション記録: ${record}`;
 		if (!ctx.hasUI) {
 			return reply(
 				`${detail}\n\n[ESCALATED] 作業を止め、状況（試したこと・失敗の原因仮説・選択肢）をユーザーに報告してください。` +
@@ -137,7 +207,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		}
 		const options = [
 			"ループを継続する（カウンタをリセットしてもう一度）",
-			"独立したバグ修正フローで対応する",
+			"独立したバグ修正フローで対応する（新しいセッション）",
 			"手動で対応する（フローを一時停止）",
 			"フローを中止する",
 		];
@@ -152,12 +222,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (choice === options[1]) {
 			const description =
 				(await ctx.ui.input("バグの内容（空欄ならエスカレーション理由を使用）", esc?.detail ?? "")) || esc?.detail || headline;
-			setState(startBugfix(state, description, limitsOf(cfg)), ctx);
-			return reply(
-				`${detail}\n\nユーザー判断: 独立したバグ修正フローを開始しました（バグ: ${description}）。` +
-					"skill harness-bugfix の SKILL.md を読み、その手順（再現テスト → 原因分析 → 修正 → 検証）に従ってください。" +
-					(state.suspended ? "完了後は実装フローへ合流します。" : ""),
-			);
+			setState(startBugfix(state, description, limitsOf(cfg), newItemDir(ctx, `bug-${timestamp()}`)), ctx);
+			return reply(`${detail}\n\nユーザー判断: 独立したバグ修正フローで対応します（バグ: ${description}）。`);
 		}
 		if (choice === options[3]) {
 			setState(finishFlow(state, "エスカレーション後にユーザーが中止"), ctx);
@@ -175,17 +241,29 @@ export default function piHarness(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	pi.on("session_start", async (_e, ctx) => {
-		reconstruct(ctx);
+		state = loadState(ctx);
+		refreshUI(ctx);
 		const { warnings } = loadConfig(ctx.cwd);
 		for (const w of warnings) ctx.ui.notify(`[piHarness] ${w}`, "warning");
+		if (state.pendingHandoff) {
+			ctx.ui.notify(`piHarness: 「${PROCESS_LABELS[state.pendingHandoff.to]}」の開始待ちです。/harness next で開始します。`, "info");
+		}
 	});
-	pi.on("session_tree", async (_e, ctx) => reconstruct(ctx));
 
-	// 現在のフェーズと次の行動をエージェントに伝える
+	// 現在のプロセス・入出力成果物・次の行動をエージェントに伝える
 	pi.on("before_agent_start", async (_e, ctx) => {
 		if (!isActive(state)) return;
+		const proc = processOf(state);
+		if (proc && !pi.getSessionName()) {
+			const who = state.issue?.number ? `#${state.issue.number} ` : state.topic ? `${state.topic} ` : "";
+			pi.setSessionName(`[harness] ${who}${PROCESS_LABELS[proc]}`);
+		}
 		return {
-			message: { customType: CONTEXT_MESSAGE, content: buildContext(state, cfgOf(ctx)), display: false },
+			message: {
+				customType: CONTEXT_MESSAGE,
+				content: buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx))),
+				display: false,
+			},
 		};
 	});
 
@@ -200,13 +278,30 @@ export default function piHarness(pi: ExtensionAPI): void {
 		return { messages: event.messages.filter((m, i) => !isCtx(m) || (i === lastIndex && isActive(state))) };
 	});
 
-	// 承認ゲート前のコード変更をブロック
+	// プロセスが終わったら、エージェントが止まった時点で次のプロセスを新しいセッションで開始する
+	pi.on("agent_settled", async (_e, ctx) => {
+		if (!state.pendingHandoff) return;
+		if (cfgOf(ctx).autoHandoff) {
+			pi.sendUserMessage("/harness next", { expandPromptTemplates: true });
+		} else {
+			ctx.ui.notify(`次のプロセス「${PROCESS_LABELS[state.pendingHandoff.to]}」は /harness next で新しいセッションとして開始します。`, "info");
+		}
+	});
+
+	// 承認ゲート前のコード変更・状態ファイルの改ざん・プロセス完了後の作業をブロック
 	pi.on("tool_call", async (event, ctx) => {
-		if (!isActive(state)) return;
 		const cfg = cfgOf(ctx);
 		if (event.toolName === "edit" || event.toolName === "write") {
-			const d = checkWrite(state, (event.input as { path?: string }).path, pathsOf(ctx, cfg));
+			const d = checkWrite(state, (event.input as { path?: string }).path, guardPaths(ctx, cfg));
 			if (d.block) return { block: true, reason: d.reason };
+		}
+		if (!isActive(state)) return;
+		if (state.pendingHandoff && !event.toolName.startsWith("harness_")) {
+			return {
+				block: true,
+				reason: "[piHarness] このプロセスは完了しています。次のプロセスは新しいセッションで開始されます。作業を終了してください。",
+				terminate: true,
+			};
 		}
 		if (event.toolName === "bash") {
 			const d = checkBash(state, (event.input as { command?: string }).command);
@@ -219,7 +314,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (!isActive(state) || event.isError) return;
 		if (event.toolName !== "edit" && event.toolName !== "write") return;
 		const path = (event.input as { path?: string }).path;
-		if (isHarnessFile(path, pathsOf(ctx, cfgOf(ctx)))) return;
+		if (isHarnessFile(path, guardPaths(ctx, cfgOf(ctx)))) return;
 		if (!TEST_PHASES.includes(state.phase)) return;
 		const next = markDirty(state);
 		if (next !== state) setState(next, ctx);
@@ -232,12 +327,12 @@ export default function piHarness(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "harness_status",
 		label: "Harness Status",
-		description: "piHarness のワークフロー状態（フロー・フェーズ・ループ回数・承認状況・次にやること）を取得する。",
-		promptSnippet: "Show piHarness workflow state (flow, phase, loop counters, approvals, next action)",
+		description: "piHarness のワークフロー状態（フロー・フェーズ・プロセスの入出力成果物・ループ回数・次にやること）を取得する。",
+		promptSnippet: "Show piHarness workflow state (process, artifacts, loop counters, next action)",
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			if (!isActive(state)) return reply("piHarness: アクティブなフローはありません。/req, /impl, /bugfix で開始できます。");
-			return reply(buildContext(state, cfgOf(ctx)));
+			return reply(buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx))));
 		},
 	});
 
@@ -245,11 +340,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 		name: "harness_ask",
 		label: "Ask User",
 		description:
-			"ユーザーに質問して回答を得る。要件の曖昧な点を確認するときに使う。1 回の呼び出しで 1 論点。選択肢を渡すと選択式（自由入力も可）になる。",
+			"ユーザーに質問して回答を得る。要件の曖昧な点を確認するときに使う。1 回の呼び出しで 1 論点。選択肢を渡すと選択式（自由入力も可）になる。質問と回答は作業ディレクトリの qa.md に記録され、後続のプロセスに引き継がれる。",
 		promptSnippet: "Ask the user one clarifying question (optionally with choices) and get the answer",
-		promptGuidelines: [
-			"要件定義中は仕様が明確になるまで harness_ask で質問を繰り返す。推測で仕様を決めない。",
-		],
+		promptGuidelines: ["要件定義中は仕様が明確になるまで harness_ask で質問を繰り返す。推測で仕様を決めない。"],
 		parameters: Type.Object({
 			question: Type.String({ description: "質問文。背景と、なぜそれを決める必要があるかを 1〜2 文で含める" }),
 			options: Type.Optional(Type.Array(Type.String(), { description: "選択肢（推奨があれば先頭に置き「(推奨)」と付ける）" })),
@@ -265,8 +358,12 @@ export default function piHarness(pi: ExtensionAPI): void {
 			} else {
 				answer = await ctx.ui.input(params.question);
 			}
-			if (!answer?.trim()) return reply("ユーザーは回答しませんでした（スキップ）。必要なら別の聞き方で再度質問してください。");
-			return reply(`ユーザーの回答: ${answer.trim()}`);
+			const text = answer?.trim();
+			if (isActive(state) && state.itemDir) {
+				writeItemFile(ctx, pathsOf(state).qa, `\n### Q (${new Date().toISOString()})\n\n${params.question}\n\n**A:** ${text || "（回答なし）"}\n`, true);
+			}
+			if (!text) return reply("ユーザーは回答しませんでした（スキップ）。必要なら別の聞き方で再度質問してください。");
+			return reply(`ユーザーの回答: ${text}`);
 		},
 	});
 
@@ -274,7 +371,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		name: "harness_phase",
 		label: "Harness Phase",
 		description:
-			"ワークフローのフェーズを遷移する。承認・テスト合格が必要な遷移は条件を満たさないと失敗する。承認依頼・テスト実行・レビュー記録・Issue 登録は専用ツールを使う。",
+			"ワークフローのフェーズを遷移する。承認・テスト合格・成果物の作成が必要な遷移は条件を満たさないと失敗する。承認依頼・テスト実行・レビュー記録・Issue 登録は専用ツールを使う。",
 		promptSnippet: "Move the piHarness workflow to the next phase (validated)",
 		parameters: Type.Object({
 			to: StringEnum(ALL_PHASES as [Phase, ...Phase[]], { description: "遷移先フェーズ" }),
@@ -283,7 +380,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!isActive(state)) throw new Error("アクティブなフローがありません。");
-			setState(transition(state, params.to, params.note), ctx);
+			const next = transition(state, params.to, params.note);
+			const required = requiredArtifact(state, params.to);
+			if (required && !existsSync(join(ctx.cwd, required.path))) {
+				throw new Error(
+					`${params.to} へ進む前に成果物 ${required.path} を作成してください（${required.template} を使用）。` +
+						"次のプロセスは新しいセッションで開始され、このファイルだけが引き継がれます。",
+				);
+			}
+			setState(next, ctx);
 
 			if (state.phase === "bug_done") {
 				if (!state.suspended) {
@@ -292,17 +397,14 @@ export default function piHarness(pi: ExtensionAPI): void {
 				}
 				let rejoin = true;
 				if (ctx.hasUI) {
-					const options = ["実装フローへ合流する（コードレビューから再開）", "ここで止める（後で /harness rejoin）"];
+					const options = ["実装フローへ合流する（新しいセッションでコードレビューから再開）", "ここで止める（後で /harness rejoin）"];
 					rejoin = (await ctx.ui.select("バグ修正が完了しました。実装フローへ合流しますか？", options)) === options[0];
 				}
 				if (!rejoin) return reply("バグ修正完了。ユーザーは合流を保留しました。状況を報告して待機してください。", true);
 				setState(rejoinImplement(state, limitsOf(cfgOf(ctx))), ctx);
-				return reply(
-					`バグ修正完了 → 実装フロー（${describeIssue(state.issue)}）へ合流しました。フェーズ: impl_review。` +
-						"バグ修正で変更が入ったため、skill harness-review に従いフルレビューを実施してください。",
-				);
+				return reply(`バグ修正完了 → 実装フロー（${describeIssue(state.issue)}）へ合流します。合流後はフルレビューから再開します。`);
 			}
-			return reply(`フェーズを ${state.phase}（${PHASE_LABELS[state.phase]}）へ遷移しました。\n\n${buildContext(state, cfgOf(ctx))}`);
+			return reply(`フェーズを ${state.phase}（${PHASE_LABELS[state.phase]}）へ遷移しました。`);
 		},
 	});
 
@@ -310,7 +412,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		name: "harness_request_approval",
 		label: "Request Approval",
 		description:
-			"人間の承認ゲート。要件定義書（kind: requirements）またはテスト/実装プラン（kind: plan）の承認をユーザーに依頼し、結果を返す。承認されるまで次のフェーズへは進めない。",
+			"人間の承認ゲート。要件定義書（kind: requirements）またはテスト/実装プラン（kind: plan）の承認をユーザーに依頼し、結果を返す。承認されるまで次のプロセスへは進めない。",
 		promptSnippet: "Ask the human to approve requirements or the test/implementation plan (hard gate)",
 		parameters: Type.Object({
 			kind: StringEnum(["requirements", "plan"] as const),
@@ -320,20 +422,26 @@ export default function piHarness(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const kind = params.kind as ApprovalKind;
-			const missing = params.documents.filter((d) => !existsSync(join(ctx.cwd, d)));
+			let documents = params.documents;
+			if (kind === "plan") {
+				const plan = pathsOf(state).plan;
+				if (!existsSync(join(ctx.cwd, plan))) throw new Error(`プランは ${plan} に作成してください（次のプロセスへはこのファイルが引き継がれます）。`);
+				documents = [plan, ...documents.filter((d) => d !== plan)];
+			}
+			const missing = documents.filter((d) => !existsSync(join(ctx.cwd, d)));
 			if (missing.length) throw new Error(`ドキュメントが見つかりません: ${missing.join(", ")}`);
-			setState(beginApproval(state, kind, params.documents), ctx);
+			setState(beginApproval(state, kind, documents), ctx);
 
 			const label = kind === "requirements" ? "要件定義" : "テスト/実装プラン";
 			if (!ctx.hasUI) {
 				return reply(
-					`${label}の承認待ちです。ドキュメント (${params.documents.join(", ")}) と要約をユーザーに提示し、` +
+					`${label}の承認待ちです。ドキュメント (${documents.join(", ")}) と要約をユーザーに提示し、` +
 						"/harness approve [コメント] または /harness revise <修正内容> の入力を待ってください。",
 					true,
 				);
 			}
 			const options = ["承認する", "修正を依頼する", "却下する（フローを中止）"];
-			const title = `【${label}の承認依頼】\n${params.summary.slice(0, 1500)}\n\n対象: ${params.documents.join(", ")}`;
+			const title = `【${label}の承認依頼】\n${params.summary.slice(0, 1500)}\n\n対象: ${documents.join(", ")}`;
 			const choice = await ctx.ui.select(title, options);
 			if (choice === undefined) {
 				return reply(
@@ -345,18 +453,14 @@ export default function piHarness(pi: ExtensionAPI): void {
 			let comment: string | undefined;
 			if (decision === "revise") comment = (await ctx.ui.editor(`${label}への修正依頼`, "")) || undefined;
 			if (decision === "approved") comment = (await ctx.ui.input("承認コメント（任意）")) || undefined;
-			setState(applyApproval(state, kind, decision, comment, params.documents), ctx);
+			setState(applyApproval(state, kind, decision, comment, documents), ctx);
 			return reply(approvalMessage(kind, decision, comment), decision === "rejected");
 		},
 	});
 
 	function approvalMessage(kind: ApprovalKind, decision: ApprovalDecision, comment?: string): string {
 		const c = comment ? `\nユーザーのコメント: ${comment}` : "";
-		if (decision === "approved") {
-			return kind === "requirements"
-				? `要件定義が承認されました。${c}\n次: Issue 分割案に従い harness_create_issues で Issue を登録してください。`
-				: `テスト/実装プランが承認されました。${c}\n次: TDD で実装を開始してください（まず失敗するテストを書き harness_run_tests expect: red）。`;
-		}
+		if (decision === "approved") return `${kind === "requirements" ? "要件定義" : "テスト/実装プラン"}が承認されました。${c}`;
 		if (decision === "revise") {
 			return `修正を依頼されました。${c}\n指摘を反映して${kind === "requirements" ? "要件定義書" : "プラン"}を更新し、再度 harness_request_approval してください。不明点は harness_ask で確認すること。`;
 		}
@@ -388,29 +492,24 @@ export default function piHarness(pi: ExtensionAPI): void {
 				command = (await ctx.ui.input("テストコマンドが未設定です。テストスイート全体を実行するコマンドを入力してください", "npm test"))?.trim();
 				if (command) saveConfigPatch(ctx.cwd, { testCommand: command });
 			}
-			if (!command) throw new Error(`テストコマンドが未設定です。${".pi/harness.json"} の testCommand を設定してください。`);
+			if (!command) throw new Error("テストコマンドが未設定です。.pi/harness.json の testCommand を設定してください。");
 
 			const started = Date.now();
-			const result = await pi.exec("bash", ["-lc", command], {
-				cwd: ctx.cwd,
-				timeout: cfg.testTimeoutSec * 1000,
-				signal,
-			});
+			const result = await pi.exec("bash", ["-lc", command], { cwd: ctx.cwd, timeout: cfg.testTimeoutSec * 1000, signal });
 			const secs = ((Date.now() - started) / 1000).toFixed(1);
 			const passed = result.code === 0 && !result.killed;
 			const output = `${result.stdout}\n${result.stderr}`;
-			const log = writeWorkFile(
+			const log = writeItemFile(
 				ctx,
-				cfg,
-				`logs/test-${timestamp()}.log`,
-				`$ ${command}\n# exit=${result.code} killed=${result.killed} ${secs}s expect=${params.expect}\n# reason: ${params.reason ?? ""}\n\n${output}`,
+				join(pathsOf(state).logs, `test-${timestamp()}.log`),
+				`$ ${command}\n# phase=${state.phase} exit=${result.code} killed=${result.killed} ${secs}s expect=${params.expect}\n# reason: ${params.reason ?? ""}\n\n${output}`,
 			);
 			const { text: tail, truncated } = tailLines(output, cfg.testOutputLines);
 			const header =
 				`$ ${command}\n結果: ${passed ? "PASS" : "FAIL"} (exit ${result.code}${result.killed ? ", タイムアウト/中断" : ""}, ${secs}s)` +
 				`\n全ログ: ${log}${truncated ? `（先頭 ${truncated} 行を省略）` : ""}\n\n${tail}\n\n`;
 
-			const { state: next, outcome } = recordTestRun(state, params.expect, passed);
+			const { state: next, outcome } = recordTestRun(state, params.expect, passed, log);
 			setState(next, ctx);
 			switch (outcome.kind) {
 				case "red_confirmed":
@@ -418,15 +517,16 @@ export default function piHarness(pi: ExtensionAPI): void {
 				case "red_unexpected_pass":
 					return reply(`${header}⚠ 失敗するはずのテストが合格しました。テストが要件やバグを捉えていません。テストを見直してください（ループ回数には数えません）。`);
 				case "pass": {
-					const next =
+					const p = pathsOf(state);
+					const hint =
 						state.phase === "impl_tdd"
-							? "プランの全項目が完了していれば harness_phase で impl_review へ。残りがあれば次のテストを書く (Red)。"
+							? `プランの全項目が完了していれば、実装レポート ${p.implementation} を書いて harness_phase で impl_review へ。残りがあれば次のテストを書く (Red)。`
 							: state.phase === "impl_fix_review"
-								? "harness_phase で impl_review へ戻り、軽量レビューを受けてください。"
+								? `指摘ごとの対応を ${p.fix(state.review.round)} に書いて harness_phase で impl_review へ。`
 								: state.phase === "bug_fix"
-									? "harness_phase で bug_done へ進んでください。"
+									? `バグレポート ${p.bug(state.counters.bugs)} を完成させて harness_phase で bug_done へ。`
 									: "次のステップへ進んでください。";
-					return reply(`${header}✅ 全テスト合格。${next}`);
+					return reply(`${header}✅ 全テスト合格。${hint}`);
 				}
 				case "fail":
 					return reply(
@@ -435,7 +535,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 							"テストを弱める・スキップする・削除することで合格させてはいけません。",
 					);
 				case "escalate":
-					return handleEscalation(ctx, `${header}テスト修正ループが上限 (${outcome.failures} 周) に達しました`);
+					return handleEscalation(ctx, `テスト修正ループが上限 (${outcome.failures} 周) に達しました（直近ログ: ${log}）`);
 			}
 		},
 	});
@@ -456,7 +556,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		name: "harness_record_review",
 		label: "Record Review",
 		description:
-			"コードレビュー結果を記録し、レビューループを進める。ブロッキング指摘 (blocker/major) が無ければ実装完了、あれば修正フェーズへ。上限周回でも残る場合はユーザーへエスカレーションする。",
+			"コードレビュー結果を記録（review-<周回>.md に書き出し）し、レビューループを進める。ブロッキング指摘 (blocker/major) が無ければ実装完了、あれば指摘修正プロセスへ。上限周回でも残る場合はユーザーへエスカレーションする。",
 		promptSnippet: "Record code review findings and advance the review loop",
 		parameters: Type.Object({
 			summary: Type.String({ description: "レビュー全体の所見" }),
@@ -468,12 +568,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const mode = reviewMode(state);
 			const findings = params.findings as ReviewFinding[];
 			const { state: next, outcome } = recordReview(state, findings, params.summary, cfg.blockingSeverities);
-			const report = writeWorkFile(
-				ctx,
-				cfg,
-				`reviews/${issueSlug()}-round-${outcome.round}.md`,
-				reviewMarkdown(outcome.round, mode, params.summary, findings, cfg),
-			);
+			const report = writeItemFile(ctx, pathsOf(state).review(outcome.round), reviewMarkdown(outcome.round, mode, params.summary, findings, cfg));
 			setState(next, ctx);
 			switch (outcome.kind) {
 				case "clean":
@@ -485,7 +580,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				case "fix":
 					return reply(
 						`レビュー ${outcome.round} 周目: ブロッキング指摘 ${outcome.blocking} 件。記録: ${report}\n` +
-							`フェーズ: impl_fix_review（レビューループ残り ${outcome.remaining} 周）。指摘を修正 → harness_run_tests (green) → harness_phase で impl_review → 軽量レビュー の順で進めてください。`,
+							`指摘修正は新しいセッションで行います（レビューループ残り ${outcome.remaining} 周）。`,
 					);
 				case "escalate":
 					return handleEscalation(ctx, `レビューループが上限 (${outcome.round} 周) に達してもブロッキング指摘 ${outcome.blocking} 件が残っています（記録: ${report}）`);
@@ -540,7 +635,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 				if (!ok) return reply("ユーザーが Issue 登録を取り消しました。分割案についてユーザーに確認してください。", true);
 			}
 
-			const useGh = !params.dryRun && (await pi.exec("gh", ["auth", "status"], { cwd: ctx.cwd, timeout: 30_000 }).catch(() => undefined))?.code === 0;
+			const useGh =
+				!params.dryRun && (await pi.exec("gh", ["auth", "status"], { cwd: ctx.cwd, timeout: 30_000 }).catch(() => undefined))?.code === 0;
 			const created: IssueRef[] = [];
 			const failures: string[] = [];
 
@@ -563,14 +659,14 @@ export default function piHarness(pi: ExtensionAPI): void {
 					created.push({ title: d.title, ...parsed });
 				} else {
 					const rel = join(cfg.docsDir, "issues", draftFileName(i, d.title));
-					mkdirSync(dirname(join(ctx.cwd, rel)), { recursive: true });
-					writeFileSync(join(ctx.cwd, rel), draftMarkdown(d, labels, body));
+					writeItemFile(ctx, rel, draftMarkdown(d, labels, body));
 					created.push({ title: d.title, file: rel });
 				}
 			}
 
 			const ok = created.filter((c) => c.url || c.file);
 			const lines = ok.map((c) => `- ${c.number ? `#${c.number} ` : ""}${c.title} ${c.url ?? c.file ?? ""}`);
+			writeItemFile(ctx, join(pathsOf(state).dir, "issues.md"), `\n## ${new Date().toISOString()}\n\n${lines.join("\n")}\n`, true);
 			if (failures.length) {
 				setState(appendIssues(state, ok), ctx);
 				return reply(
@@ -592,26 +688,26 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	async function confirmReplace(ctx: ExtensionContext, next: string): Promise<boolean> {
 		if (!isActive(state) || !ctx.hasUI) return true;
-		return ctx.ui.confirm(
-			"進行中のフローがあります",
-			`現在: ${state.flow} / ${PHASE_LABELS[state.phase]}\n破棄して ${next} を開始しますか？`,
-		);
+		return ctx.ui.confirm("進行中のフローがあります", `現在: ${state.flow} / ${PHASE_LABELS[state.phase]}\n破棄して ${next} を開始しますか？`);
 	}
 
 	pi.registerCommand("req", {
-		description: "要件定義フローを開始する（ヒアリング → 要件定義書 → 承認 → Issue 登録）",
+		description: "要件定義フローを新しいセッションで開始する（ヒアリング → 要件定義書 → 承認 → Issue 登録）",
 		handler: async (args, ctx) => {
+			state = loadState(ctx);
 			if (!(await confirmReplace(ctx, "要件定義フロー"))) return;
 			let topic = args.trim();
 			if (!topic && ctx.hasUI) topic = (await ctx.ui.input("何を作りたいですか？（テーマ・背景）"))?.trim() ?? "";
-			setState(startRequirements(state, topic, limitsOf(cfgOf(ctx))), ctx);
-			pi.sendUserMessage(`/skill:harness-requirements ${topic}`, { expandPromptTemplates: true });
+			const dir = newItemDir(ctx, `req-${timestamp().slice(0, 10)}-${slugify(topic || "requirements", 30)}`);
+			setState(startRequirements(state, topic, limitsOf(cfgOf(ctx)), dir), ctx);
+			await startProcessSession(ctx);
 		},
 	});
 
 	pi.registerCommand("impl", {
-		description: "TDD 実装フローを開始する: /impl <Issue番号 | Issue URL>",
+		description: "TDD 実装フローを新しいセッションで開始する: /impl <Issue番号 | Issue URL>",
 		handler: async (args, ctx) => {
+			state = loadState(ctx);
 			let arg = args.trim();
 			if (!arg && ctx.hasUI) arg = (await ctx.ui.input("実装する Issue 番号または URL"))?.trim() ?? "";
 			const num = parseIssueArg(arg);
@@ -621,33 +717,39 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			if (!(await confirmReplace(ctx, `Issue #${num} の実装フロー`))) return;
 			const cfg = cfgOf(ctx);
-			const view = await pi.exec(
-				"gh",
-				["issue", "view", String(num), "--json", "number,title,body,url,labels", ...(cfg.issueRepo ? ["--repo", cfg.issueRepo] : [])],
-				{ cwd: ctx.cwd, timeout: 60_000 },
-			).catch(() => undefined);
+			const view = await pi
+				.exec("gh", ["issue", "view", String(num), "--json", "number,title,body,url", ...(cfg.issueRepo ? ["--repo", cfg.issueRepo] : [])], {
+					cwd: ctx.cwd,
+					timeout: 60_000,
+				})
+				.catch(() => undefined);
 			let issue: IssueRef = { number: num, title: "(タイトル未取得)" };
-			let body = "";
+			let body: string | undefined;
 			if (view?.code === 0) {
 				try {
 					const j = JSON.parse(view.stdout) as { number: number; title: string; body: string; url: string };
 					issue = { number: j.number, title: j.title, url: j.url };
 					body = j.body;
 				} catch {
-					// 取得失敗時はエージェントに読ませる
+					// 取得失敗時はプラン作成セッションで取得させる
 				}
 			}
-			setState(startImplement(state, issue, limitsOf(cfg)), ctx);
-			const issueText = body
-				? `\n\n<issue number="${issue.number}" title="${issue.title}" url="${issue.url}">\n${body}\n</issue>`
-				: `\n\n（Issue 本文を自動取得できませんでした。gh issue view ${num} や docs/issues/ などから内容を確認してください）`;
-			pi.sendUserMessage(`/skill:harness-tdd Issue #${num} を実装してください。${issueText}`, { expandPromptTemplates: true });
+			setState(startImplement(state, issue, limitsOf(cfg), newItemDir(ctx, `issue-${num}`)), ctx);
+			writeItemFile(
+				ctx,
+				pathsOf(state).issue,
+				body !== undefined
+					? `# #${issue.number} ${issue.title}\n\nURL: ${issue.url}\n\n${body}\n`
+					: `# Issue #${num}\n\n（本文を自動取得できませんでした。\`gh issue view ${num}\` や docs/issues/ から内容を確認し、このファイルに本文を保存してください）\n`,
+			);
+			await startProcessSession(ctx);
 		},
 	});
 
 	pi.registerCommand("bugfix", {
-		description: "独立したバグ修正フローを開始する（完了後、中断中の実装フローへ合流）: /bugfix <バグの説明>",
+		description: "独立したバグ修正フローを新しいセッションで開始する（完了後、中断中の実装フローへ合流）: /bugfix <バグの説明>",
 		handler: async (args, ctx) => {
+			state = loadState(ctx);
 			const cfg = cfgOf(ctx);
 			let description = args.trim();
 			if (!description && ctx.hasUI) {
@@ -655,32 +757,42 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			if (!description) description = state.escalation?.detail ?? "";
 			const joinsImplement = state.flow === "implement" || state.escalation?.flow === "implement";
-			if (!joinsImplement && !(await confirmReplace(ctx, "バグ修正フロー"))) return;
-			setState(startBugfix(state, description, limitsOf(cfg)), ctx);
-			ctx.ui.notify(
-				state.suspended ? `バグ修正フロー開始（完了後 ${describeIssue(state.suspended.issue)} の実装フローへ合流）` : "バグ修正フロー開始",
-				"info",
-			);
-			pi.sendUserMessage(`/skill:harness-bugfix ${description}`, { expandPromptTemplates: true });
+			if (!joinsImplement && state.flow !== "bugfix" && !(await confirmReplace(ctx, "バグ修正フロー"))) return;
+			setState(startBugfix(state, description, limitsOf(cfg), newItemDir(ctx, `bug-${timestamp()}`)), ctx);
+			await startProcessSession(ctx);
 		},
 	});
 
-	const SUBCOMMANDS = ["status", "approve", "revise", "reject", "continue", "rejoin", "abort", "config"];
+	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "continue", "rejoin", "abort", "config"];
 
 	pi.registerCommand("harness", {
-		description: "piHarness の操作: status | approve [コメント] | revise <修正内容> | reject | continue | rejoin | abort | config",
-		getArgumentCompletions: (prefix) =>
-			SUBCOMMANDS.filter((s) => s.startsWith(prefix.trim())).map((s) => ({ value: s, label: s })),
+		description:
+			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | continue [指示] | rejoin | abort | config",
+		getArgumentCompletions: (prefix) => SUBCOMMANDS.filter((s) => s.startsWith(prefix.trim())).map((s) => ({ value: s, label: s })),
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = args.trim().split(/\s+/);
 			const text = rest.join(" ").trim();
 			const cfg = cfgOf(ctx);
+			state = loadState(ctx);
 			try {
 				switch (sub) {
 					case "status": {
-						const body = isActive(state) ? buildContext(state, cfg) : "アクティブなフローはありません。";
+						const body = isActive(state) ? buildContext(state, cfg, processIO(state, existsIn(ctx))) : "アクティブなフローはありません。";
 						const recent = state.log.slice(-8).map((l) => `  ${l.at.slice(11, 19)} ${l.event}`).join("\n");
 						ctx.ui.notify(`${body}\n\n最近のイベント:\n${recent || "  なし"}`, "info");
+						return;
+					}
+					case "next": {
+						// 次のプロセス（または中断中の現在のプロセス）を新しいセッションで開始する
+						if (!isActive(state)) {
+							ctx.ui.notify("アクティブなフローはありません。", "info");
+							return;
+						}
+						if (state.phase === "escalated") {
+							ctx.ui.notify("エスカレーション中です。/harness continue, /bugfix, /harness abort のいずれかを選んでください。", "warning");
+							return;
+						}
+						await startProcessSession(ctx, text || undefined);
 						return;
 					}
 					case "approve":
@@ -699,22 +811,22 @@ export default function piHarness(pi: ExtensionAPI): void {
 						const decision: ApprovalDecision = sub === "approve" ? "approved" : sub === "revise" ? "revise" : "rejected";
 						const docs = kind === "requirements" ? state.artifacts.docs : state.artifacts.plan ? [state.artifacts.plan] : [];
 						setState(applyApproval(state, kind, decision, text || undefined, docs), ctx);
-						if (decision !== "rejected") pi.sendUserMessage(approvalMessage(kind, decision, text || undefined));
+						if (decision === "approved") await startProcessSession(ctx);
+						else if (decision === "revise") pi.sendUserMessage(approvalMessage(kind, decision, text || undefined));
 						else ctx.ui.notify("却下しました。フローを中止しました。", "info");
 						return;
 					}
 					case "continue": {
 						setState(resumeAfterEscalation(state, limitsOf(cfg)), ctx);
-						pi.sendUserMessage(
-							`ループを継続します（カウンタをリセット、フェーズ: ${state.phase}）。${text ? `ユーザーからの指示: ${text}\n` : ""}これまでと異なるアプローチで原因を再分析してください。`,
+						await startProcessSession(
+							ctx,
+							`エスカレーション後にユーザーがループ継続を選択しました（カウンタはリセット済み）。エスカレーション記録を読み、これまでと異なるアプローチで原因を再分析してください。${text ? ` ${text}` : ""}`,
 						);
 						return;
 					}
 					case "rejoin": {
 						setState(rejoinImplement(state, limitsOf(cfg)), ctx);
-						pi.sendUserMessage(
-							`バグ修正フローから実装フロー（${describeIssue(state.issue)}）へ合流しました。skill harness-review に従いフルレビューを実施してください。`,
-						);
+						await startProcessSession(ctx);
 						return;
 					}
 					case "abort": {
