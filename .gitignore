@@ -1,0 +1,4 @@
+node_modules/
+.pi/harness/state.json
+.pi/harness/**/logs/
+*.log

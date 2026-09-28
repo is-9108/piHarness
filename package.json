@@ -1,0 +1,31 @@
+{
+  "name": "pi-harness",
+  "version": "0.1.0",
+  "description": "pi-coding-agent extension + skills: requirements with human approval gate, TDD implementation flow, and independent bugfix flow",
+  "type": "module",
+  "private": true,
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "engines": { "node": ">=22.19" },
+  "pi": {
+    "extensions": ["./extensions/harness/index.ts"],
+    "skills": ["./skills"]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "test:e2e": "node test/e2e/smoke.ts && node test/e2e/compaction.ts && node test/e2e/natural.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run test:e2e"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}

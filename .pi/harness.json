@@ -1,0 +1,19 @@
+{
+  "testCommand": "npm test",
+  "testTimeoutSec": 900,
+  "maxTestLoops": 3,
+  "maxReviewLoops": 3,
+  "blockingSeverities": [
+    "blocker",
+    "major"
+  ],
+  "docsDir": "docs",
+  "workDir": ".pi/harness",
+  "issueLabels": [],
+  "ensureLabels": true,
+  "autoHandoff": true,
+  "models": {},
+  "checkCommands": [
+    "npm run typecheck"
+  ]
+}
