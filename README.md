@@ -39,24 +39,64 @@ node -v   # v22.19 以上であること
 
 ## インストール
 
-### A. 他のプロジェクトで使う（推奨）
+### A. プロジェクトごとに clone して使う（推奨）
+
+各プロジェクトの `.pi/piHarness/` に clone し、セットアップスクリプトを 1 回実行します。
+
+```bash
+cd ~/projects/my-app
+git clone https://github.com/is-9108/piHarness.git .pi/piHarness
+node .pi/piHarness/scripts/install.mjs
+pi        # 起動してプロジェクトを信頼（trust）する
+```
+
+セットアップスクリプトは次のことを行います。何度実行しても結果は同じです。
+
+| 対象 | 内容 |
+|------|------|
+| `.pi/settings.json` | `packages` に `"./piHarness"` を追加（既存の設定・パッケージは保持） |
+| `.pi/harness.json` | 無ければ雛形を作成（あれば変更しない）。プロジェクトごとのテストコマンド・モデルはここで設定 |
+| `.gitignore` | `.pi/harness/state.json`, `.pi/harness/**/logs/`, `.pi/piHarness/` を追加 |
+| 環境チェック | Node.js 22.19 以上・pi・gh（ログイン状態）を確認して表示 |
+
+- **更新:** `git -C .pi/piHarness pull`（pi 起動中なら `/reload`）
+- **取り外し:** `node .pi/piHarness/scripts/install.mjs --uninstall` で登録だけを外します（成果物と設定は残ります）
+- **確認のみ:** `--dry-run` で変更内容だけを表示します
+- **別の場所に clone した場合:** `node <clone先>/scripts/install.mjs --project <プロジェクト>` で相対パスを自動計算します
+
+チームで同じバージョンを使いたい場合は、clone の代わりに git サブモジュールにできます。
+この場合、スクリプトは `.pi/piHarness/` を `.gitignore` に入れません。
+
+```bash
+git submodule add https://github.com/is-9108/piHarness.git .pi/piHarness
+node .pi/piHarness/scripts/install.mjs
+```
+
+補足:
+
+- **プロジェクトごとに独立:** ワークフローの状態（`.pi/harness/state.json`）・成果物・設定（`.pi/harness.json`）はプロジェクトごとに独立しています。
+  プロジェクトごとに別のバージョンの piHarness を使うこともできます。
+- **本体は編集できない:** エージェントはプロジェクト内の piHarness 本体（`.pi/piHarness/`）を編集できません（拡張がブロックします）。
+- **依存パッケージは不要:** clone 先で `npm install` は不要です。必要なパッケージは Pi 本体が提供します。
+
+### B. 全プロジェクト共通で使う
+
+1 か所に clone して、ユーザー設定に登録します。全プロジェクトで同じ piHarness が有効になります。
 
 ```bash
 git clone https://github.com/is-9108/piHarness.git ~/piHarness
-pi install ~/piHarness            # 全プロジェクトで有効（~/.pi/agent/settings.json に登録）
-# または対象プロジェクト内で
-pi install -l ~/piHarness         # そのプロジェクトのみ（.pi/settings.json に登録）
+pi install ~/piHarness
 ```
-
-### B. このリポジトリ内で試す
-
-`.pi/settings.json` がこのパッケージを読み込むよう設定済みです。リポジトリ直下で `pi` を起動し、プロジェクトを信頼（trust）してください。
 
 ### C. 一時的に読み込む
 
 ```bash
 pi -e ~/piHarness/extensions/harness/index.ts
 ```
+
+### piHarness 自体の開発
+
+このリポジトリの `.pi/settings.json` が自分自身を読み込むよう設定されています。リポジトリ直下で `pi` を起動し、プロジェクトを信頼してください。
 
 ## 使い方
 
@@ -194,7 +234,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
 ```bash
 npm install
 npm run typecheck   # tsc
-npm test            # 状態機械・ガード・設定・Issue ヘルパーのユニットテスト (node --test)
+npm test            # 状態機械・ガード・設定・Issue ヘルパー・セットアップスクリプトのユニットテスト (node --test)
 npm run test:e2e    # 偽モデルで実際の Pi セッションランタイムを動かし、3 フローとセッション切り替えを通す E2E
 npm run check       # 上記すべて
 ```

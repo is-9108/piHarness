@@ -11,13 +11,14 @@
  * 状態遷移は state.ts、引き継ぎは handoff.ts の純粋関数で行い、この拡張はツール/コマンド/イベントとの接続だけを担う。
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { findModel, type HarnessConfig, loadConfig, PROCESS_KINDS, resolveProcessModel, saveConfigPatch } from "./config.ts";
-import { checkBash, checkWrite, type GuardPaths, isHarnessFile, STATE_FILE } from "./guard.ts";
+import { checkBash, checkWrite, type GuardPaths, isHarnessFile, isInside, STATE_FILE } from "./guard.ts";
 import { buildContext } from "./guidance.ts";
 import {
 	escalationMarkdown,
@@ -78,6 +79,8 @@ import {
 import { slugify, tailLines, timestamp } from "./text.ts";
 
 const CONTEXT_MESSAGE = "harness-context";
+/** piHarness 自身のディレクトリ（プロジェクト内に clone して使う場合、エージェントに書き換えさせない） */
+const HARNESS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ALL_PHASES = Object.keys(PHASE_LABELS) as Phase[];
 
 type ToolText = { content: { type: "text"; text: string }[]; details: { phase: Phase }; terminate?: boolean };
@@ -340,7 +343,11 @@ export default function piHarness(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		const cfg = cfgOf(ctx);
 		if (event.toolName === "edit" || event.toolName === "write") {
-			const d = checkWrite(state, (event.input as { path?: string }).path, guardPaths(ctx, cfg));
+			const path = (event.input as { path?: string }).path;
+			if (path && !isInside(ctx.cwd, HARNESS_ROOT, "/") && isInside(path, HARNESS_ROOT, ctx.cwd)) {
+				return { block: true, reason: `[piHarness] piHarness 本体 (${HARNESS_ROOT}) は編集できません。` };
+			}
+			const d = checkWrite(state, path, guardPaths(ctx, cfg));
 			if (d.block) return { block: true, reason: d.reason };
 		}
 		if (!isActive(state)) return;

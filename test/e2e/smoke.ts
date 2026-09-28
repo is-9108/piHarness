@@ -133,8 +133,11 @@ let r = await run("/impl 1", [
 	call("harness_phase", { to: "impl_plan" }),
 	call("write", { path: "src/feature.js", content: "x" }), // 承認前 → ブロック
 	call("write", { path: p("plan.md"), content: "# プラン" }),
+	call("write", { path: join(root, "skills/harness-tdd/SKILL.md"), content: "x" }), // piHarness 本体 → ブロック
 	call("harness_request_approval", { kind: "plan", summary: "PLAN-SESSION-MARKER", documents: [p("plan.md")] }),
 ]);
+assert.match(r[3], /^2:write \[ERROR\]: .*piHarness 本体/);
+assert.match(readFileSync(join(root, "skills/harness-tdd/SKILL.md"), "utf8"), /^---\nname: harness-tdd/);
 assert.equal(sessionNo, 2, "/impl でプラン作成用の新しいセッションが作られる");
 assert.match(firstUserText(runtime.session), /TDD 実装フロー（piHarness）/, "スキルが展開される");
 assert.match(firstUserText(runtime.session), /会話は引き継がれていません/);

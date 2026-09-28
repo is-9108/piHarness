@@ -17,6 +17,8 @@ piHarness/
 │   ├── config.ts                 # .pi/harness.json の読み込み、テストコマンド自動検出
 │   ├── issues.ts                 # Issue 案の検証、gh 引数の組み立て、出力解析
 │   └── text.ts                   # 整形ヘルパー
+├── scripts/install.mjs           # プロジェクトへの組み込み（.pi/settings.json・harness.json・.gitignore）
+├── templates/harness.json        # 組み込み時に作る .pi/harness.json の雛形
 ├── skills/
 │   ├── harness-requirements/     # 要件定義の手順・テンプレート・Issue 分割ルール
 │   ├── harness-tdd/              # TDD 実装の手順・プランテンプレート
@@ -61,6 +63,17 @@ piHarness/
 - **プロセスごとのモデル**: `/harness next` が state.json に「開始中のプロセス」を記録し、新しいセッションで再生成された拡張が
   `session_start` でそれを読み取って `pi.setModel` / `pi.setThinkingLevel` を適用します（そのセッションにだけ効き、Pi の既定値は変えない）。
 - **開始メッセージは参照のみ**: 新しいセッションには成果物の「パス」と役割だけを渡し、内容はエージェントに読ませます（前の会話の要約も渡さない）。
+
+### プロジェクトごとに clone して使う
+
+各プロジェクトの `.pi/piHarness/` に clone し、`.pi/settings.json` の `packages` にローカルパスとして登録します（Pi のローカルパッケージ機能）。
+Pi は settings ファイルの場所を基準に相対パスを解決するため、プロジェクトを移動しても動きます。
+拡張が使う `typebox` と `@earendil-works/*` は Pi 本体が提供するため、clone 先で `npm install` は不要です。
+
+- **状態・成果物・設定の置き場所:** すべてプロジェクト側にあり（`.pi/harness/`, `.pi/harness.json`）、piHarness 本体の clone には書き込みません。
+- **本体の編集禁止:** 拡張は自分自身のディレクトリ（`import.meta.url` から求める）への `edit` / `write` をブロックします。
+  エージェントがハーネスのルールを書き換えられないようにするためです。
+  piHarness 自体を開発するときは、cwd が本体の中なのでブロックしません。
 
 ### 状態機械を純粋関数にする
 
