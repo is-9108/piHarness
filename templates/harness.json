@@ -1,4 +1,5 @@
 {
+  "checkCommands": [],
   "testTimeoutSec": 900,
   "maxTestLoops": 3,
   "maxReviewLoops": 3,
@@ -8,5 +9,15 @@
   "issueLabels": [],
   "ensureLabels": true,
   "autoHandoff": true,
+  "testIntegrity": true,
+  "git": {
+    "enabled": true,
+    "branchPrefix": "issue-",
+    "commit": true,
+    "commitArtifacts": false,
+    "pr": "ask",
+    "draft": false,
+    "dirtyStart": "ask"
+  },
   "models": {}
 }

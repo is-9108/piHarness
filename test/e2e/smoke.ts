@@ -5,6 +5,7 @@
  *   npm run test:e2e
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -30,12 +31,21 @@ writeFileSync(
 	}),
 );
 
+// Git リポジトリとして初期化（作業ブランチ・差分基準・完了時コミットの検証用）
+const git = (...args: string[]) => execFileSync("git", args, { cwd: project, encoding: "utf8" }).trim();
+git("init", "-q", "-b", "main");
+git("config", "user.name", "e2e");
+git("config", "user.email", "e2e@example.com");
+writeFileSync(join(project, ".gitignore"), ".pi/harness/state.json\n.pi/harness/**/logs/\n");
+
 const faux = fauxProvider({ models: [{ id: "worker" }, { id: "reviewer", reasoning: true }, { id: "cheap" }] });
 // プロセスごとのモデル設定: レビューだけ別モデル + 高い思考レベル、それ以外は default
 mkdirSync(join(project, ".pi"), { recursive: true });
 writeFileSync(
 	join(project, ".pi/harness.json"),
 	JSON.stringify({
+		// lint 相当のチェック: LINT_FAIL ファイルがあると失敗する
+		checkCommands: ["node -e \"process.exit(require('fs').existsSync('LINT_FAIL')?1:0)\""],
 		models: {
 			default: "faux/worker",
 			hearing: "faux/cheap",
@@ -46,6 +56,9 @@ writeFileSync(
 );
 const call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 const done = (text: string) => fauxAssistantMessage(text);
+
+git("add", "-A");
+git("commit", "-q", "-m", "init");
 
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
 	const services = await createAgentSessionServices({
@@ -65,6 +78,8 @@ const runtime = await createAgentSessionRuntime(createRuntime, { cwd: project, a
 
 // 実行ログ: "<セッション番号>:<ツール名>[ ERROR]: <結果の 1 行目>"
 const toolResults: string[] = [];
+/** ツール結果の全文（toolResults と同じ順序） */
+const toolTexts: string[] = [];
 const sessionsSeen: AgentSession[] = [];
 let sessionNo = 0;
 
@@ -86,6 +101,7 @@ async function bind(): Promise<void> {
 		if (e.type === "tool_execution_end") {
 			const text = (e.result?.content ?? []).map((c: { text?: string }) => c.text ?? "").join("");
 			toolResults.push(`${no}:${e.toolName}${e.isError ? " [ERROR]" : ""}: ${text.split("\n")[0]}`);
+			toolTexts.push(text);
 		}
 	});
 }
@@ -149,9 +165,15 @@ const planSession = runtime.session;
 r = await run("/harness approve 境界値も見ておいて", [
 	call("harness_run_tests", { expect: "red" }),
 	call("write", { path: "src/feature.js", content: "module.exports = 1" }),
+	call("bash", { command: "touch LINT_FAIL" }),
+	call("harness_run_tests", { expect: "green" }), // テストは通るがチェック（lint 相当）が失敗 → 失敗 1 回
+	call("bash", { command: "rm LINT_FAIL" }),
 	call("harness_run_tests", { expect: "green" }),
 	call("harness_phase", { to: "impl_review" }), // implementation.md が無い → 拒否
 	call("write", { path: p("implementation.md"), content: "# 実装レポート" }),
+	call("bash", { command: "echo '// bash で変更' >> src/feature.js" }),
+	call("harness_phase", { to: "impl_review" }), // 合格後に bash で変更 → 拒否
+	call("harness_run_tests", { expect: "green" }),
 	call("harness_phase", { to: "impl_review" }),
 	// ↑ でプロセス完了 → 自動で /harness next → [S4] レビュー
 	call("harness_record_review", {
@@ -160,24 +182,46 @@ r = await run("/harness approve 境界値も見ておいて", [
 	}),
 	// → [S5] 指摘修正
 	call("write", { path: "src/feature.js", content: "module.exports = 2" }),
+	call("write", { path: "test/feature.test.js", content: "it.skip('境界値', () => {});\n" }),
 	call("harness_run_tests", { expect: "green" }),
 	call("harness_phase", { to: "impl_review" }), // fix-1.md が無い → 拒否
 	call("write", { path: p("fix-1.md"), content: "# 対応" }),
-	call("harness_phase", { to: "impl_review" }),
-	// → [S6] 軽量レビュー
+	call("harness_phase", { to: "impl_review" }), // it.skip の追加を検知 → 拒否
+	call("harness_phase", { to: "impl_review", testChangeReason: "境界値テストは #9 のセンサー実装待ちのため一時的にスキップ" }),
+	// → [S6] 軽量レビュー → 完了（コミット）
 	call("harness_record_review", { summary: "LGTM", findings: [] }),
 	done("完了"),
 ]);
 for (const x of r) console.log("  ", x);
 assert.equal(sessionNo, 6, "実装 → レビュー → 修正 → レビュー がそれぞれ新しいセッション");
-assert.deepEqual(
-	r.filter((x) => x.includes("[ERROR]")).map((x) => x.split(":")[0]),
-	["3", "5"],
-);
-assert.match(r.find((x) => x.startsWith("3:harness_phase [ERROR]")) ?? "", /implementation\.md/);
-assert.match(r.find((x) => x.startsWith("5:harness_phase [ERROR]")) ?? "", /fix-1\.md/);
+const errorsOf = (session: number) => r.filter((x) => x.startsWith(`${session}:`) && x.includes("[ERROR]"));
+assert.equal(errorsOf(3).length, 2);
+assert.match(errorsOf(3)[0], /implementation\.md/);
+assert.match(errorsOf(3)[1], /再度テスト/, "bash による変更も未テスト扱いになる");
+assert.equal(errorsOf(5).length, 2);
+assert.match(errorsOf(5)[0], /fix-1\.md/);
+assert.match(errorsOf(5)[1], /テストを弱める可能性のある変更を検知/);
+const s3Runs = toolTexts.filter((_, i) => toolResults[i].startsWith("3:harness_run_tests"));
+assert.match(s3Runs[1], /LINT_FAIL[\s\S]*→ FAIL[\s\S]*結果: FAIL[\s\S]*修正ループ 1\/3/, "チェックコマンドの失敗で green 判定が失敗する");
+assert.match(s3Runs[2], /結果: PASS/);
 assert.ok(r.some((x) => /^4:harness_record_review: レビュー 1 周目/.test(x)));
 assert.ok(r.some((x) => /^6:harness_record_review: レビュー 2 周目（軽量）/.test(x)));
+assert.match(readFileSync(join(project, p("test-changes.md")), "utf8"), /\[skip_added\] test\/feature\.test\.js[\s\S]*#9 のセンサー実装待ち/);
+assert.match(firstUserText(sessionsSeen[5]), /test-changes\.md — テストの削除・スキップ/, "テスト変更の理由がレビューに引き継がれる");
+assert.match(firstUserText(sessionsSeen[3]), /変更の差分: `git diff [0-9a-f]{12}`/);
+// Git: 作業ブランチ issue-1 上に完了コミット（Closes #1）。PR は確認が必要（UI なし）なので作成しない
+assert.equal(git("rev-parse", "--abbrev-ref", "HEAD"), "issue-1");
+assert.match(git("log", "-1", "--format=%B"), /\(#1\)[\s\S]*Closes #1/);
+assert.match(git("show", "--stat", "--format=", "HEAD"), /src\/feature\.js/);
+assert.doesNotMatch(git("show", "--stat", "--format=", "HEAD"), /\.pi\/harness\//, "成果物は既定でコミットしない");
+assert.equal(git("status", "--porcelain", "--", "src", "test"), "");
+const issue1 = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8"));
+assert.equal(issue1.phase, "impl_done");
+assert.match(issue1.git.commit, /^[0-9a-f]{40}$/);
+assert.equal(issue1.git.baseBranch, "main");
+// 利用量: プロセスごとのセッションが記録される
+const usage1 = JSON.parse(readFileSync(join(project, p("usage.json")), "utf8"));
+assert.deepEqual([...new Set(usage1.sessions.map((x: { process: string }) => x.process))].sort(), ["fix", "implement", "plan", "review"]);
 
 const s3 = firstUserText(sessionsSeen[2]);
 assert.match(s3, /承認時のユーザーコメント: 境界値も見ておいて/);
@@ -199,7 +243,7 @@ assert.equal(handoff.match(/^## /gm)?.length, 5, "handoff.md に 5 回分の引�
 // エスカレーション → バグ修正（新セッション）→ 実装フローへ合流（新しいレビューセッション）
 // ---------------------------------------------------------------------------
 
-r = await run("/impl 2", [
+r = await run("/impl 2", [ // 作業ブランチ issue-1 上から開始 → UI なしでは既定ブランチ main から issue-2 を作成
 	call("harness_phase", { to: "impl_plan" }),
 	call("write", { path: ".pi/harness/issue-2/plan.md", content: "# プラン" }),
 	call("harness_request_approval", { kind: "plan", summary: "s", documents: [".pi/harness/issue-2/plan.md"] }),
@@ -219,7 +263,7 @@ r = await run("/bugfix BROKEN ファイルが残る", [
 	call("harness_phase", { to: "bug_analyze" }),
 	call("write", { path: "src/feature.js", content: "y" }), // 分析中 → ブロック
 	call("harness_phase", { to: "bug_fix" }),
-	call("bash", { command: "rm BROKEN" }),
+	call("bash", { command: "rm BROKEN && mkdir -p src && echo 'module.exports = 1' > src/feature.js" }), // issue-2 は main から作成されている
 	call("harness_run_tests", { expect: "green" }),
 	call("harness_phase", { to: "bug_done" }), // bug-1.md が無い → 拒否
 	call("write", { path: ".pi/harness/issue-2/bug-1.md", content: "# 原因" }),
@@ -238,6 +282,12 @@ assert.deepEqual(
 );
 assert.ok(r.some((x) => x.startsWith(`${bugSession + 1}:harness_record_review: レビュー 1 周目（フル）`)));
 assert.match(firstUserText(sessionsSeen[bugSession]), /bug-1\.md — バグレポート #1/);
+// issue-2 は既定ブランチ main から作成され（issue-1 の変更を含まない）、合流後のレビュー通過でコミットされる
+assert.equal(git("rev-parse", "--abbrev-ref", "HEAD"), "issue-2");
+assert.match(git("log", "-1", "--format=%s"), /\(#2\)$/);
+assert.equal(git("merge-base", "issue-2", "main"), git("rev-parse", "main"));
+assert.equal(git("rev-list", "--count", "main..issue-2"), "1");
+assert.equal(JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8")).git.baseBranch, "main");
 
 // ---------------------------------------------------------------------------
 // 要件定義フロー: ヒアリング → 要件定義書作成 →（未確定論点で）ヒアリング → 要件定義書作成 → 承認 → Issue 登録
@@ -312,6 +362,18 @@ const state = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "
 assert.equal(state.kickoff, undefined);
 assert.equal(state.phase, "req_done");
 assert.equal(state.pendingHandoff, undefined);
+
+// Issue の進み具合: 要件定義で登録した 2 件のうち、依存の無い 01 が次の候補。/impl next で Markdown の Issue から開始できる
+const registry = JSON.parse(readFileSync(join(project, ".pi/harness/issues.json"), "utf8"));
+const fromReq = registry.issues.filter((i: { file?: string }) => i.file);
+assert.deepEqual(fromReq.map((i: { deps: string[] }) => i.deps.length), [0, 1]);
+assert.equal(registry.issues.find((i: { id: string }) => i.id === "#1").status, "done");
+r = await run("/impl next", [done("プラン作成を開始します")]);
+const nextState = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8"));
+assert.equal(nextState.issue.file, "docs/issues/01-センサー読み取り.md");
+assert.equal(nextState.phase, "impl_context");
+assert.equal(git("rev-parse", "--abbrev-ref", "HEAD"), "issue-01");
+assert.match(firstUserText(runtime.session), /センサー読み取り/);
 
 await runtime.dispose();
 console.log(`E2E smoke: OK (${sessionNo} sessions)`);

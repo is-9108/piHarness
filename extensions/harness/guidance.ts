@@ -3,7 +3,7 @@
  * 詳細な手順は SKILL.md 側に置き、ここでは「今どこにいて次に何をすべきか」だけを短く伝える。
  */
 import type { HarnessConfig } from "./config.ts";
-import { PROCESS_LABELS, type ProcessIO } from "./handoff.ts";
+import { diffInstruction, PROCESS_LABELS, type ProcessIO } from "./handoff.ts";
 import { allowedTransitions, describeIssue, type HarnessState, PHASE_LABELS, type Phase, reviewMode } from "./state.ts";
 
 const NEXT: Record<Phase, string> = {
@@ -47,6 +47,8 @@ export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO
 		if (io.inputs.length) lines.push(`入力成果物: ${io.inputs.map((i) => i.path).join(", ")}`);
 		lines.push(`出力成果物: ${io.outputs.map((o) => o.path).join(", ")}`);
 	}
+	const diff = diffInstruction(s);
+	if (diff) lines.push(diff);
 	if (s.pendingHandoff) {
 		lines.push(`このプロセスは完了済み。次の「${PROCESS_LABELS[s.pendingHandoff.to]}」は新しいセッションで開始される。これ以上作業しないこと。`);
 	}
@@ -57,6 +59,7 @@ export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO
 			`テストループ: 連続失敗 ${s.test.failures}/${s.test.max}${s.test.dirty ? "（最後のテスト以降に未テストの変更あり）" : ""}`,
 		);
 		lines.push(`テストコマンド: ${cfg.testCommand ?? "(未設定: harness_run_tests 実行時にユーザーへ確認)"}`);
+		if (cfg.checkCommands.length) lines.push(`green 判定で合格が必要なチェック: ${cfg.checkCommands.join(" / ")}`);
 	}
 	if (s.flow === "implement") {
 		lines.push(`レビューループ: ${s.review.round}/${s.review.max} 周実施済み（次回: ${reviewMode(s) === "full" ? "フルレビュー" : "軽量レビュー"}）`);

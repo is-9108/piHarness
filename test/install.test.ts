@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 // @ts-expect-error プレーンな .mjs（型定義なし）
-import { defaultProject, install, packageRef, updateGitignore, updateSettings } from "../scripts/install.mjs";
+import { defaultProject, detectCheckCommands, install, packageRef, updateGitignore, updateSettings } from "../scripts/install.mjs";
 
 const repo = resolve(import.meta.dirname, "..");
 
@@ -81,6 +81,16 @@ describe("install スクリプト", () => {
 		install({ project, root: clone, uninstall: true, log: quiet });
 		assert.deepEqual(JSON.parse(readFileSync(join(project, ".pi/settings.json"), "utf8")).packages, []);
 		assert.ok(existsSync(join(project, ".pi/harness.json")));
+	});
+
+	it("package.json の lint・型チェックを checkCommands に入れる", () => {
+		const { project, clone } = projectWithClone();
+		writeFileSync(join(project, "package.json"), JSON.stringify({ scripts: { test: "vitest", lint: "eslint .", typecheck: "tsc --noEmit", build: "tsc" } }));
+		assert.deepEqual(detectCheckCommands(project), ["npm run lint", "npm run typecheck"]);
+		install({ project, root: clone, log: quiet });
+		const cfg = JSON.parse(readFileSync(join(project, ".pi/harness.json"), "utf8"));
+		assert.deepEqual(cfg.checkCommands, ["npm run lint", "npm run typecheck"]);
+		assert.equal(cfg.git.pr, "ask");
 	});
 
 	it("--dry-run では何も書き込まない", () => {

@@ -23,6 +23,7 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
 ```text
 .pi/harness/
 ├── state.json                 # ワークフロー状態（全セッション共通。直接編集は不可）
+├── issues.json                # 登録した Issue の進み具合と依存関係（/impl next が使う）
 ├── req-2026-09-28-温度ロガー/   # 要件定義: qa.md, hearing.md, open-questions.md, issues.md, handoff.md
 └── issue-12/                  # 実装フロー（バグ修正もここ）
     ├── issue.md               # /impl 時に gh issue view で取得した本文
@@ -30,6 +31,8 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
     ├── implementation.md      # 実装レポート
     ├── review-1.md, fix-1.md, review-2.md …
     ├── escalation-1.md, bug-1.md
+    ├── test-changes.md        # テストの削除・スキップ等とその理由（あれば）
+    ├── usage.json             # セッションごとのモデル利用量
     ├── handoff.md             # セッション切り替えの履歴（入力/出力の一覧）
     └── logs/test-*.log        # テストの全文ログ
 ```
@@ -103,7 +106,10 @@ flowchart LR
 | `impl_tdd` | Red → Green → Refactor | 制限なし | 全テスト green かつ未テスト変更なしで `harness_phase → impl_review` |
 | `impl_review` | 多角的コードレビュー（1 周目フル / 2 周目以降軽量） | `.pi/harness/` のみ | `harness_record_review` |
 | `impl_fix_review` | ブロッキング指摘の修正 | 制限なし | 全テスト green かつ未テスト変更なしで `harness_phase → impl_review` |
-| `impl_done` | 完了報告 | `.pi/harness/` のみ | — |
+| `impl_done` | 完了（Issue を完了にし、コミット、設定に応じて PR） | `.pi/harness/` のみ | — |
+
+`/impl` の開始時に作業ブランチを作成し、開始時点のコミットを差分の基準として記録します（git リポジトリの場合）。
+レビュー通過時に拡張がコミットし、`git.pr` に従って PR を作成します（既定は確認してから作成）。
 
 ### テストループ
 
@@ -111,7 +117,10 @@ flowchart LR
 - `expect: "red"` の失敗は TDD の Red 確認であり、ループ回数に数えません。Red 期待で合格した場合は「テストが要件を捉えていない」と警告します。
 - `expect: "green"` の **連続失敗** がループ回数です。合格でリセットされます。
 - 連続失敗が `maxTestLoops`（既定 3）に達するとエスカレーションします。
-- 最後の合格以降に `edit` / `write` でファイルが変更されると「未テストの変更あり」となり、レビューへ進めません。
+- `expect: "green"` のときは `checkCommands`（lint・型チェックなど）も実行し、すべて合格して初めて合格です。
+- 最後の合格以降にファイルが変更されると（bash 経由を含め、git の作業ツリーの指紋で検知）「未テストの変更あり」となり、レビューへ進めません。
+- レビューへ進む時点で、実装開始時点からの差分にテストの削除・スキップ追加・アサーション減少があれば遷移を止めます。
+  正当な理由があるときだけ `testChangeReason` に理由を書いて進めます（`test-changes.md` に記録され、レビューで検証されます）。
 
 ### レビューループ
 

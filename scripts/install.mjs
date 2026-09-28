@@ -93,6 +93,20 @@ export function isSubmodule(project, root = harnessRoot) {
 		.some((l) => l.trim().replace(/^path\s*=\s*/, "") === rel && /^\s*path\s*=/.test(l));
 }
 
+/** package.json の lint・型チェック系スクリプトを checkCommands の候補にする */
+export function detectCheckCommands(project) {
+	const file = join(project, "package.json");
+	if (!existsSync(file)) return [];
+	let scripts;
+	try {
+		scripts = JSON.parse(readFileSync(file, "utf8")).scripts ?? {};
+	} catch {
+		return [];
+	}
+	const runner = existsSync(join(project, "pnpm-lock.yaml")) ? "pnpm" : existsSync(join(project, "yarn.lock")) ? "yarn" : "npm run";
+	return ["lint", "typecheck", "type-check", "check-types", "tsc"].filter((name) => typeof scripts[name] === "string").map((name) => `${runner} ${name}`);
+}
+
 function readJson(file, fallback) {
 	if (!existsSync(file)) return fallback;
 	try {
@@ -168,9 +182,13 @@ export function install({ project, uninstall = false, dryRun = false, root = har
 	if (existsSync(configFile)) {
 		results.push("- .pi/harness.json は既にあります（変更しません）");
 	} else {
-		const template = readFileSync(join(root, "templates", "harness.json"), "utf8");
-		write(configFile, template);
-		results.push("✓ .pi/harness.json を作成しました（テストコマンドは未指定なら自動検出されます）");
+		const template = JSON.parse(readFileSync(join(root, "templates", "harness.json"), "utf8"));
+		const checks = detectCheckCommands(project);
+		if (checks.length) template.checkCommands = checks;
+		write(configFile, `${JSON.stringify(template, null, 2)}\n`);
+		results.push(
+			`✓ .pi/harness.json を作成しました（テストコマンドは未指定なら自動検出されます${checks.length ? `。checkCommands: ${checks.join(", ")}` : ""}）`,
+		);
 	}
 
 	// 3. .gitignore

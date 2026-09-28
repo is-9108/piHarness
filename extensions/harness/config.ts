@@ -10,17 +10,47 @@ export type ThinkingLevelName = (typeof THINKING_LEVELS)[number];
 
 export const PROCESS_KINDS: ProcessKind[] = ["hearing", "requirements", "issues", "plan", "implement", "review", "fix", "bugfix"];
 
-/** プロセスで使うモデル。model は "provider/model-id"（または一意なら "model-id" のみ） */
+/** レビューのフル（1 周目）/ 軽量（2 周目以降）だけ別に指定するためのキー */
+export const REVIEW_VARIANTS = ["review_full", "review_light"] as const;
+export type ReviewVariant = (typeof REVIEW_VARIANTS)[number];
+export type ModelKey = ProcessKind | ReviewVariant | "default";
+export const MODEL_KEYS: ModelKey[] = ["default", ...PROCESS_KINDS, ...REVIEW_VARIANTS];
+
+/**
+ * プロセスで使うモデル。model は "provider/model-id"（または一意なら "model-id" のみ）の候補リスト。
+ * 先頭から順に、見つかって認証が設定されている最初のモデルを使う（フォールバック）。
+ */
 export interface ProcessModelSetting {
-	model?: string;
+	model?: string[];
 	thinking?: ThinkingLevelName;
 }
 
-export type ModelSettings = Partial<Record<ProcessKind | "default", ProcessModelSetting>>;
+export type ModelSettings = Partial<Record<ModelKey, ProcessModelSetting>>;
+
+export interface GitSettings {
+	/** Git 連携を使うか（git リポジトリでない場合は自動的に無効） */
+	enabled: boolean;
+	/** 作業ブランチ名の接頭辞 */
+	branchPrefix: string;
+	/** 作業ブランチの作成元（= PR のマージ先）。未指定なら現在のブランチ。ただし別の作業ブランチ上なら既定ブランチ */
+	baseBranch?: string;
+	/** 実装完了時に変更をコミットするか */
+	commit: boolean;
+	/** 成果物（workDir 配下の md）もコミットに含めるか */
+	commitArtifacts: boolean;
+	/** PR の作成: ask = 確認してから作成 / auto = 確認なしで作成 / off = 作成しない */
+	pr: "ask" | "auto" | "off";
+	/** ドラフト PR として作成するか */
+	draft: boolean;
+	/** 未コミットの変更がある状態で /impl を開始するときの扱い: ask = 確認 / allow = そのまま / refuse = 中止 */
+	dirtyStart: "ask" | "allow" | "refuse";
+}
 
 export interface HarnessConfig {
 	/** テストスイート全体を実行するシェルコマンド（例: "npm test", "pytest -q"） */
 	testCommand?: string;
+	/** テストと一緒に実行して合格を必須にするチェック（lint・型チェックなど）。green 判定のときだけ実行する */
+	checkCommands: string[];
 	/** テスト実行のタイムアウト（秒）。ラズパイでは長めを既定値にしている */
 	testTimeoutSec: number;
 	/** テスト失敗の修正ループ上限 */
@@ -45,9 +75,24 @@ export interface HarnessConfig {
 	autoHandoff: boolean;
 	/** プロセスごとのモデル・思考レベル（未指定のプロセスは default、それも無ければ Pi の既定モデル） */
 	models: ModelSettings;
+	/** Git 連携（作業ブランチ・差分の基準・完了時のコミットと PR） */
+	git: GitSettings;
+	/** テストを弱める変更（テスト削除・スキップ追加・アサーション減少）を検知して理由の記録を求めるか */
+	testIntegrity: boolean;
 }
 
+export const DEFAULT_GIT: GitSettings = {
+	enabled: true,
+	branchPrefix: "issue-",
+	commit: true,
+	commitArtifacts: false,
+	pr: "ask",
+	draft: false,
+	dirtyStart: "ask",
+};
+
 export const DEFAULT_CONFIG: HarnessConfig = {
+	checkCommands: [],
 	testTimeoutSec: 900,
 	maxTestLoops: 3,
 	maxReviewLoops: 3,
@@ -59,6 +104,8 @@ export const DEFAULT_CONFIG: HarnessConfig = {
 	testOutputLines: 120,
 	autoHandoff: true,
 	models: {},
+	git: DEFAULT_GIT,
+	testIntegrity: true,
 };
 
 export const CONFIG_PATH = ".pi/harness.json";
@@ -98,6 +145,12 @@ export function mergeConfig(raw: Partial<HarnessConfig>, warnings: string[] = []
 	if (!Array.isArray(c.issueLabels)) c.issueLabels = [];
 	if (typeof c.autoHandoff !== "boolean") c.autoHandoff = DEFAULT_CONFIG.autoHandoff;
 	c.models = normalizeModels(raw.models as unknown, warnings);
+	if (!Array.isArray(c.checkCommands) || !c.checkCommands.every((x) => typeof x === "string" && x.trim())) {
+		if (raw.checkCommands !== undefined) warnings.push("checkCommands はコマンド文字列の配列で指定してください。無視します。");
+		c.checkCommands = [];
+	}
+	c.git = normalizeGit(raw.git as unknown, warnings);
+	if (typeof c.testIntegrity !== "boolean") c.testIntegrity = DEFAULT_CONFIG.testIntegrity;
 	return c;
 }
 
@@ -146,8 +199,40 @@ export function saveConfigPatch(cwd: string, patch: Partial<HarnessConfig>): voi
 	writeFileSync(path, `${JSON.stringify({ ...current, ...patch }, null, 2)}\n`);
 }
 
+export function normalizeGit(raw: unknown, warnings: string[] = []): GitSettings {
+	if (raw === undefined || raw === null) return { ...DEFAULT_GIT };
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		warnings.push("git はオブジェクトで指定してください。既定値を使用します。");
+		return { ...DEFAULT_GIT };
+	}
+	const r = raw as Record<string, unknown>;
+	const g: GitSettings = { ...DEFAULT_GIT };
+	for (const key of ["enabled", "commit", "commitArtifacts", "draft"] as const) {
+		if (r[key] === undefined) continue;
+		if (typeof r[key] === "boolean") g[key] = r[key] as boolean;
+		else warnings.push(`git.${key} は true / false で指定してください。`);
+	}
+	if (r.branchPrefix !== undefined) {
+		if (typeof r.branchPrefix === "string" && /^[\w./-]*$/.test(r.branchPrefix)) g.branchPrefix = r.branchPrefix;
+		else warnings.push("git.branchPrefix は英数字・/・-・_・. で指定してください。");
+	}
+	if (r.baseBranch !== undefined) {
+		if (typeof r.baseBranch === "string" && /^[\w./-]+$/.test(r.baseBranch)) g.baseBranch = r.baseBranch;
+		else warnings.push("git.baseBranch はブランチ名で指定してください。");
+	}
+	if (r.pr !== undefined) {
+		if (r.pr === "ask" || r.pr === "auto" || r.pr === "off") g.pr = r.pr;
+		else warnings.push('git.pr は "ask" / "auto" / "off" のいずれかで指定してください。');
+	}
+	if (r.dirtyStart !== undefined) {
+		if (r.dirtyStart === "ask" || r.dirtyStart === "allow" || r.dirtyStart === "refuse") g.dirtyStart = r.dirtyStart;
+		else warnings.push('git.dirtyStart は "ask" / "allow" / "refuse" のいずれかで指定してください。');
+	}
+	return g;
+}
+
 /**
- * models 設定を正規化する。値は "provider/model-id" の文字列か { model, thinking }。
+ * models 設定を正規化する。値は "provider/model-id"・その配列（フォールバック候補）・{ model, thinking } のいずれか。
  */
 export function normalizeModels(raw: unknown, warnings: string[] = []): ModelSettings {
 	if (raw === undefined || raw === null) return {};
@@ -155,38 +240,46 @@ export function normalizeModels(raw: unknown, warnings: string[] = []): ModelSet
 		warnings.push("models はオブジェクトで指定してください。無視します。");
 		return {};
 	}
+	const toList = (v: unknown, key: string): string[] | undefined => {
+		const list = typeof v === "string" ? [v] : Array.isArray(v) ? v : undefined;
+		if (!list || !list.every((x) => typeof x === "string" && x.trim())) {
+			warnings.push(`models.${key}.model は "provider/model-id" またはその配列で指定してください。`);
+			return undefined;
+		}
+		return list.map((x: string) => x.trim());
+	};
 	const out: ModelSettings = {};
 	for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-		if (key !== "default" && !PROCESS_KINDS.includes(key as ProcessKind)) {
-			warnings.push(`models.${key} は不明なプロセスです（指定可能: default, ${PROCESS_KINDS.join(", ")}）。無視します。`);
+		if (!MODEL_KEYS.includes(key as ModelKey)) {
+			warnings.push(`models.${key} は不明なプロセスです（指定可能: ${MODEL_KEYS.join(", ")}）。無視します。`);
 			continue;
 		}
 		const setting: ProcessModelSetting = {};
-		if (typeof value === "string") {
-			setting.model = value.trim();
-		} else if (value && typeof value === "object" && !Array.isArray(value)) {
+		if (typeof value === "string" || Array.isArray(value)) {
+			setting.model = toList(value, key);
+		} else if (value && typeof value === "object") {
 			const v = value as { model?: unknown; thinking?: unknown };
-			if (typeof v.model === "string" && v.model.trim()) setting.model = v.model.trim();
-			else if (v.model !== undefined) warnings.push(`models.${key}.model は文字列で指定してください。`);
+			if (v.model !== undefined) setting.model = toList(v.model, key);
 			if (typeof v.thinking === "string" && (THINKING_LEVELS as readonly string[]).includes(v.thinking)) {
 				setting.thinking = v.thinking as ThinkingLevelName;
 			} else if (v.thinking !== undefined) {
 				warnings.push(`models.${key}.thinking は ${THINKING_LEVELS.join(" / ")} のいずれかで指定してください。`);
 			}
 		} else {
-			warnings.push(`models.${key} は "provider/model-id" か { "model": ..., "thinking": ... } で指定してください。`);
+			warnings.push(`models.${key} は "provider/model-id"・その配列・{ "model": ..., "thinking": ... } のいずれかで指定してください。`);
 			continue;
 		}
-		if (setting.model || setting.thinking) out[key as ProcessKind | "default"] = setting;
+		if (setting.model || setting.thinking) out[key as ModelKey] = setting;
 	}
 	return out;
 }
 
-/** プロセスに適用する設定（プロセス個別の値を優先し、無い項目は default を使う） */
-export function resolveProcessModel(models: ModelSettings, process: ProcessKind): ProcessModelSetting {
-	const d = models.default ?? {};
-	const p = models[process] ?? {};
-	return { model: p.model ?? d.model, thinking: p.thinking ?? d.thinking };
+/**
+ * プロセスに適用する設定。優先順位は レビューの周回別キー（review_full / review_light）→ プロセス → default で、項目ごとに決める。
+ */
+export function resolveProcessModel(models: ModelSettings, process: ProcessKind, variant?: ReviewVariant): ProcessModelSetting {
+	const chain = [variant ? models[variant] : undefined, models[process], models.default].filter(Boolean) as ProcessModelSetting[];
+	return { model: chain.find((c) => c.model)?.model, thinking: chain.find((c) => c.thinking)?.thinking };
 }
 
 /** "provider/model-id" を分解する。"/" を含まない場合は model-id のみ */

@@ -11,7 +11,7 @@
  * 状態遷移は state.ts、引き継ぎは handoff.ts の純粋関数で行い、この拡張はツール/コマンド/イベントとの接続だけを担う。
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -20,7 +20,12 @@ import { Type } from "typebox";
 import { findModel, type HarnessConfig, loadConfig, PROCESS_KINDS, resolveProcessModel, saveConfigPatch } from "./config.ts";
 import { checkBash, checkWrite, type GuardPaths, isHarnessFile, isInside, STATE_FILE } from "./guard.ts";
 import { buildContext } from "./guidance.ts";
+import { emptyRegistry, type IssueRegistry, nextIssue, progressTable, registerIssues, setStatus } from "./progress.ts";
+import { analyzeTestDiff, findingsMarkdown, signature as integritySignature } from "./integrity.ts";
+import { commitAll, currentBranch, defaultBranch, diffSince, dirtyFiles, fingerprint, type GitInfo, headSha, isGitRepo, prepareBranch, branchName, type Run } from "./git.ts";
+import { type UsageFile, sumSession, summarize as summarizeUsage, upsertSession, usageMarkdown } from "./usage.ts";
 import {
+	artifactPaths,
 	escalationMarkdown,
 	handoffRecord,
 	kickoffMessage,
@@ -41,8 +46,11 @@ import {
 	withDependencies,
 } from "./issues.ts";
 import {
+	acknowledgeTestChanges,
 	type ApprovalDecision,
 	type ApprovalKind,
+	isAcknowledged,
+	isTestGatedTransition,
 	appendIssues,
 	applyApproval,
 	beginApproval,
@@ -130,12 +138,42 @@ export default function piHarness(pi: ExtensionAPI): void {
 		ctx.ui.setStatus("harness", line ? `🧭 ${line}` : undefined);
 	}
 
+	const gitRun =
+		(ctx: { cwd: string }): Run =>
+		(cmd, args) =>
+			pi.exec(cmd, args, { cwd: ctx.cwd, timeout: 120_000 });
+
+	/** git の差分・指紋・コミットから外すパス（成果物ディレクトリと、プロジェクト内に clone した piHarness 本体） */
+	function gitExcludes(ctx: { cwd: string }, cfg: HarnessConfig): string[] {
+		const out = [cfg.workDir];
+		const rel = relative(ctx.cwd, HARNESS_ROOT);
+		if (rel && !rel.startsWith("..") && !isAbsolute(rel)) out.push(rel);
+		return out;
+	}
+
 	function writeItemFile(ctx: { cwd: string }, rel: string, content: string, append = false): string {
 		const abs = join(ctx.cwd, rel);
 		mkdirSync(dirname(abs), { recursive: true });
 		if (append) appendFileSync(abs, content);
 		else writeFileSync(abs, content);
 		return rel;
+	}
+
+	const registryFile = (ctx: { cwd: string }) => join(ctx.cwd, cfgOf(ctx).workDir, "issues.json");
+
+	function loadRegistry(ctx: { cwd: string }): IssueRegistry {
+		const file = registryFile(ctx);
+		if (!existsSync(file)) return emptyRegistry();
+		try {
+			const r = JSON.parse(readFileSync(file, "utf8")) as IssueRegistry;
+			return r.version === 1 && Array.isArray(r.issues) ? r : emptyRegistry();
+		} catch {
+			return emptyRegistry();
+		}
+	}
+
+	function saveRegistry(ctx: { cwd: string }, reg: IssueRegistry): void {
+		writeItemFile(ctx, relative(ctx.cwd, registryFile(ctx)), `${JSON.stringify(reg, null, 2)}\n`);
 	}
 
 	/** 同じ名前の作業ディレクトリが既にあれば -r2, -r3 … を付けて新しく作る */
@@ -195,6 +233,173 @@ export default function piHarness(pi: ExtensionAPI): void {
 	}
 
 	/**
+	 * 実装フロー完了時の後処理: Issue を完了にし、変更をコミットし、設定に応じて PR を作成する。
+	 * PR（外部への公開）は git.pr が "ask" ならユーザーの確認を必須にする。戻り値はユーザー向けの報告文。
+	 */
+	async function finalizeImplementation(ctx: ExtensionContext, cfg: HarnessConfig, opts: { forcePr?: boolean } = {}): Promise<string> {
+		const lines: string[] = [];
+		const issue = state.issue;
+		if (issue) saveRegistry(ctx, setStatus(loadRegistry(ctx), issue, "done"));
+		const usage = usageSummaryLine(ctx);
+		if (usage) lines.push(usage);
+		const git = state.git;
+		if (!git || !cfg.git.enabled) {
+			lines.push("Git 連携なし（コミット・PR は作成していません）。");
+			return lines.join("\n");
+		}
+		const run = gitRun(ctx);
+		const excludes = cfg.git.commitArtifacts ? gitExcludes(ctx, cfg).filter((e) => e !== cfg.workDir) : gitExcludes(ctx, cfg);
+		const title = `${issue?.title ?? "piHarness 実装"}${issue?.number ? ` (#${issue.number})` : ""}`;
+		let next: GitInfo = { ...git };
+		if (cfg.git.commit && !git.commit) {
+			try {
+				const body = [
+					"piHarness TDD 実装フローで作成",
+					`レビュー: ${state.review.history.length} 周（${state.review.history.map((h) => `${h.round}:${h.blocking}件`).join(", ")}）`,
+					issue?.number ? `\nCloses #${issue.number}` : "",
+				].join("\n");
+				const sha = await commitAll(run, excludes, `${title}\n\n${body}`);
+				if (sha) {
+					next = { ...next, commit: sha };
+					lines.push(`コミットしました: ${sha.slice(0, 12)}${git.branch ? `（ブランチ ${git.branch}）` : ""}`);
+				} else {
+					lines.push("コミットする変更はありませんでした。");
+				}
+			} catch (e) {
+				lines.push(`⚠ ${(e as Error).message}`);
+				setState({ ...state, git: next }, ctx);
+				return lines.join("\n");
+			}
+		}
+		setState({ ...state, git: next }, ctx);
+
+		const mode = opts.forcePr ? "auto" : cfg.git.pr;
+		if (mode === "off") {
+			lines.push("PR は作成しない設定です（git.pr: off）。");
+		} else if (next.pr?.status === "created") {
+			lines.push(`PR は作成済みです: ${next.pr.url}`);
+		} else if (!next.branch || !next.baseBranch || next.branch === next.baseBranch) {
+			lines.push("作業ブランチが無いため PR は作成していません（開始時のブランチ上で作業しました）。");
+		} else if (!next.commit) {
+			lines.push("コミットが無いため PR は作成していません。");
+		} else {
+			let go = mode === "auto";
+			if (mode === "ask") {
+				if (!ctx.hasUI) {
+					lines.push("PR 作成には確認が必要です（git.pr: ask）。/harness pr で作成できます。");
+				} else {
+					go = await ctx.ui.confirm(
+						"PR を作成しますか？",
+						`ブランチ ${next.branch} を origin に push し、${next.baseBranch} への${cfg.git.draft ? "ドラフト " : ""}PR を作成します。\nタイトル: ${title}`,
+					);
+					if (!go) lines.push("PR の作成はスキップしました（後で /harness pr で作成できます）。");
+				}
+			}
+			if (go) lines.push(await createPullRequest(ctx, cfg, title));
+		}
+		return lines.join("\n");
+	}
+
+	async function createPullRequest(ctx: ExtensionContext, cfg: HarnessConfig, title: string): Promise<string> {
+		const git = state.git;
+		if (!git?.branch || !git.baseBranch) return "作業ブランチが無いため PR を作成できません。";
+		const fail = (msg: string) => {
+			setState({ ...state, git: { ...git, pr: { status: "failed", error: msg } } }, ctx);
+			return `⚠ PR を作成できませんでした: ${msg}（原因を解消して /harness pr で再試行できます）`;
+		};
+		const push = await pi.exec("git", ["push", "-u", "origin", git.branch], { cwd: ctx.cwd, timeout: 180_000 }).catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message, killed: false }));
+		if (push.code !== 0) return fail(`git push: ${(push.stderr || push.stdout).trim()}`);
+		const p = pathsOf(state);
+		const impl = existsSync(join(ctx.cwd, p.implementation)) ? readFileSync(join(ctx.cwd, p.implementation), "utf8") : "";
+		const reviews = state.review.history.map((h) => `- ${h.round} 周目（${h.mode === "full" ? "フル" : "軽量"}）: ブロッキング ${h.blocking} 件 / 全 ${h.total} 件`).join("\n");
+		const body = `${impl.trim()}\n\n## レビュー（piHarness）\n\n${reviews || "なし"}\n${state.issue?.number ? `\nCloses #${state.issue.number}\n` : ""}`;
+		const args = ["pr", "create", "--base", git.baseBranch, "--head", git.branch, "--title", title, "--body", body];
+		if (cfg.git.draft) args.push("--draft");
+		if (cfg.issueRepo) args.push("--repo", cfg.issueRepo);
+		const r = await pi.exec("gh", args, { cwd: ctx.cwd, timeout: 120_000 }).catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message, killed: false }));
+		const url = r.stdout.match(/https?:\/\/\S+\/pull\/\d+/)?.[0];
+		if (r.code !== 0 || !url) return fail(`gh pr create: ${(r.stderr || r.stdout).trim()}`);
+		setState({ ...state, git: { ...git, pr: { status: "created", url } } }, ctx);
+		if (state.issue) saveRegistry(ctx, setStatus(loadRegistry(ctx), state.issue, "done", { pr: url }));
+		return `PR を作成しました: ${url}`;
+	}
+
+	// -----------------------------------------------------------------------
+	// モデル利用量（セッションごとに集計して作業ディレクトリの usage.json へ）
+	// -----------------------------------------------------------------------
+
+	/** このセッションが担当するプロセス（セッション開始時に決まる） */
+	let sessionProcess: ProcessKind | undefined;
+
+	function loadUsage(ctx: { cwd: string }, itemDir: string): UsageFile {
+		const file = join(ctx.cwd, artifactPaths(itemDir).usage);
+		if (!existsSync(file)) return { version: 1, sessions: [] };
+		try {
+			return JSON.parse(readFileSync(file, "utf8")) as UsageFile;
+		} catch {
+			return { version: 1, sessions: [] };
+		}
+	}
+
+	function recordUsage(ctx: ExtensionContext): void {
+		if (!state.itemDir) return;
+		sessionProcess ??= processOf(state) ?? undefined;
+		if (!sessionProcess) return;
+		const models = sumSession(ctx.sessionManager.getEntries() as { type: string; message?: unknown }[]);
+		if (Object.keys(models).length === 0) return;
+		const file = upsertSession(loadUsage(ctx, state.itemDir), {
+			sessionId: ctx.sessionManager.getSessionId(),
+			process: sessionProcess,
+			models,
+			updatedAt: new Date().toISOString(),
+		});
+		writeItemFile(ctx, artifactPaths(state.itemDir).usage, `${JSON.stringify(file, null, 2)}\n`);
+	}
+
+	function usageSummaryLine(ctx: { cwd: string }): string | undefined {
+		if (!state.itemDir) return undefined;
+		const file = loadUsage(ctx, state.itemDir);
+		if (file.sessions.length === 0) return undefined;
+		const { total } = summarizeUsage(file);
+		return `モデル利用量: ${file.sessions.length} セッション / 入力 ${total.input.toLocaleString("en-US")}・出力 ${total.output.toLocaleString("en-US")} トークン / $${total.cost.toFixed(4)}（詳細: /harness usage）`;
+	}
+
+	pi.on("agent_end", async (_e, ctx) => {
+		try {
+			recordUsage(ctx);
+		} catch (e) {
+			ctx.ui.notify(`[piHarness] 利用量を記録できませんでした: ${(e as Error).message}`, "warning");
+		}
+	});
+
+	/**
+	 * テストを弱める変更（テスト削除・スキップ/フォーカス追加・アサーション減少）を実装開始時点からの差分で検知する。
+	 * 見つかった場合は理由の記録を求め、記録された理由は test-changes.md としてレビュー担当に引き継ぐ。
+	 */
+	async function checkTestIntegrity(ctx: ExtensionContext, cfg: HarnessConfig, reason: string | undefined): Promise<void> {
+		if (!cfg.testIntegrity || !state.git?.base) return;
+		const { nameStatus, patch } = await diffSince(gitRun(ctx), state.git.base, gitExcludes(ctx, cfg), ctx.cwd);
+		const findings = analyzeTestDiff(nameStatus, patch);
+		if (findings.length === 0) return;
+		const sig = integritySignature(findings);
+		if (isAcknowledged(state, sig)) return;
+		if (!reason?.trim()) {
+			throw new Error(
+				`テストを弱める可能性のある変更を検知しました（実装開始時点 ${state.git.base.slice(0, 12)} からの差分）:\n${findingsMarkdown(findings)}\n\n` +
+					"意図しない変更なら元に戻してください。正当な変更（仕様変更で不要になったテストの削除など）であれば、" +
+					"harness_phase の testChangeReason に理由を書いて再実行してください。理由はレビュー担当が検証します。",
+			);
+		}
+		writeItemFile(
+			ctx,
+			pathsOf(state).testChanges,
+			`\n## ${new Date().toISOString()}（${PHASE_LABELS[state.phase]}）\n\n${findingsMarkdown(findings)}\n\n**理由:** ${reason.trim()}\n`,
+			true,
+		);
+		setState(acknowledgeTestChanges(state, sig, reason.trim()), ctx);
+	}
+
+	/**
 	 * ループ上限時のエスカレーション。記録ファイルを書き出し、UI があればその場でユーザーに判断を仰ぐ。
 	 */
 	async function handleEscalation(ctx: ExtensionContext, headline: string): Promise<ToolText> {
@@ -250,17 +455,30 @@ export default function piHarness(pi: ExtensionAPI): void {
 	 * 設定が無ければ何もしない（Pi の既定モデルのまま）。失敗しても処理は続け、警告だけ出す。
 	 */
 	async function applyProcessModel(ctx: ExtensionContext, proc: ProcessKind): Promise<string | undefined> {
-		const setting = resolveProcessModel(cfgOf(ctx).models, proc);
+		const variant = proc === "review" ? (reviewMode(state) === "full" ? "review_full" : "review_light") : undefined;
+		const setting = resolveProcessModel(cfgOf(ctx).models, proc, variant);
 		const applied: string[] = [];
 		if (setting.model) {
-			// getAvailable() は起動直後に認証状態の反映が遅れることがあるため、全カタログから探して認証は setModel に判定させる
-			const { model, error } = findModel(setting.model, ctx.modelRegistry.getAll());
-			if (!model) {
-				ctx.ui.notify(`[piHarness] ${PROCESS_LABELS[proc]}: ${error} 既定のモデルを使用します。`, "warning");
-			} else if (!(await setModelWhenReady(ctx, model))) {
-				ctx.ui.notify(`[piHarness] ${PROCESS_LABELS[proc]}: ${setting.model} の認証が設定されていません。既定のモデルを使用します。`, "warning");
-			} else {
-				applied.push(`${model.provider}/${model.id}`);
+			// 候補を先頭から試し、見つかって認証が設定されている最初のモデルを使う（フォールバック）
+			const problems: string[] = [];
+			for (const ref of setting.model) {
+				// getAvailable() は起動直後に認証状態の反映が遅れることがあるため、全カタログから探して認証は setModel に判定させる
+				const { model, error } = findModel(ref, ctx.modelRegistry.getAll());
+				if (!model) {
+					problems.push(error ?? ref);
+					continue;
+				}
+				if (!(await setModelWhenReady(ctx, model))) {
+					problems.push(`${ref} の認証が設定されていません。`);
+					continue;
+				}
+				applied.push(`${model.provider}/${model.id}${problems.length ? `（フォールバック: ${problems.length} 件スキップ）` : ""}`);
+				break;
+			}
+			if (applied.length === 0) {
+				ctx.ui.notify(`[piHarness] ${PROCESS_LABELS[proc]}: 使えるモデルがありません。既定のモデルを使用します。\n${problems.join("\n")}`, "warning");
+			} else if (problems.length) {
+				ctx.ui.notify(`[piHarness] ${PROCESS_LABELS[proc]}: 優先候補を使えなかったためフォールバックしました。\n${problems.join("\n")}`, "warning");
 			}
 		}
 		if (setting.thinking) {
@@ -287,8 +505,10 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_e, ctx) => {
 		state = loadState(ctx);
+		sessionProcess = undefined;
 		if (state.kickoff) {
 			const proc = state.kickoff;
+			sessionProcess = proc;
 			setState({ ...state, kickoff: undefined }, ctx);
 			const applied = await applyProcessModel(ctx, proc);
 			if (applied) ctx.ui.notify(`piHarness: ${PROCESS_LABELS[proc]} のモデル → ${applied}`, "info");
@@ -431,10 +651,23 @@ export default function piHarness(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			to: StringEnum(ALL_PHASES as [Phase, ...Phase[]], { description: "遷移先フェーズ" }),
 			note: Type.Optional(Type.String({ description: "遷移理由・成果の要約" })),
+			testChangeReason: Type.Optional(
+				Type.String({
+					description:
+						"テストの削除・スキップ追加・アサーション減少を検知して遷移が拒否された場合に限り、その変更が正当である理由（レビュー担当が検証する）",
+				}),
+			),
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!isActive(state)) throw new Error("アクティブなフローがありません。");
+			const cfg = cfgOf(ctx);
+			const gated = isTestGatedTransition(state.phase, params.to);
+			// 合格時点から作業ツリーが変わっていれば（bash 経由の変更を含む）未テスト扱いにする
+			if (gated && state.test.fingerprint && !state.test.dirty) {
+				const current = await fingerprint(gitRun(ctx), ctx.cwd, gitExcludes(ctx, cfg));
+				if (current && current !== state.test.fingerprint) setState(markDirty(state), ctx);
+			}
 			const next = transition(state, params.to, params.note);
 			const required = requiredArtifact(state, params.to);
 			if (required && !existsSync(join(ctx.cwd, required.path))) {
@@ -443,6 +676,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 						"次のプロセスは新しいセッションで開始され、このファイルだけが引き継がれます。",
 				);
 			}
+			if (gated) await checkTestIntegrity(ctx, cfg, params.testChangeReason);
 			const from = state.phase;
 			setState(next, ctx);
 
@@ -558,22 +792,44 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			if (!command) throw new Error("テストコマンドが未設定です。.pi/harness.json の testCommand を設定してください。");
 
-			const started = Date.now();
-			const result = await pi.exec("bash", ["-lc", command], { cwd: ctx.cwd, timeout: cfg.testTimeoutSec * 1000, signal });
-			const secs = ((Date.now() - started) / 1000).toFixed(1);
-			const passed = result.code === 0 && !result.killed;
-			const output = `${result.stdout}\n${result.stderr}`;
+			// green 判定ではテストに加えて lint・型チェックなどのチェックも合格を必須にする
+			const commands = [
+				{ label: "テスト", command },
+				...(params.expect === "green" ? cfg.checkCommands.map((c) => ({ label: "チェック", command: c })) : []),
+			];
+			const runs: { label: string; command: string; code: number; killed: boolean; secs: string; output: string }[] = [];
+			for (const c of commands) {
+				const started = Date.now();
+				const result = await pi.exec("bash", ["-lc", c.command], { cwd: ctx.cwd, timeout: cfg.testTimeoutSec * 1000, signal });
+				runs.push({
+					...c,
+					code: result.code,
+					killed: result.killed,
+					secs: ((Date.now() - started) / 1000).toFixed(1),
+					output: `${result.stdout}\n${result.stderr}`,
+				});
+			}
+			const ok = (r: (typeof runs)[number]) => r.code === 0 && !r.killed;
+			const passed = runs.every(ok);
 			const log = writeItemFile(
 				ctx,
 				join(pathsOf(state).logs, `test-${timestamp()}.log`),
-				`$ ${command}\n# phase=${state.phase} exit=${result.code} killed=${result.killed} ${secs}s expect=${params.expect}\n# reason: ${params.reason ?? ""}\n\n${output}`,
+				`# phase=${state.phase} expect=${params.expect}\n# reason: ${params.reason ?? ""}\n` +
+					runs.map((r) => `\n$ ${r.command}\n# exit=${r.code} killed=${r.killed} ${r.secs}s\n\n${r.output}`).join("\n"),
 			);
-			const { text: tail, truncated } = tailLines(output, cfg.testOutputLines);
+			// 失敗したコマンド（無ければテスト）の出力末尾をモデルに渡す
+			const shown = runs.find((r) => !ok(r)) ?? runs[0];
+			const { text: tail, truncated } = tailLines(shown.output, cfg.testOutputLines);
+			const summary = runs
+				.map((r) => `$ ${r.command}\n  → ${ok(r) ? "PASS" : "FAIL"} (exit ${r.code}${r.killed ? ", タイムアウト/中断" : ""}, ${r.secs}s)`)
+				.join("\n");
 			const header =
-				`$ ${command}\n結果: ${passed ? "PASS" : "FAIL"} (exit ${result.code}${result.killed ? ", タイムアウト/中断" : ""}, ${secs}s)` +
-				`\n全ログ: ${log}${truncated ? `（先頭 ${truncated} 行を省略）` : ""}\n\n${tail}\n\n`;
+				`${summary}\n結果: ${passed ? "PASS" : "FAIL"}\n全ログ: ${log}\n\n` +
+				`[${shown.label}の出力${truncated ? `・先頭 ${truncated} 行を省略` : ""}: ${shown.command}]\n${tail}\n\n`;
+			// 実行後の作業ツリーの指紋（合格後に bash 経由でファイルが変わってもレビューへ進めないようにする）
+			const fp = passed && params.expect === "green" ? await fingerprint(gitRun(ctx), ctx.cwd, gitExcludes(ctx, cfg)) : undefined;
 
-			const { state: next, outcome } = recordTestRun(state, params.expect, passed, log);
+			const { state: next, outcome } = recordTestRun(state, params.expect, passed, log, fp);
 			setState(next, ctx);
 			switch (outcome.kind) {
 				case "red_confirmed":
@@ -635,12 +891,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const report = writeItemFile(ctx, pathsOf(state).review(outcome.round), reviewMarkdown(outcome.round, mode, params.summary, findings, cfg));
 			setState(next, ctx);
 			switch (outcome.kind) {
-				case "clean":
+				case "clean": {
+					const finalized = await finalizeImplementation(ctx, cfg);
 					return reply(
 						`レビュー ${outcome.round} 周目（${mode === "full" ? "フル" : "軽量"}）: ブロッキング指摘なし。実装フロー完了です。記録: ${report}\n` +
+							`${finalized}\n` +
 							(outcome.nonBlocking ? `軽微な指摘 ${outcome.nonBlocking} 件はユーザーへの報告に含めてください（必要なら別 Issue 化を提案）。` : "") +
-							"変更内容・テスト結果・レビュー結果をユーザーに報告してください。",
+							"変更内容・テスト結果・レビュー結果・コミット/PR・利用量をユーザーに報告してください。",
 					);
+				}
 				case "fix":
 					return reply(
 						`レビュー ${outcome.round} 周目: ブロッキング指摘 ${outcome.blocking} 件。記録: ${report}\n` +
@@ -733,15 +992,26 @@ export default function piHarness(pi: ExtensionAPI): void {
 			writeItemFile(ctx, join(pathsOf(state).dir, "issues.md"), `\n## ${new Date().toISOString()}\n\n${lines.join("\n")}\n`, true);
 			if (failures.length) {
 				setState(appendIssues(state, ok), ctx);
+				const failedIds = new Set(created.filter((c) => !c.url && !c.file).map((c) => `title:${c.title}`));
+				const reg = registerIssues(loadRegistry(ctx), drafts.map((d, i) => ({ ...created[i], dependsOn: d.dependsOn })), state.itemDir);
+				saveRegistry(ctx, { ...reg, issues: reg.issues.filter((i) => !failedIds.has(i.id)) });
 				return reply(
 					`${ok.length}/${drafts.length} 件を登録しました:\n${lines.join("\n")}\n\n失敗 (${failures.length} 件):\n- ${failures.join("\n- ")}\n` +
 						"失敗したものだけを修正して再度 harness_create_issues してください（登録済みのものは含めない）。",
 				);
 			}
 			setState(recordIssues(state, ok), ctx);
+			saveRegistry(
+				ctx,
+				registerIssues(
+					loadRegistry(ctx),
+					drafts.map((d, i) => ({ ...created[i], dependsOn: d.dependsOn })),
+					state.itemDir,
+				),
+			);
 			const where = useGh ? "GitHub に登録" : `Markdown として ${cfg.docsDir}/issues/ に保存${params.dryRun ? "" : "（gh CLI が未認証/未インストールのため）"}`;
 			return reply(
-				`${ok.length} 件の Issue を${where}しました:\n${lines.join("\n")}\n\n要件定義フロー完了。一覧と推奨着手順をユーザーに報告し、/impl <番号> で実装フローを開始できることを伝えてください。`,
+				`${ok.length} 件の Issue を${where}しました:\n${lines.join("\n")}\n${usageSummaryLine(ctx) ?? ""}\n\n要件定義フロー完了。一覧と推奨着手順をユーザーに報告し、/impl next（依存関係から次の Issue を自動選択）または /impl <番号> で実装フローを開始できることを伝えてください。`,
 			);
 		},
 	});
@@ -752,6 +1022,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	async function confirmReplace(ctx: ExtensionContext, next: string): Promise<boolean> {
 		if (!isActive(state) || !ctx.hasUI) return true;
+		if (["impl_done", "req_done", "bug_done"].includes(state.phase) && !state.suspended) return true;
 		return ctx.ui.confirm("進行中のフローがあります", `現在: ${state.flow} / ${PHASE_LABELS[state.phase]}\n破棄して ${next} を開始しますか？`);
 	}
 
@@ -768,44 +1039,137 @@ export default function piHarness(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerCommand("impl", {
-		description: "TDD 実装フローを新しいセッションで開始する: /impl <Issue番号 | Issue URL>",
-		handler: async (args, ctx) => {
-			state = loadState(ctx);
-			let arg = args.trim();
-			if (!arg && ctx.hasUI) arg = (await ctx.ui.input("実装する Issue 番号または URL"))?.trim() ?? "";
-			const num = parseIssueArg(arg);
-			if (!num) {
-				ctx.ui.notify("Issue 番号または URL を指定してください: /impl 12", "error");
-				return;
+	/** Issue 番号・URL・Markdown ファイルから Issue の情報と本文を得る */
+	async function resolveIssue(ctx: ExtensionContext, cfg: HarnessConfig, arg: string): Promise<{ issue: IssueRef; body?: string } | undefined> {
+		const file = arg.replace(/^file:/, "");
+		if (/\.md$/i.test(file) && existsSync(join(ctx.cwd, file))) {
+			const text = readFileSync(join(ctx.cwd, file), "utf8");
+			const title =
+				text.match(/^title:\s*"?(.+?)"?\s*$/m)?.[1]?.replace(/\\"/g, '"') ?? text.match(/^#\s+(.+)$/m)?.[1] ?? file;
+			return { issue: { title, file: relative(ctx.cwd, join(ctx.cwd, file)) }, body: text };
+		}
+		const num = parseIssueArg(arg);
+		if (!num) return undefined;
+		const view = await pi
+			.exec("gh", ["issue", "view", String(num), "--json", "number,title,body,url", ...(cfg.issueRepo ? ["--repo", cfg.issueRepo] : [])], {
+				cwd: ctx.cwd,
+				timeout: 60_000,
+			})
+			.catch(() => undefined);
+		if (view?.code === 0) {
+			try {
+				const j = JSON.parse(view.stdout) as { number: number; title: string; body: string; url: string };
+				return { issue: { number: j.number, title: j.title, url: j.url }, body: j.body };
+			} catch {
+				// 取得失敗時はプラン作成セッションで取得させる
 			}
-			if (!(await confirmReplace(ctx, `Issue #${num} の実装フロー`))) return;
-			const cfg = cfgOf(ctx);
-			const view = await pi
-				.exec("gh", ["issue", "view", String(num), "--json", "number,title,body,url", ...(cfg.issueRepo ? ["--repo", cfg.issueRepo] : [])], {
+		}
+		// 登録済みの Issue ならタイトルだけでも補う
+		const known = loadRegistry(ctx).issues.find((i) => i.number === num);
+		return { issue: { number: num, title: known?.title ?? "(タイトル未取得)", url: known?.url } };
+	}
+
+	/** GitHub 上で閉じられた Issue を完了扱いにする（gh が使える場合のみ） */
+	async function refreshRegistryFromGitHub(ctx: ExtensionContext, cfg: HarnessConfig): Promise<void> {
+		let reg = loadRegistry(ctx);
+		const targets = reg.issues.filter((i) => i.number && i.status !== "done");
+		if (targets.length === 0) return;
+		const auth = await pi.exec("gh", ["auth", "status"], { cwd: ctx.cwd, timeout: 30_000 }).catch(() => undefined);
+		if (auth?.code !== 0) return;
+		for (const i of targets) {
+			const r = await pi
+				.exec("gh", ["issue", "view", String(i.number), "--json", "state", ...(cfg.issueRepo ? ["--repo", cfg.issueRepo] : [])], {
 					cwd: ctx.cwd,
-					timeout: 60_000,
+					timeout: 30_000,
 				})
 				.catch(() => undefined);
-			let issue: IssueRef = { number: num, title: "(タイトル未取得)" };
-			let body: string | undefined;
-			if (view?.code === 0) {
+			if (r?.code === 0 && /"CLOSED"/.test(r.stdout)) reg = setStatus(reg, i, "done");
+		}
+		saveRegistry(ctx, reg);
+	}
+
+	pi.registerCommand("impl", {
+		description: "TDD 実装フローを新しいセッションで開始する: /impl <Issue番号 | Issue URL | docs/issues/*.md | next>",
+		getArgumentCompletions: (prefix) => ("next".startsWith(prefix.trim()) ? [{ value: "next", label: "next（次に着手できる Issue）" }] : null),
+		handler: async (args, ctx) => {
+			state = loadState(ctx);
+			const cfg = cfgOf(ctx);
+			let arg = args.trim();
+			if (!arg && ctx.hasUI) arg = (await ctx.ui.input("実装する Issue（番号 / URL / docs/issues/*.md / next）"))?.trim() ?? "";
+			if (arg === "next") {
+				await refreshRegistryFromGitHub(ctx, cfg);
+				const reg = loadRegistry(ctx);
+				const { issue: next, blocked, inProgress } = nextIssue(reg);
+				if (!next) {
+					const why = inProgress.length
+						? `実装中: ${inProgress.map((i) => i.id).join(", ")}`
+						: blocked.length
+							? `依存待ち: ${blocked.map((b) => `${b.issue.id}（${b.waitingFor.join(", ")} 待ち）`).join(", ")}`
+							: "未着手の Issue はありません。";
+					ctx.ui.notify(`着手できる Issue がありません。${why}\n\n${progressTable(reg)}`, "info");
+					return;
+				}
+				arg = next.number ? String(next.number) : (next.file ?? "");
+				ctx.ui.notify(`次の Issue: ${next.id} ${next.title}`, "info");
+			}
+			const resolved = await resolveIssue(ctx, cfg, arg);
+			if (!resolved) {
+				ctx.ui.notify("Issue 番号・URL・docs/issues/*.md のいずれか、または next を指定してください: /impl 12", "error");
+				return;
+			}
+			const { issue, body } = resolved;
+			if (!(await confirmReplace(ctx, `${describeIssue(issue)} の実装フロー`))) return;
+
+			// Git: 作業ブランチを用意し、レビューの差分基準となる開始時点のコミットを記録する
+			let git: GitInfo | undefined;
+			const run = gitRun(ctx);
+			if (cfg.git.enabled && (await isGitRepo(run))) {
+				const dirty = await dirtyFiles(run, gitExcludes(ctx, cfg));
+				if (dirty.length && cfg.git.dirtyStart !== "allow") {
+					const list = dirty.slice(0, 10).join("\n") + (dirty.length > 10 ? `\n…ほか ${dirty.length - 10} 件` : "");
+					if (cfg.git.dirtyStart === "refuse") {
+						ctx.ui.notify(`未コミットの変更があるため開始できません（git.dirtyStart: refuse）:\n${list}`, "error");
+						return;
+					}
+					if (ctx.hasUI && !(await ctx.ui.confirm("未コミットの変更があります", `${list}\n\nこの変更は作業ブランチに持ち込まれ、レビューの差分にも含まれます。続けますか？`))) return;
+				}
+				// 作成元: 設定 → 現在のブランチ。ただし別の作業ブランチ（前の Issue）上にいる場合は既定ブランチから切る
+				const target = branchName(cfg.git.branchPrefix, issue);
+				let startFrom = cfg.git.baseBranch;
+				const cur = await currentBranch(run);
+				if (!startFrom && cur && cur !== target && cfg.git.branchPrefix && cur.startsWith(cfg.git.branchPrefix)) {
+					const def = await defaultBranch(run);
+					if (def) {
+						startFrom = def;
+						if (ctx.hasUI) {
+							const options = [`${def} から作成する（推奨）`, `現在の作業ブランチ ${cur} から作成する（積み上げ）`];
+							const choice = await ctx.ui.select(`別の作業ブランチ ${cur} 上にいます。${target} をどこから作成しますか？`, options);
+							if (choice === undefined) return;
+							if (choice === options[1]) startFrom = cur;
+						}
+					}
+				}
 				try {
-					const j = JSON.parse(view.stdout) as { number: number; title: string; body: string; url: string };
-					issue = { number: j.number, title: j.title, url: j.url };
-					body = j.body;
-				} catch {
-					// 取得失敗時はプラン作成セッションで取得させる
+					git = await prepareBranch(run, target, startFrom);
+				} catch (e) {
+					ctx.ui.notify(`[piHarness] ${(e as Error).message}`, "error");
+					return;
 				}
 			}
-			setState(startImplement(state, issue, limitsOf(cfg), newItemDir(ctx, `issue-${num}`)), ctx);
+
+			const base = issue.number ? `issue-${issue.number}` : `issue-${slugify((issue.file ?? issue.title).replace(/\.md$/, "").split("/").pop() ?? "local", 40)}`;
+			setState({ ...startImplement(state, issue, limitsOf(cfg), newItemDir(ctx, base)), git }, ctx);
+			saveRegistry(ctx, setStatus(loadRegistry(ctx), issue, "in_progress"));
 			writeItemFile(
 				ctx,
 				pathsOf(state).issue,
-				body !== undefined
-					? `# #${issue.number} ${issue.title}\n\nURL: ${issue.url}\n\n${body}\n`
-					: `# Issue #${num}\n\n（本文を自動取得できませんでした。\`gh issue view ${num}\` や docs/issues/ から内容を確認し、このファイルに本文を保存してください）\n`,
+				issue.file
+					? `# ${issue.title}\n\n元ファイル: ${issue.file}\n\n${body ?? ""}\n`
+					: body !== undefined
+						? `# #${issue.number} ${issue.title}\n\nURL: ${issue.url}\n\n${body}\n`
+						: `# Issue #${issue.number}\n\n（本文を自動取得できませんでした。\`gh issue view ${issue.number}\` や docs/issues/ から内容を確認し、このファイルに本文を保存してください）\n`,
 			);
+			if (git?.branch) ctx.ui.notify(`作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）`, "info");
 			await startProcessSession(ctx);
 		},
 	});
@@ -823,15 +1187,20 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const joinsImplement = state.flow === "implement" || state.escalation?.flow === "implement";
 			if (!joinsImplement && state.flow !== "bugfix" && !(await confirmReplace(ctx, "バグ修正フロー"))) return;
 			setState(startBugfix(state, description, limitsOf(cfg), newItemDir(ctx, `bug-${timestamp()}`)), ctx);
+			// 単独のバグ修正では現在の HEAD を差分の基準にする（ブランチは切らない）
+			if (!state.git && cfg.git.enabled && (await isGitRepo(gitRun(ctx)))) {
+				const head = await headSha(gitRun(ctx));
+				if (head) setState({ ...state, git: { base: head, branch: await currentBranch(gitRun(ctx)) } }, ctx);
+			}
 			await startProcessSession(ctx);
 		},
 	});
 
-	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "continue", "rejoin", "abort", "models", "config"];
+	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "continue", "rejoin", "abort", "pr", "issues", "usage", "models", "config"];
 
 	pi.registerCommand("harness", {
 		description:
-			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | continue [指示] | rejoin | abort | models | config",
+			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | continue [指示] | rejoin | abort | pr | issues | usage [作業ディレクトリ] | models | config",
 		getArgumentCompletions: (prefix) => SUBCOMMANDS.filter((s) => s.startsWith(prefix.trim())).map((s) => ({ value: s, label: s })),
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = args.trim().split(/\s+/);
@@ -904,21 +1273,51 @@ export default function piHarness(pi: ExtensionAPI): void {
 						ctx.ui.notify("フローを中止しました。", "info");
 						return;
 					}
+					case "pr": {
+						if (state.phase !== "impl_done") {
+							ctx.ui.notify(`PR は実装フロー完了後に作成できます（現在: ${state.phase}）`, "warning");
+							return;
+						}
+						if (ctx.hasUI && cfg.git.pr !== "auto" && !(await ctx.ui.confirm("PR を作成しますか？", `ブランチ ${state.git?.branch ?? "-"} → ${state.git?.baseBranch ?? "-"}`))) return;
+						ctx.ui.notify(await finalizeImplementation(ctx, cfg, { forcePr: true }), "info");
+						return;
+					}
+					case "issues": {
+						await refreshRegistryFromGitHub(ctx, cfg);
+						ctx.ui.notify(`${progressTable(loadRegistry(ctx))}\n\n次の Issue は /impl next で開始できます。`, "info");
+						return;
+					}
+					case "usage": {
+						const dir = text || state.itemDir;
+						if (!dir) {
+							ctx.ui.notify("作業ディレクトリを指定してください: /harness usage .pi/harness/issue-12", "warning");
+							return;
+						}
+						ctx.ui.notify(`モデル利用量（${dir}）:\n${usageMarkdown(loadUsage(ctx, dir), PROCESS_LABELS)}`, "info");
+						return;
+					}
 					case "models": {
 						const catalogue = ctx.modelRegistry.getAll();
-						const rows = PROCESS_KINDS.map((proc) => {
-							const setting = resolveProcessModel(cfg.models, proc);
-							const found = setting.model ? findModel(setting.model, catalogue) : undefined;
-							const model = !setting.model
-								? "(Pi の既定)"
-								: !found?.model
-									? `${setting.model} ⚠ ${found?.error ?? ""}`
-									: ctx.modelRegistry.hasConfiguredAuth(found.model)
-										? setting.model
-										: `${setting.model} ⚠ 認証が未設定`;
-							return `  ${PROCESS_LABELS[proc].padEnd(12, "　")} ${model}${setting.thinking ? `  thinking: ${setting.thinking}` : ""}`;
-						});
-						ctx.ui.notify(`プロセスごとのモデル（.pi/harness.json の models）:\n${rows.join("\n")}`, "info");
+						const describe = (refs: string[] | undefined) => {
+							if (!refs) return "(Pi の既定)";
+							return refs
+								.map((ref) => {
+									const found = findModel(ref, catalogue);
+									if (!found.model) return `${ref} ⚠ ${found.error ?? ""}`;
+									return ctx.modelRegistry.hasConfiguredAuth(found.model) ? ref : `${ref} ⚠ 認証が未設定`;
+								})
+								.join(" → ");
+						};
+						const rows: string[] = [];
+						for (const proc of PROCESS_KINDS) {
+							const variants = proc === "review" ? (["review_full", "review_light"] as const) : [undefined];
+							for (const v of variants) {
+								const setting = resolveProcessModel(cfg.models, proc, v);
+								const label = v === "review_full" ? "レビュー(フル)" : v === "review_light" ? "レビュー(軽量)" : PROCESS_LABELS[proc];
+								rows.push(`  ${label.padEnd(12, "　")} ${describe(setting.model)}${setting.thinking ? `  thinking: ${setting.thinking}` : ""}`);
+							}
+						}
+						ctx.ui.notify(`プロセスごとのモデル（.pi/harness.json の models。→ はフォールバック順）:\n${rows.join("\n")}`, "info");
 						return;
 					}
 					case "config": {

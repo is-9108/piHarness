@@ -87,6 +87,8 @@ export interface SuspendedImplement {
 	issue?: IssueRef;
 }
 
+import type { GitInfo } from "./git.ts";
+
 /**
  * セッションを分ける単位。プロセスが変わるときは新しいセッションを開始し、
  * 前のプロセスとの連携は成果物（md ファイル）だけで行う。
@@ -125,7 +127,13 @@ export interface HarnessState {
 		runs: number;
 		/** 直近のテストログ（cwd からの相対パス） */
 		lastLog?: string;
+		/** 直近の green 合格時点の作業ツリーの指紋（bash 経由の変更も検知するため） */
+		fingerprint?: string;
 	};
+	/** Git 連携の情報（作業ブランチ・差分の基準・コミット・PR） */
+	git?: GitInfo;
+	/** ユーザー/エージェントが理由を記録したうえで許可したテストの変更（同じ内容を二度確認しない） */
+	testChangeAcks: { signature: string; reason: string; at: string }[];
 	review: {
 		/** 実施済みレビュー周回数 */
 		round: number;
@@ -161,6 +169,7 @@ export function initialState(limits: Limits = DEFAULT_LIMITS): HarnessState {
 		flow: null,
 		phase: "idle",
 		counters: { escalations: 0, bugs: 0 },
+		testChangeAcks: [],
 		approvals: {},
 		test: { failures: 0, max: limits.maxTestLoops, dirty: false, runs: 0 },
 		review: { round: 0, max: limits.maxReviewLoops, history: [], lastFindings: [] },
@@ -240,6 +249,7 @@ export function startBugfix(prev: HarnessState, description: string, limits: Lim
 	s.bug = { description, startedAt: now() };
 	// 直近のテストログはバグ修正セッションの入力になるため引き継ぐ
 	s.test = { failures: 0, max: limits.maxTestLoops, dirty: false, runs: 0, lastLog: prev.test.lastLog };
+	if (!s.suspended) s.git = undefined; // 単独のバグ修正は index 側で差分の基準を設定し直す
 	return withLog(s, `バグ修正フロー開始: ${description || "(説明なし)"}`);
 }
 
@@ -266,6 +276,11 @@ const TEST_GATED_TRANSITIONS: Partial<Record<Phase, Phase[]>> = {
 	impl_fix_review: ["impl_review"],
 	bug_fix: ["bug_done"],
 };
+
+/** テスト合格（かつ合格後に未変更）が条件の遷移か */
+export function isTestGatedTransition(from: Phase, to: Phase): boolean {
+	return (TEST_GATED_TRANSITIONS[from] ?? []).includes(to);
+}
 
 export function allowedTransitions(s: HarnessState): Phase[] {
 	return [...(FREE_TRANSITIONS[s.phase] ?? []), ...(TEST_GATED_TRANSITIONS[s.phase] ?? [])];
@@ -394,6 +409,7 @@ export function recordTestRun(
 	expect: "red" | "green",
 	passed: boolean,
 	log?: string,
+	fingerprint?: string,
 ): { state: HarnessState; outcome: TestOutcome } {
 	if (!TEST_PHASES.includes(prev.phase)) {
 		throw new TransitionError(`現在のフェーズ (${prev.phase}) ではテストループは実行できません。`);
@@ -404,6 +420,7 @@ export function recordTestRun(
 	s.test.lastResult = passed ? "pass" : "fail";
 	s.test.dirty = false;
 	if (log) s.test.lastLog = log;
+	s.test.fingerprint = passed && expect === "green" ? fingerprint : undefined;
 
 	if (expect === "red") {
 		if (passed) return { state: withLog(s, "Red 期待のテストが合格（テストが不十分）"), outcome: { kind: "red_unexpected_pass" } };
@@ -429,6 +446,16 @@ export function recordTestRun(
 		state: withLog(s, `テスト失敗 (${s.test.failures}/${s.test.max})`),
 		outcome: { kind: "fail", failures: s.test.failures, remaining: s.test.max - s.test.failures },
 	};
+}
+
+export function acknowledgeTestChanges(prev: HarnessState, signature: string, reason: string): HarnessState {
+	const s = clone(prev);
+	s.testChangeAcks = [...(s.testChangeAcks ?? []), { signature, reason, at: now() }];
+	return withLog(s, `テストの変更を理由付きで許可: ${reason}`);
+}
+
+export function isAcknowledged(s: HarnessState, signature: string): boolean {
+	return (s.testChangeAcks ?? []).some((a) => a.signature === signature);
 }
 
 export function markDirty(prev: HarnessState): HarnessState {

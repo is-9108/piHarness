@@ -117,7 +117,8 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | コマンド | 説明 |
 |---------|------|
 | `/req [テーマ]` | 要件定義フローを開始 |
-| `/impl <番号 \| URL>` | TDD 実装フローを開始（`gh issue view` で本文を取得） |
+| `/impl <番号 \| URL \| docs/issues/*.md>` | TDD 実装フローを開始（作業ブランチを作成。GitHub の Issue は `gh issue view` で本文を取得） |
+| `/impl next` | 依存関係から次に着手できる Issue を選んで開始 |
 | `/bugfix [説明]` | バグ修正フローを開始（実装フロー中/エスカレーション中なら完了後に合流） |
 | `/harness status` | 現在のフロー・フェーズ・プロセスの入出力成果物・ループ回数・最近のイベント |
 | `/harness next [指示]` | 次のプロセス（または中断中の現在のプロセス）を新しいセッションで開始（`autoHandoff: false` 時や pi 再起動後） |
@@ -127,7 +128,10 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | `/harness continue [指示]` | エスカレーション後、カウンタをリセットしてループを継続（新しいセッション） |
 | `/harness rejoin` | 保留したバグ修正フローの結果を実装フローへ合流 |
 | `/harness abort` | フローを中止 |
-| `/harness models` | 各プロセスに適用されるモデル・思考レベルを表示 |
+| `/harness issues` | 登録した Issue の進み具合（完了 / 実装中 / 依存待ち / 次の候補） |
+| `/harness pr` | 完了した実装の PR を作成（`git.pr: ask` で見送った場合や失敗時の再試行） |
+| `/harness usage [作業ディレクトリ]` | プロセス別・モデル別のトークン数と費用 |
+| `/harness models` | 各プロセスに適用されるモデル・思考レベル・フォールバック順を表示 |
 | `/harness config` | 有効な設定を表示 |
 
 ### エージェント用ツール（拡張が登録）
@@ -159,6 +163,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
 ```json
 {
   "testCommand": "npm test",
+  "checkCommands": ["npm run lint", "npm run typecheck"],
   "testTimeoutSec": 900,
   "maxTestLoops": 3,
   "maxReviewLoops": 3,
@@ -170,11 +175,23 @@ pi -e ~/piHarness/extensions/harness/index.ts
   "ensureLabels": true,
   "testOutputLines": 120,
   "autoHandoff": true,
+  "testIntegrity": true,
+  "git": {
+    "enabled": true,
+    "branchPrefix": "issue-",
+    "baseBranch": "main",
+    "commit": true,
+    "commitArtifacts": false,
+    "pr": "ask",
+    "draft": false,
+    "dirtyStart": "ask"
+  },
   "models": {
     "default": "anthropic/claude-sonnet-5",
-    "hearing": { "model": "google/gemini-flash-latest", "thinking": "low" },
+    "hearing": { "model": ["google/gemini-flash-latest", "ollama/qwen3:8b"], "thinking": "low" },
     "requirements": { "model": "anthropic/claude-opus-5-5", "thinking": "high" },
-    "review": { "model": "anthropic/claude-opus-5-5", "thinking": "high" },
+    "review_full": { "model": "anthropic/claude-opus-5-5", "thinking": "high" },
+    "review_light": { "model": "anthropic/claude-sonnet-5", "thinking": "medium" },
     "implement": { "thinking": "medium" }
   }
 }
@@ -183,18 +200,62 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | キー | 既定値 | 説明 |
 |------|-------|------|
 | `testCommand` | 自動検出 | テストスイート全体を実行するコマンド。未検出時は初回実行時に質問して保存 |
-| `testTimeoutSec` | 900 | テストのタイムアウト（ラズパイ向けに長め） |
+| `checkCommands` | []（セットアップ時に package.json の lint / typecheck を検出） | green 判定でテストと一緒に実行し、合格を必須にするチェック（lint・型チェックなど） |
+| `testTimeoutSec` | 900 | テスト・チェック 1 コマンドあたりのタイムアウト（ラズパイ向けに長め） |
 | `maxTestLoops` | 3 | テスト失敗の修正ループ上限 |
 | `maxReviewLoops` | 3 | レビューループ上限 |
 | `blockingSeverities` | blocker, major | 修正必須とみなす重大度 |
 | `docsDir` | docs | 要件定義書などの出力先 |
 | `workDir` | .pi/harness | 状態ファイルと、作業項目ごとの成果物（プラン・実装レポート・レビュー記録・テストログ・バグレポート）の出力先 |
-| `issueRepo` | カレントリポジトリ | Issue 登録先 |
+| `issueRepo` | カレントリポジトリ | Issue 登録・PR 作成先 |
 | `issueLabels` | [] | 全 Issue に付与するラベル |
 | `ensureLabels` | true | 存在しないラベルを自動作成 |
 | `testOutputLines` | 120 | モデルに渡すテスト出力の末尾行数（全文はログに保存） |
 | `autoHandoff` | true | プロセス完了時に自動で新しいセッションを開始する。false なら `/harness next` で手動開始 |
+| `testIntegrity` | true | テストを弱める変更を検知して理由の記録を求める（下記） |
+| `git` | 下記 | Git 連携（作業ブランチ・差分の基準・コミット・PR） |
 | `models` | {} | プロセスごとのモデル・思考レベル（下記） |
+
+### Git 連携（`git`）
+
+git リポジトリであれば自動で有効になります。
+
+1. **開始時:** `/impl` で作業ブランチ（`issue-12-add-login` など。タイトルが日本語だけなら `issue-12`）を作成し、開始時点のコミットを**差分の基準**として記録します。
+   - 作成元（= PR のマージ先）は `baseBranch`、未指定なら現在のブランチです。前の Issue の作業ブランチ上にいる場合は、既定ブランチ（`origin/HEAD` / `main` / `master`）から作るか、積み上げるかを確認します（UI が無ければ既定ブランチ）。
+   - 既存のブランチなら切り替えて再開します。未コミットの変更がある場合は確認します（`dirtyStart`: `ask` / `allow` / `refuse`）。
+2. **作業中:** レビュー・修正・バグ修正の各セッションには「`git diff <基準>` で差分を確認する」と案内します。関係ない変更がレビューに混ざりません。
+3. **完了時:** レビューを通過すると変更をコミットします（件名 `タイトル (#12)`、本文に `Closes #12`）。成果物（`.pi/harness/`）は既定ではコミットしません（`commitArtifacts`）。
+4. **PR:** `pr` に従います。
+   - `ask`（既定）: 確認ダイアログで承認したときだけ、push して開始時のブランチへの PR を作成します。PR の本文は実装レポートとレビュー履歴から作ります。
+   - `auto`: 確認なしで作成します。
+   - `off`: 作成しません。
+   - 見送った場合や失敗した場合は `/harness pr` で作成できます。
+
+エージェントにはコミット・push・ブランチ操作をさせません（SKILL で禁止し、完了処理は拡張が行います）。
+コミットには git のユーザー設定（`git config --global user.name / user.email`）が必要です。
+
+### テストの保護（`testIntegrity`）
+
+実装開始時点からの差分（新規ファイルを含む）を調べ、次の変更を見つけると、レビューやバグ修正完了への遷移を止めます。
+
+- テストファイルの削除
+- `.skip` / `xit` / `@pytest.mark.skip` / `t.Skip` / `#[ignore]` などの追加
+- `.only` / `fit` など、一部のテストだけを実行させる記述の追加
+- アサーション（`expect` / `assert` など）の差し引きでの減少
+
+仕様変更でテストが不要になった場合など、正当な理由があるときだけ、エージェントが理由を書いて先へ進めます。理由は `test-changes.md` に記録され、レビュー担当が妥当性を検証します。
+
+### Issue の進み具合
+
+要件定義で登録した Issue は、依存関係とともに `.pi/harness/issues.json` に記録されます。
+`/impl` で「実装中」、レビュー通過で「完了」になり、GitHub で閉じられた Issue も完了として扱います。
+`/impl next` は、登録順で最初の「未着手かつ依存がすべて完了した Issue」を選んで開始します。gh が無い環境で `docs/issues/*.md` に保存された Issue も対象です。
+
+### モデル利用量
+
+各セッションのトークン数と費用を、作業ディレクトリの `usage.json` にプロセスごとに記録します。
+`/harness usage` で表示でき、実装フローや要件定義フローの完了時の報告にも合計を含めます。
+モデルの割り当て（安価なモデル・高性能なモデル）の効果を確認するのに使えます。
 
 ### プロセスごとのモデル（`models`）
 
@@ -210,14 +271,16 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | `plan` | Issue/コード読込・テスト/実装プラン作成 |
 | `implement` | TDD 実装 |
 | `review` | コードレビュー（各周回） |
+| `review_full` / `review_light` | レビューの 1 周目（フル）/ 2 周目以降（軽量）だけを別に指定（`review` より優先） |
 | `fix` | レビュー指摘修正（各周回） |
 | `bugfix` | バグ修正 |
 
-- 値は `"provider/model-id"` の文字列、または `{ "model": "provider/model-id", "thinking": "high" }`。
+- 値は `"provider/model-id"` の文字列、その配列、または `{ "model": ..., "thinking": "high" }`。
   `model-id` だけでも、プロバイダーが一意に決まれば指定できます。
+- **配列はフォールバック候補**です。先頭から順に、見つかって認証が設定されている最初のモデルを使います（例: `["google/gemini-flash-latest", "ollama/qwen3:8b"]`）。
 - `thinking` は `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` から選びます。モデルの対応範囲に丸められます。
 - プロセス個別の指定にない項目は `default` の値を使います。どちらにもなければ Pi の既定値のままです。
-- 指定したモデルが見つからない場合や、認証が未設定の場合は、警告を出して既定のモデルで続行します。
+- 候補がすべて使えない場合（見つからない・認証が未設定）は、警告を出して既定のモデルで続行します。
 - `/harness models` で各プロセスに実際に使われるモデルを確認できます。利用可能なモデルの一覧は `pi --list-models` で確認できます。
 
 例えば「ヒアリングは安価な Flash 系モデル、要件定義書作成は高性能モデル」「計画とレビューは高性能モデル、実装は速いモデル」「ラズパイ上のローカル LLM（Ollama など）は Issue 登録のような軽いプロセスだけ」といった使い分けができます。
@@ -234,7 +297,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
 ```bash
 npm install
 npm run typecheck   # tsc
-npm test            # 状態機械・ガード・設定・Issue ヘルパー・セットアップスクリプトのユニットテスト (node --test)
+npm test            # 状態機械・ガード・設定・Git・テスト保護・進み具合・利用量・セットアップスクリプトのユニットテスト (node --test)
 npm run test:e2e    # 偽モデルで実際の Pi セッションランタイムを動かし、3 フローとセッション切り替えを通す E2E
 npm run check       # 上記すべて
 ```

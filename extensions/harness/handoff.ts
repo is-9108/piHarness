@@ -27,6 +27,8 @@ export interface ArtifactPaths {
 	bug: (n: number) => string;
 	escalation: (n: number) => string;
 	handoff: string;
+	testChanges: string;
+	usage: string;
 	logs: string;
 }
 
@@ -44,6 +46,8 @@ export function artifactPaths(itemDir: string): ArtifactPaths {
 		bug: (n) => join(itemDir, `bug-${n}.md`),
 		escalation: (n) => join(itemDir, `escalation-${n}.md`),
 		handoff: join(itemDir, "handoff.md"),
+		testChanges: join(itemDir, "test-changes.md"),
+		usage: join(itemDir, "usage.json"),
 		logs: join(itemDir, "logs"),
 	};
 }
@@ -163,6 +167,7 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 			add(p.implementation, "実装レポート");
 			reviews();
 			bugs();
+			add(p.testChanges, "テストの削除・スキップ・アサーション減少と、その理由（妥当か必ず検証する）");
 			outputs.push({ path: p.review(s.review.round + 1), why: "レビュー記録（harness_record_review が書き出す）" });
 			break;
 		case "fix":
@@ -201,6 +206,8 @@ export function kickoffMessage(s: HarnessState, exists: (path: string) => boolea
 	if (s.issue) lines.push(`対象 Issue: ${describeIssue(s.issue)}${s.issue.url ? ` ${s.issue.url}` : ""}`);
 	if (s.bug) lines.push(`バグ: ${s.bug.description}`);
 	lines.push(`作業ディレクトリ: ${s.itemDir}/`);
+	const diff = diffInstruction(s);
+	if (diff) lines.push(diff);
 	lines.push("");
 	lines.push("## 入力（最初にすべて読むこと）");
 	lines.push(...(io.inputs.length ? io.inputs.map((i) => `- ${i.path} — ${i.why}`) : ["- （なし）"]));
@@ -217,6 +224,14 @@ export function kickoffMessage(s: HarnessState, exists: (path: string) => boolea
 		lines.push(`ユーザーからの指示: ${userNote}`);
 	}
 	return lines.join("\n");
+}
+
+/** コードを扱うプロセスで、どこからの差分を見るべきかの案内 */
+export function diffInstruction(s: HarnessState): string | undefined {
+	const proc = processOf(s);
+	if (!s.git?.base || !proc || !["implement", "review", "fix", "bugfix"].includes(proc)) return undefined;
+	const short = s.git.base.slice(0, 12);
+	return `変更の差分: \`git diff ${short}\`（実装開始時点 ${short} からの変更。未コミット分を含む）と \`git status\`（新規ファイル）${s.git.branch ? `／作業ブランチ: ${s.git.branch}` : ""}`;
 }
 
 /** handoff.md に追記する 1 件分の記録 */

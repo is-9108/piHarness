@@ -12,5 +12,8 @@
   "issueLabels": [],
   "ensureLabels": true,
   "autoHandoff": true,
-  "models": {}
+  "models": {},
+  "checkCommands": [
+    "npm run typecheck"
+  ]
 }
