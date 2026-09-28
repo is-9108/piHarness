@@ -58,7 +58,7 @@
 
 ## 8. 制約・前提
 
-- 実行環境: Raspberry Pi（機種・OS・アーキテクチャ: ）
+- 実行環境: Raspberry Pi 5（arm64 / Raspberry Pi OS 64-bit、メモリ: 　GB、ストレージ: SD / NVMe）
 -
 
 ## 9. 受け入れ条件

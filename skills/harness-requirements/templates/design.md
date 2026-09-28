@@ -24,11 +24,12 @@ flowchart LR
 
 ## 5. エラーハンドリング方針
 
-## 6. Raspberry Pi 固有の考慮
+## 6. Raspberry Pi 5 固有の考慮
 
-- CPU / メモリ / ストレージ（SD カード寿命）への配慮:
+- CPU / メモリ / ストレージ（SD カードの場合は書込み寿命）への配慮:
 - 起動方法（systemd 等）・電源断時の挙動:
-- ARM 向けの依存ライブラリ可否:
+- arm64 向けの依存ライブラリ可否:
+- GPIO / 周辺機器（Pi 5 は RP1 経由。libgpiod / gpiozero / lgpio を使用）:
 
 ## 7. テスト方針
 

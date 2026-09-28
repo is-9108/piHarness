@@ -15,7 +15,8 @@ AI エージェントに次の 3 つのフローを「手順書」だけでな�
 
 ## 必要なもの（Raspberry Pi）
 
-- Raspberry Pi OS 64-bit（arm64）推奨。Pi 4 / Pi 5（メモリ 4GB 以上推奨）
+- Raspberry Pi 5（arm64 / Cortex-A76。メモリ 8GB 以上推奨）+ Raspberry Pi OS 64-bit（Bookworm 以降）
+- ストレージは SD カードより NVMe SSD（M.2 HAT）推奨: `npm install` やテストの I/O が速く、書き込み寿命の心配も減ります
 - Node.js **22.19 以上**（pi-coding-agent の要件）
 - pi-coding-agent: `npm install -g @earendil-works/pi-coding-agent`
 - GitHub CLI（Issue 登録・取得に使用。無くても動作し、その場合 Issue は `docs/issues/` に Markdown で保存）
