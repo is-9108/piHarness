@@ -5,13 +5,13 @@ AI エージェントに次の 3 つのフローを「手順書」だけでな�
 
 | フロー | 開始 | 概要 |
 |-------|------|------|
-| 1. 要件定義 | `/req <テーマ>` | 仕様が明確になるまで質問 → 要件定義書・設計概要・Issue 分割案 → **人間の承認ゲート** → 機能単位の小さな GitHub Issue を登録 |
+| 1. 要件定義 | `/req <テーマ>` | 仕様が明確になるまで質問（ヒアリング）→ 要件定義書・設計概要・Issue 分割案 → **人間の承認ゲート** → 機能単位の小さな GitHub Issue を登録（ヒアリング / 要件定義書作成 / Issue 登録は別セッション） |
 | 2. TDD 実装 | `/impl <Issue番号>` | Issue とコードベースを読込 → テストプラン/実装プラン → **人間の承認** → Red/Green/Refactor → テスト修正ループ（最大 3 周）→ 多角的コードレビューループ（最大 3 周、2 周目以降は軽量）|
 | 3. バグ修正 | `/bugfix <説明>` | エスカレーション時にユーザー判断で起動。再現テスト → 根本原因分析 → 修正 → 検証 → **実装フローへ合流** |
 
 ループ上限に達するとエージェントは自走をやめ、ユーザーに判断（ループ継続 / バグ修正フロー / 手動対応 / 中止）を求めます。
 
-**各プロセス（要件定義 / Issue 登録 / プラン作成 / TDD 実装 / レビュー / 指摘修正 / バグ修正）は独立したセッションで実行され、
+**各プロセス（要件ヒアリング / 要件定義書作成 / Issue 登録 / プラン作成 / TDD 実装 / レビュー / 指摘修正 / バグ修正）は独立したセッションで実行され、
 プロセス間の連携は成果物の md ファイル（`plan.md`, `implementation.md`, `review-N.md`, `fix-N.md`, `bug-N.md` など）だけで行います。**
 プロセスが完了すると自動で次のセッションが開始されます。
 
@@ -106,7 +106,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
 
 | Skill | 内容 |
 |-------|------|
-| `harness-requirements` | ヒアリングのチェックリスト、要件定義書/設計概要/Issue 分割案テンプレート、Issue 分割ルール |
+| `harness-requirements` | ヒアリングのチェックリスト、ヒアリング結果/要件定義書/設計概要/Issue 分割案テンプレート、Issue 分割ルール |
 | `harness-tdd` | Issue・コード読込、プランテンプレート、TDD サイクル、失敗時の分析手順 |
 | `harness-review` | 多角的フルレビュー / 軽量レビューの手順、重大度基準、観点チェックリスト |
 | `harness-bugfix` | 再現 → 根本原因分析 → 修正 → 合流、バグレポートテンプレート |
@@ -132,6 +132,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
   "autoHandoff": true,
   "models": {
     "default": "anthropic/claude-sonnet-5",
+    "hearing": { "model": "google/gemini-flash-latest", "thinking": "low" },
     "requirements": { "model": "anthropic/claude-opus-5-5", "thinking": "high" },
     "review": { "model": "anthropic/claude-opus-5-5", "thinking": "high" },
     "implement": { "thinking": "medium" }
@@ -163,7 +164,8 @@ pi -e ~/piHarness/extensions/harness/index.ts
 | キー | 対象プロセス |
 |------|-------------|
 | `default` | 個別指定のないプロセス全体 |
-| `requirements` | 要件定義（ヒアリング・ドキュメント作成） |
+| `hearing` | 要件ヒアリング（質問の繰り返し。ターン数が多いので安価なモデル向き） |
+| `requirements` | 要件定義書・設計概要・Issue 分割案の作成と承認依頼（高性能モデル向き） |
 | `issues` | Issue 登録 |
 | `plan` | Issue/コード読込・テスト/実装プラン作成 |
 | `implement` | TDD 実装 |
@@ -178,7 +180,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
 - 指定したモデルが見つからない場合や、認証が未設定の場合は、警告を出して既定のモデルで続行します。
 - `/harness models` で各プロセスに実際に使われるモデルを確認できます。利用可能なモデルの一覧は `pi --list-models` で確認できます。
 
-例えば「計画とレビューは高性能モデル、実装は速いモデル」「ラズパイ上のローカル LLM（Ollama など）は Issue 登録のような軽いプロセスだけ」といった使い分けができます。
+例えば「ヒアリングは安価な Flash 系モデル、要件定義書作成は高性能モデル」「計画とレビューは高性能モデル、実装は速いモデル」「ラズパイ上のローカル LLM（Ollama など）は Issue 登録のような軽いプロセスだけ」といった使い分けができます。
 
 成果物の md ファイルは Issue ごとの作業記録としてコミットしても構いません。状態ファイルとテストログは `.gitignore` を推奨します:
 

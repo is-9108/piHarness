@@ -50,15 +50,25 @@ function planApproved(): HarnessState {
 
 describe("プロセス（セッション）境界", () => {
 	it("フロー開始で新しいセッションを要求する", () => {
-		assert.equal(handoffTo(initialState(), startRequirements(initialState(), "t", L, ".pi/harness/req")), "requirements");
+		assert.equal(handoffTo(initialState(), startRequirements(initialState(), "t", L, ".pi/harness/req")), "hearing");
 		assert.equal(handoffTo(initialState(), startImplement(initialState(), { title: "t" }, L, DIR)), "plan");
 	});
 
 	it("同じプロセス内の遷移では切り替えない", () => {
 		const s = step(initialState(), startImplement(initialState(), { title: "t" }, L, DIR));
 		assert.equal(handoffTo(s, transition(s, "impl_plan")), undefined);
-		const r = step(initialState(), startRequirements(initialState(), "t", L, ".pi/harness/req"));
-		assert.equal(handoffTo(r, transition(r, "req_document")), undefined);
+		let r = step(initialState(), startRequirements(initialState(), "t", L, ".pi/harness/req"));
+		r = step(r, transition(r, "req_document"));
+		r = step(r, beginApproval(r, "requirements", ["docs/r.md"]));
+		assert.equal(handoffTo(r, applyApproval(r, "requirements", "revise", "x", ["docs/r.md"])), undefined, "修正依頼は同じ要件定義書作成セッションで対応");
+	});
+
+	it("ヒアリングと要件定義書作成は別セッション（往復もそれぞれ新しいセッション）", () => {
+		const h = step(initialState(), startRequirements(initialState(), "t", L, ".pi/harness/req"));
+		assert.equal(processOf(h), "hearing");
+		assert.equal(handoffTo(h, transition(h, "req_document")), "requirements");
+		const d = step(h, transition(h, "req_document"));
+		assert.equal(handoffTo(d, transition(d, "req_clarify")), "hearing");
 	});
 
 	it("承認で 要件定義→Issue 登録、プラン→実装 に切り替わる", () => {
@@ -115,6 +125,26 @@ describe("プロセス（セッション）境界", () => {
 
 describe("成果物による引き継ぎ", () => {
 	const all = () => true;
+
+	it("ヒアリング → 要件定義書作成には hearing.md、戻るには open-questions.md が必要", () => {
+		const R = artifactPaths(".pi/harness/req");
+		const h = startRequirements(initialState(), "t", L, ".pi/harness/req");
+		assert.equal(requiredArtifact(h, "req_document")?.path, R.hearing);
+		assert.equal(requiredArtifact(transition(h, "req_document"), "req_clarify")?.path, R.openQuestions);
+	});
+
+	it("ヒアリングは未確定論点を最優先で読み、要件定義書作成は hearing.md を読む", () => {
+		const R = artifactPaths(".pi/harness/req");
+		const h = startRequirements(initialState(), "t", L, ".pi/harness/req");
+		const hio = processIO(h, all);
+		assert.equal(hio?.inputs[0].path, R.openQuestions);
+		assert.equal(hio?.outputs[0].path, R.hearing);
+		const dio = processIO(transition(h, "req_document"), all);
+		assert.equal(dio?.process, "requirements");
+		assert.equal(dio?.inputs[0].path, R.hearing);
+		assert.match(kickoffMessage(h, all), /「1\. ヒアリング」から/);
+		assert.match(kickoffMessage(transition(h, "req_document"), all), /「2\. ドキュメント作成」から/);
+	});
 
 	it("各プロセスの出力が無ければ次へ進めない", () => {
 		let s = planApproved();

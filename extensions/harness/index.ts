@@ -10,13 +10,13 @@
  *
  * 状態遷移は state.ts、引き継ぎは handoff.ts の純粋関数で行い、この拡張はツール/コマンド/イベントとの接続だけを担う。
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { findModel, type HarnessConfig, loadConfig, resolveProcessModel, saveConfigPatch } from "./config.ts";
+import { findModel, type HarnessConfig, loadConfig, PROCESS_KINDS, resolveProcessModel, saveConfigPatch } from "./config.ts";
 import { checkBash, checkWrite, type GuardPaths, isHarnessFile, STATE_FILE } from "./guard.ts";
 import { buildContext } from "./guidance.ts";
 import {
@@ -436,7 +436,16 @@ export default function piHarness(pi: ExtensionAPI): void {
 						"次のプロセスは新しいセッションで開始され、このファイルだけが引き継がれます。",
 				);
 			}
+			const from = state.phase;
 			setState(next, ctx);
+
+			// ヒアリング完了時、回答済みの未確定論点は退避する（次にヒアリングへ戻るときは新しい open-questions.md が必要）
+			if (from === "req_clarify" && state.phase === "req_document") {
+				const oq = pathsOf(state).openQuestions;
+				if (existsSync(join(ctx.cwd, oq))) {
+					renameSync(join(ctx.cwd, oq), join(ctx.cwd, pathsOf(state).dir, `open-questions-resolved-${timestamp()}.md`));
+				}
+			}
 
 			if (state.phase === "bug_done") {
 				if (!state.suspended) {
@@ -740,7 +749,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("req", {
-		description: "要件定義フローを新しいセッションで開始する（ヒアリング → 要件定義書 → 承認 → Issue 登録）",
+		description: "要件定義フローを新しいセッションで開始する（ヒアリング → 要件定義書 → 承認 → Issue 登録。各工程は別セッション）",
 		handler: async (args, ctx) => {
 			state = loadState(ctx);
 			if (!(await confirmReplace(ctx, "要件定義フロー"))) return;
@@ -890,7 +899,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 					}
 					case "models": {
 						const catalogue = ctx.modelRegistry.getAll();
-						const rows = (["requirements", "issues", "plan", "implement", "review", "fix", "bugfix"] as ProcessKind[]).map((proc) => {
+						const rows = PROCESS_KINDS.map((proc) => {
 							const setting = resolveProcessModel(cfg.models, proc);
 							const found = setting.model ? findModel(setting.model, catalogue) : undefined;
 							const model = !setting.model

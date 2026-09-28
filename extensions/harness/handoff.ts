@@ -18,6 +18,8 @@ export interface ArtifactPaths {
 	dir: string;
 	issue: string;
 	qa: string;
+	hearing: string;
+	openQuestions: string;
 	plan: string;
 	implementation: string;
 	review: (round: number) => string;
@@ -33,6 +35,8 @@ export function artifactPaths(itemDir: string): ArtifactPaths {
 		dir: itemDir,
 		issue: join(itemDir, "issue.md"),
 		qa: join(itemDir, "qa.md"),
+		hearing: join(itemDir, "hearing.md"),
+		openQuestions: join(itemDir, "open-questions.md"),
 		plan: join(itemDir, "plan.md"),
 		implementation: join(itemDir, "implementation.md"),
 		review: (r) => join(itemDir, `review-${r}.md`),
@@ -55,6 +59,12 @@ export function pathsOf(s: HarnessState): ArtifactPaths {
 export function requiredArtifact(s: HarnessState, to: Phase): { path: string; template: string } | undefined {
 	if (!s.itemDir) return undefined;
 	const p = artifactPaths(s.itemDir);
+	if (s.phase === "req_clarify" && to === "req_document") {
+		return { path: p.hearing, template: "skill harness-requirements の templates/hearing.md" };
+	}
+	if (s.phase === "req_document" && to === "req_clarify") {
+		return { path: p.openQuestions, template: "未確定の論点を箇条書きにした Markdown" };
+	}
 	if (s.phase === "impl_tdd" && to === "impl_review") {
 		return { path: p.implementation, template: "skill harness-tdd の templates/implementation.md" };
 	}
@@ -68,7 +78,8 @@ export function requiredArtifact(s: HarnessState, to: Phase): { path: string; te
 }
 
 export const PROCESS_LABELS: Record<ProcessKind, string> = {
-	requirements: "要件定義",
+	hearing: "要件ヒアリング",
+	requirements: "要件定義書作成",
 	issues: "Issue 登録",
 	plan: "テスト/実装プラン作成",
 	implement: "TDD 実装",
@@ -78,7 +89,8 @@ export const PROCESS_LABELS: Record<ProcessKind, string> = {
 };
 
 const SKILL_OF: Record<ProcessKind, { skill: string; section?: string }> = {
-	requirements: { skill: "harness-requirements" },
+	hearing: { skill: "harness-requirements", section: "1. ヒアリング" },
+	requirements: { skill: "harness-requirements", section: "2. ドキュメント作成" },
 	issues: { skill: "harness-requirements", section: "4. Issue 登録" },
 	plan: { skill: "harness-tdd" },
 	implement: { skill: "harness-tdd", section: "3. TDD 実装" },
@@ -116,13 +128,23 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 	};
 
 	switch (proc) {
-		case "requirements":
-			add(p.qa, "これまでのヒアリング記録");
+		case "hearing":
+			add(p.openQuestions, "要件定義書作成で見つかった未確定の論点（最優先で確認する）");
+			add(p.hearing, "これまでに確定した仕様のまとめ");
+			add(p.qa, "これまでの質問と回答の記録");
 			for (const d of s.artifacts.docs) add(d, "作成中の要件ドキュメント");
-			outputs.push({ path: "docs/requirements/<slug>.md ほか", why: "要件定義書・設計概要・Issue 分割案" });
+			outputs.push({ path: p.hearing, why: "確定した仕様のまとめ（要件定義書作成へ進む前に必須）" });
+			break;
+		case "requirements":
+			add(p.hearing, "ヒアリングで確定した仕様のまとめ");
+			add(p.qa, "質問と回答の記録（根拠の確認用）");
+			for (const d of s.artifacts.docs) add(d, "作成中の要件ドキュメント");
+			outputs.push({ path: "docs/requirements/<slug>.md ほか", why: "要件定義書・設計概要・Issue 分割案（承認対象）" });
+			outputs.push({ path: p.openQuestions, why: "大きな未確定事項が見つかった場合のみ。ヒアリングへ戻る前に必須" });
 			break;
 		case "issues":
 			for (const d of s.artifacts.docs) add(d, "承認済みの要件ドキュメント（Issue 分割案を含む）");
+			add(p.hearing, "ヒアリングで確定した仕様のまとめ");
 			add(p.qa, "ヒアリング記録");
 			outputs.push({ path: "GitHub Issue（または docs/issues/*.md）", why: "機能単位の Issue" });
 			break;

@@ -9,8 +9,9 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
 
 | プロセス（= 1 セッション） | フェーズ | 入力成果物 | 出力成果物 |
 |---|---|---|---|
-| 要件定義 | req_clarify → req_document → req_approval | `qa.md`（ヒアリング記録） | `docs/requirements/*.md`, `docs/design/*.md`, Issue 分割案 |
-| Issue 登録 | req_issues → req_done | 承認済みドキュメント, `qa.md` | GitHub Issue（または `docs/issues/*.md`）, `issues.md` |
+| 要件ヒアリング | req_clarify | `open-questions.md`（差し戻し時）, `hearing.md`, `qa.md` | `hearing.md`（`qa.md` は自動記録） |
+| 要件定義書作成 | req_document → req_approval | `hearing.md`, `qa.md` | `docs/requirements/*.md`, `docs/design/*.md`, Issue 分割案（差し戻す場合は `open-questions.md`） |
+| Issue 登録 | req_issues → req_done | 承認済みドキュメント, `hearing.md`, `qa.md` | GitHub Issue（または `docs/issues/*.md`）, `issues.md` |
 | プラン作成 | impl_context → impl_plan → impl_plan_approval | `issue.md` | `plan.md` |
 | TDD 実装 | impl_tdd | `issue.md`, `plan.md` | コード, `implementation.md` |
 | コードレビュー（周回ごと） | impl_review | `issue.md`, `plan.md`, `implementation.md`, 過去の `review-*.md` / `fix-*.md` / `bug-*.md` | `review-N.md` |
@@ -22,7 +23,7 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
 ```text
 .pi/harness/
 ├── state.json                 # ワークフロー状態（全セッション共通。直接編集は不可）
-├── req-2026-09-28-温度ロガー/   # 要件定義: qa.md, issues.md, handoff.md
+├── req-2026-09-28-温度ロガー/   # 要件定義: qa.md, hearing.md, open-questions.md, issues.md, handoff.md
 └── issue-12/                  # 実装フロー（バグ修正もここ）
     ├── issue.md               # /impl 時に gh issue view で取得した本文
     ├── plan.md                # テスト/実装プラン（承認対象）
@@ -77,14 +78,17 @@ flowchart LR
 
 ## 1. 要件定義フロー
 
-| フェーズ | 内容 | 書き込み可能 | 次へ進む方法 |
-|---------|------|-------------|-------------|
-| `req_clarify` | 仕様が明確になるまで `harness_ask` で質問を繰り返す | `docs/`, `.pi/harness/` | `harness_phase → req_document` |
-| `req_document` | 要件定義書・設計概要・Issue 分割案を作成 | 同上 | `harness_request_approval (requirements)`／不明点があれば `req_clarify` へ戻る |
-| `req_approval` | **人間の承認ゲート** | 同上 | 承認ダイアログ または `/harness approve / revise / reject` |
-| `req_issues` | 機能単位の小さな Issue を登録（受け入れ条件必須・依存関係付き） | 同上 | `harness_create_issues` |
-| `req_done` | 完了報告 | 同上 | — |
+| フェーズ | プロセス | 内容 | 書き込み可能 | 次へ進む方法 |
+|---------|---------|------|-------------|-------------|
+| `req_clarify` | 要件ヒアリング | 仕様が明確になるまで `harness_ask` で質問を繰り返し、`hearing.md` にまとめる | `docs/`, `.pi/harness/` | `hearing.md` を書いて `harness_phase → req_document`（新セッション） |
+| `req_document` | 要件定義書作成 | `hearing.md` から要件定義書・設計概要・Issue 分割案を作成 | 同上 | `harness_request_approval (requirements)`／大きな未確定事項は `open-questions.md` を書いて `req_clarify` へ差し戻し（新セッション） |
+| `req_approval` | 要件定義書作成 | **人間の承認ゲート** | 同上 | 承認ダイアログ または `/harness approve / revise / reject` |
+| `req_issues` | Issue 登録 | 機能単位の小さな Issue を登録（受け入れ条件必須・依存関係付き） | 同上 | `harness_create_issues` |
+| `req_done` | Issue 登録 | 完了報告 | 同上 | — |
 
+- ヒアリングと要件定義書作成を分けているのは、質問の繰り返しでターン数が多くなる工程に安価なモデルを、
+  ドキュメント作成に高性能なモデルを割り当てられるようにするためです（`models.hearing` / `models.requirements`）。
+- ヒアリングへ差し戻した `open-questions.md` は、ヒアリング完了時に `open-questions-resolved-<日時>.md` へ退避されます。
 - 承認前の `harness_create_issues` は拒否されます。bash での `gh issue create` もフロー中はブロックされます。
 - `harness_create_issues` は登録前にもう一度ユーザーに確認します（外部への書き込みのため）。
 - gh CLI が未インストール/未認証の場合は `docs/issues/NN-<slug>.md` に保存します。

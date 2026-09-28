@@ -30,12 +30,19 @@ writeFileSync(
 	}),
 );
 
-const faux = fauxProvider({ models: [{ id: "worker" }, { id: "reviewer", reasoning: true }] });
+const faux = fauxProvider({ models: [{ id: "worker" }, { id: "reviewer", reasoning: true }, { id: "cheap" }] });
 // プロセスごとのモデル設定: レビューだけ別モデル + 高い思考レベル、それ以外は default
 mkdirSync(join(project, ".pi"), { recursive: true });
 writeFileSync(
 	join(project, ".pi/harness.json"),
-	JSON.stringify({ models: { default: "faux/worker", review: { model: "faux/reviewer", thinking: "high" } } }),
+	JSON.stringify({
+		models: {
+			default: "faux/worker",
+			hearing: "faux/cheap",
+			requirements: { model: "faux/reviewer", thinking: "high" },
+			review: { model: "faux/reviewer", thinking: "high" },
+		},
+	}),
 );
 const call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 const done = (text: string) => fauxAssistantMessage(text);
@@ -230,23 +237,43 @@ assert.ok(r.some((x) => x.startsWith(`${bugSession + 1}:harness_record_review: �
 assert.match(firstUserText(sessionsSeen[bugSession]), /bug-1\.md — バグレポート #1/);
 
 // ---------------------------------------------------------------------------
-// 要件定義フロー: 要件定義セッション → 承認 → Issue 登録セッション
+// 要件定義フロー: ヒアリング → 要件定義書作成 →（未確定論点で）ヒアリング → 要件定義書作成 → 承認 → Issue 登録
+// それぞれ別セッション。ヒアリングは安価なモデル、要件定義書作成は高性能モデル
 // ---------------------------------------------------------------------------
 
 const issueBody = "## 背景・目的\nx\n## 受け入れ条件\n- [ ] y";
+const reqItem = `.pi/harness/req-${new Date().toISOString().slice(0, 10)}-温度ロガー`;
 r = await run("/req 温度ロガー", [
-	call("harness_phase", { to: "req_document" }),
 	call("write", { path: "src/x.js", content: "x" }), // 要件定義中 → ブロック
+	call("harness_phase", { to: "req_document" }), // hearing.md が無い → 拒否
+	call("write", { path: `${reqItem}/hearing.md`, content: "# 確定事項" }),
+	call("harness_phase", { to: "req_document" }), // → 要件定義書作成セッション
+	call("harness_phase", { to: "req_clarify" }), // open-questions.md が無い → 拒否
+	call("write", { path: `${reqItem}/open-questions.md`, content: "- 保存期間は?" }),
+	call("harness_phase", { to: "req_clarify" }), // → ヒアリングセッション（2 回目）
+	call("write", { path: `${reqItem}/hearing.md`, content: "# 確定事項（保存期間: 30 日）" }),
+	call("harness_phase", { to: "req_document" }), // → 要件定義書作成セッション（2 回目）
 	call("write", { path: "docs/requirements/logger.md", content: "# 要件" }),
 	call("harness_create_issues", { issues: [{ title: "a", body: issueBody }], dryRun: true }), // 承認前 → 拒否
 	call("harness_request_approval", { kind: "requirements", summary: "s", documents: ["docs/requirements/logger.md"] }),
 ]);
-const reqSession = sessionNo;
-assert.match(firstUserText(runtime.session), /要件定義フロー（piHarness）/);
+assert.ok(existsSync(join(project, reqItem, "hearing.md")));
+assert.ok(!existsSync(join(project, reqItem, "open-questions.md")), "回答済みの open-questions.md は退避される");
+assert.ok(readdirSync(join(project, reqItem)).some((f) => f.startsWith("open-questions-resolved-")));
+for (const x of r) console.log("  ", x);
+const hearing1 = sessionNo - 3;
 assert.deepEqual(
 	r.filter((x) => x.includes("[ERROR]")).map((x) => x.replace(/: .*/, "")),
-	[`${reqSession}:write [ERROR]`, `${reqSession}:harness_create_issues [ERROR]`],
+	[`${hearing1}:write [ERROR]`, `${hearing1}:harness_phase [ERROR]`, `${hearing1 + 1}:harness_phase [ERROR]`, `${hearing1 + 3}:harness_create_issues [ERROR]`],
 );
+assert.match(r.find((x) => x.startsWith(`${hearing1}:harness_phase [ERROR]`)) ?? "", /hearing\.md/);
+assert.match(r.find((x) => x.startsWith(`${hearing1 + 1}:harness_phase [ERROR]`)) ?? "", /open-questions\.md/);
+assert.match(firstUserText(sessionsSeen[hearing1 - 1]), /「1\. ヒアリング」から/);
+assert.match(firstUserText(sessionsSeen[hearing1]), /「2\. ドキュメント作成」から/);
+assert.match(firstUserText(sessionsSeen[hearing1]), /hearing\.md — ヒアリングで確定した仕様のまとめ/);
+assert.match(firstUserText(sessionsSeen[hearing1 + 1]), /open-questions\.md — 要件定義書作成で見つかった未確定の論点/);
+assert.doesNotMatch(firstUserText(sessionsSeen[hearing1 + 2]), /open-questions\.md — 要件定義書作成で見つかった/, "回答済みの未確定論点は退避され、次の要件定義書作成には渡らない");
+const reqSession = sessionNo;
 r = await run("/harness approve", [
 	call("harness_create_issues", {
 		issues: [
@@ -264,14 +291,18 @@ assert.match(r.at(-1) ?? "", /2 件の Issue をMarkdown として docs\/issues\
 assert.deepEqual(readdirSync(join(project, "docs/issues")).sort(), ["01-センサー読み取り.md", "02-sqlite-保存.md"]);
 assert.match(readFileSync(join(project, "docs/issues/02-sqlite-保存.md"), "utf8"), /## 依存関係[\s\S]*- センサー読み取り/);
 
-// プロセスごとのモデル: レビューセッション（4, 6, 合流後のレビュー）だけ reviewer + thinking high
+// プロセスごとのモデル:
+//   レビュー・要件定義書作成 → reviewer + thinking high / ヒアリング → cheap / それ以外 → worker
 const reviewSessions = new Set([4, 6, bugSession + 1]);
+const hearingSessions = new Set([hearing1, hearing1 + 2]);
+const documentSessions = new Set([hearing1 + 1, hearing1 + 3]);
 sessionsSeen.forEach((session, i) => {
 	const no = i + 1;
 	if (no === 1) return; // pi 起動直後のセッション（ハーネス外）
-	const expected = reviewSessions.has(no) ? "reviewer" : "worker";
+	const strong = reviewSessions.has(no) || documentSessions.has(no);
+	const expected = strong ? "reviewer" : hearingSessions.has(no) ? "cheap" : "worker";
 	assert.equal(session.model?.id, expected, `セッション ${no} のモデル`);
-	if (reviewSessions.has(no)) assert.equal(session.thinkingLevel, "high", `セッション ${no} の思考レベル`);
+	if (strong) assert.equal(session.thinkingLevel, "high", `セッション ${no} の思考レベル`);
 });
 
 const state = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8"));

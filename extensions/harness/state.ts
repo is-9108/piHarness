@@ -91,7 +91,7 @@ export interface SuspendedImplement {
  * セッションを分ける単位。プロセスが変わるときは新しいセッションを開始し、
  * 前のプロセスとの連携は成果物（md ファイル）だけで行う。
  */
-export type ProcessKind = "requirements" | "issues" | "plan" | "implement" | "review" | "fix" | "bugfix";
+export type ProcessKind = "hearing" | "requirements" | "issues" | "plan" | "implement" | "review" | "fix" | "bugfix";
 
 export interface PendingHandoff {
 	from: ProcessKind | null;
@@ -564,7 +564,7 @@ export function finishFlow(prev: HarnessState, reason: string): HarnessState {
 // ---------------------------------------------------------------------------
 
 const PROCESS_OF: Record<Exclude<Phase, "idle" | "escalated">, ProcessKind> = {
-	req_clarify: "requirements",
+	req_clarify: "hearing",
 	req_document: "requirements",
 	req_approval: "requirements",
 	req_issues: "issues",

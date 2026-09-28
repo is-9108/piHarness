@@ -8,7 +8,7 @@ import type { ProcessKind, Severity } from "./state.ts";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevelName = (typeof THINKING_LEVELS)[number];
 
-export const PROCESS_KINDS: ProcessKind[] = ["requirements", "issues", "plan", "implement", "review", "fix", "bugfix"];
+export const PROCESS_KINDS: ProcessKind[] = ["hearing", "requirements", "issues", "plan", "implement", "review", "fix", "bugfix"];
 
 /** プロセスで使うモデル。model は "provider/model-id"（または一意なら "model-id" のみ） */
 export interface ProcessModelSetting {

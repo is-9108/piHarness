@@ -17,6 +17,7 @@ describe("プロセスごとのモデル設定", () => {
 				default: "anthropic/claude-sonnet-5",
 				review: { model: "anthropic/claude-opus-5-5", thinking: "high" },
 				implement: { thinking: "low" },
+				hearing: "google/gemini-flash",
 			},
 			w,
 		);
@@ -24,6 +25,7 @@ describe("プロセスごとのモデル設定", () => {
 		assert.deepEqual(m.default, { model: "anthropic/claude-sonnet-5" });
 		assert.deepEqual(m.review, { model: "anthropic/claude-opus-5-5", thinking: "high" });
 		assert.deepEqual(m.implement, { thinking: "low" });
+		assert.deepEqual(m.hearing, { model: "google/gemini-flash" });
 	});
 
 	it("不明なプロセス名・不正な思考レベルは警告して無視する", () => {

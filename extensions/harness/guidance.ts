@@ -9,9 +9,9 @@ import { allowedTransitions, describeIssue, type HarnessState, PHASE_LABELS, typ
 const NEXT: Record<Phase, string> = {
 	idle: "",
 	req_clarify:
-		"仕様が明確になるまで harness_ask でユーザーに質問を繰り返す（1 回の質問は 1 論点）。不明点が無くなったら harness_phase で req_document へ。",
+		"仕様が明確になるまで harness_ask で質問を繰り返す（1 回の質問は 1 論点）。不明点が無くなったら確定事項を hearing.md にまとめ、harness_phase で req_document へ（ドキュメント作成は別セッション）。",
 	req_document:
-		"skill harness-requirements のテンプレートに従い要件定義書と関連ドキュメントを作成し、Issue 分割案も書く。完成したら harness_request_approval (kind: requirements) で人間の承認を得る。",
+		"hearing.md をもとに skill harness-requirements のテンプレートで要件定義書・関連ドキュメント・Issue 分割案を作成し、harness_request_approval (kind: requirements) で承認を得る。大きな未確定事項があれば open-questions.md に書いて harness_phase で req_clarify へ戻る。",
 	req_approval: "人間の承認待ち。承認ダイアログの結果を待つ。/harness approve または /harness revise でも応答できる。",
 	req_issues:
 		"承認済み。Issue 分割案に従い harness_create_issues で機能ごとの小さな Issue を登録する（1 Issue = 1 機能・レビュー可能な大きさ・受け入れ条件必須）。",
