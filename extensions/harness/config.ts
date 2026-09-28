@@ -81,6 +81,8 @@ export interface HarnessConfig {
 	testIntegrity: boolean;
 	/** しきい値による自動圧縮 */
 	compaction: { enabled: boolean; thresholdPercent: number };
+	/** TUI の入力欄の上にダッシュボード（工程・いまの作業・ブランチ・トークン等）を表示するか */
+	dashboard: boolean;
 	/** Issue・プランの大きさの上限（1 セッションで扱える大きさに保つ） */
 	issueLimits: { maxAcceptanceCriteria: number; allowedSizes: IssueSize[]; maxPlanTestCases: number };
 }
@@ -113,6 +115,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
 	git: DEFAULT_GIT,
 	testIntegrity: true,
 	compaction: { enabled: true, thresholdPercent: 60 },
+	dashboard: true,
 	issueLimits: { maxAcceptanceCriteria: 5, allowedSizes: ["S", "M"], maxPlanTestCases: 12 },
 };
 
@@ -160,6 +163,7 @@ export function mergeConfig(raw: Partial<HarnessConfig>, warnings: string[] = []
 	c.git = normalizeGit(raw.git as unknown, warnings);
 	if (typeof c.testIntegrity !== "boolean") c.testIntegrity = DEFAULT_CONFIG.testIntegrity;
 	c.compaction = normalizeCompaction(raw.compaction as unknown, warnings);
+	if (typeof c.dashboard !== "boolean") c.dashboard = DEFAULT_CONFIG.dashboard;
 	c.issueLimits = normalizeIssueLimits(raw.issueLimits as unknown, warnings);
 	return c;
 }

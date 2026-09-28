@@ -87,6 +87,7 @@ import {
 } from "./state.ts";
 import { slugify, tailLines, timestamp } from "./text.ts";
 import { toolsForProcess } from "./tools.ts";
+import { describeActivity, renderDashboard } from "./dashboard.ts";
 import { compactionInstructions, shouldCompact } from "./compaction.ts";
 
 const CONTEXT_MESSAGE = "harness-context";
@@ -138,11 +139,81 @@ export default function piHarness(pi: ExtensionAPI): void {
 		refreshUI(ctx);
 	}
 
+	/** いま何をしているか（ダッシュボードと作業中表示に出す） */
+	let activity: string | undefined;
+	/** フロー外で表示する現在のブランチ */
+	let branchCache: string | undefined;
+
 	function refreshUI(ctx: ExtensionContext): void {
-		const line = statusLine(state);
-		// フロー外では、話しかけて開始できることを示す
-		ctx.ui.setStatus("harness", line ? `🧭 ${line}` : "🧭 piHarness: 作りたいもの・実装したい Issue・直したい不具合を話しかけてください");
+		if (!ctx.hasUI) return;
+		const cfg = cfgOf(ctx);
+		if (!cfg.dashboard) {
+			const line = statusLine(state);
+			// フロー外では、話しかけて開始できることを示す
+			ctx.ui.setStatus("harness", line ? `🧭 ${line}` : "🧭 piHarness: 作りたいもの・実装したい Issue・直したい不具合を話しかけてください");
+			ctx.ui.setWidget("harness", undefined);
+			return;
+		}
+		ctx.ui.setStatus("harness", undefined);
+		ctx.ui.setWidget("harness", dashboardLines(ctx, cfg));
 	}
+
+	function dashboardLines(ctx: ExtensionContext, cfg: HarnessConfig): string[] {
+		const entries = ctx.sessionManager.getEntries() as { type: string; message?: unknown }[];
+		const mine = Object.values(sumSession(entries));
+		const session = {
+			input: mine.reduce((a, t) => a + t.input + t.cacheRead, 0),
+			output: mine.reduce((a, t) => a + t.output, 0),
+			cost: mine.reduce((a, t) => a + t.cost, 0),
+		};
+		let item: { tokens: number; cost: number; sessions: number } | undefined;
+		if (state.itemDir && isActive(state)) {
+			const id = ctx.sessionManager.getSessionId();
+			const others = loadUsage(ctx, state.itemDir).sessions.filter((x) => x.sessionId !== id);
+			const { total } = summarizeUsage({ version: 1, sessions: others });
+			const ownsItem = sessionItemDir === state.itemDir;
+			item = {
+				tokens: total.input + total.cacheRead + total.output + (ownsItem ? session.input + session.output : 0),
+				cost: total.cost + (ownsItem ? session.cost : 0),
+				sessions: others.length + (ownsItem && mine.length ? 1 : 0),
+			};
+		}
+		const usage = ctx.getContextUsage();
+		const theme = ctx.ui.theme as { fg?: (c: string, t: string) => string } | undefined;
+		return renderDashboard(
+			{
+				state,
+				activity,
+				branch: state.git?.branch ?? branchCache,
+				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+				thinking: pi.getThinkingLevel(),
+				session,
+				item,
+				context: usage ? { percent: usage.percent, tokens: usage.tokens, window: usage.contextWindow } : undefined,
+				compactAt: cfg.compaction.enabled ? cfg.compaction.thresholdPercent : undefined,
+			},
+			theme?.fg ? (c, t) => theme.fg!(c, t) : undefined,
+		);
+	}
+
+	function setActivity(ctx: ExtensionContext, text: string | undefined): void {
+		activity = text;
+		if (ctx.hasUI) ctx.ui.setWorkingMessage(text);
+		refreshUI(ctx);
+	}
+
+	async function updateBranch(ctx: ExtensionContext): Promise<void> {
+		if (state.git?.branch) return;
+		const run = gitRun(ctx);
+		branchCache = (await isGitRepo(run)) ? await currentBranch(run) : undefined;
+	}
+
+	// いま何をしているかをダッシュボードと作業中表示に反映する
+	pi.on("agent_start", async (_e, ctx) => setActivity(ctx, "💭 考え中"));
+	pi.on("tool_execution_start", async (e, ctx) => setActivity(ctx, describeActivity(e.toolName, e.args)));
+	pi.on("tool_execution_end", async (_e, ctx) => setActivity(ctx, "💭 考え中"));
+	pi.on("ui_prompt_start", async (e, ctx) => setActivity(ctx, `⏸ あなたの入力待ち${e.title ? `: ${e.title.split("\n")[0].slice(0, 40)}` : ""}`));
+	pi.on("ui_prompt_end", async (_e, ctx) => setActivity(ctx, "💭 考え中"));
 
 	const gitRun =
 		(ctx: { cwd: string }): Run =>
@@ -355,6 +426,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	/** このセッションが担当するプロセス（セッション開始時に決まる） */
 	let sessionProcess: ProcessKind | undefined;
+	/** このセッションが担当する作業項目のディレクトリ（セッション開始時に決まる） */
+	let sessionItemDir: string | undefined;
 
 	function loadUsage(ctx: { cwd: string }, itemDir: string): UsageFile {
 		const file = join(ctx.cwd, artifactPaths(itemDir).usage);
@@ -366,19 +439,22 @@ export default function piHarness(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * 利用量はセッション開始時点で決まった作業項目・プロセスに記録する。
+	 * 途中で別のフローを開始しても、このセッションの利用量が新しい作業に付かないようにするため。
+	 * フロー外で始まった通常の会話は記録しない。
+	 */
 	function recordUsage(ctx: ExtensionContext): void {
-		if (!state.itemDir) return;
-		sessionProcess ??= processOf(state) ?? undefined;
-		if (!sessionProcess) return;
+		if (!sessionItemDir || !sessionProcess) return;
 		const models = sumSession(ctx.sessionManager.getEntries() as { type: string; message?: unknown }[]);
 		if (Object.keys(models).length === 0) return;
-		const file = upsertSession(loadUsage(ctx, state.itemDir), {
+		const file = upsertSession(loadUsage(ctx, sessionItemDir), {
 			sessionId: ctx.sessionManager.getSessionId(),
 			process: sessionProcess,
 			models,
 			updatedAt: new Date().toISOString(),
 		});
-		writeItemFile(ctx, artifactPaths(state.itemDir).usage, `${JSON.stringify(file, null, 2)}\n`);
+		writeItemFile(ctx, artifactPaths(sessionItemDir).usage, `${JSON.stringify(file, null, 2)}\n`);
 	}
 
 	function usageSummaryLine(ctx: { cwd: string }): string | undefined {
@@ -395,6 +471,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 		} catch (e) {
 			ctx.ui.notify(`[piHarness] 利用量を記録できませんでした: ${(e as Error).message}`, "warning");
 		}
+		await updateBranch(ctx).catch(() => undefined);
+		setActivity(ctx, undefined);
 	});
 
 	/**
@@ -537,15 +615,21 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_e, ctx) => {
 		state = loadState(ctx);
-		sessionProcess = undefined;
+		// 再開したセッション（pi の再起動など）は、その時点のプロセスを担当する
+		const resumed = isActive(state) && !state.pendingHandoff && !state.kickoff;
+		sessionProcess = resumed ? (processOf(state) ?? undefined) : undefined;
+		sessionItemDir = resumed ? state.itemDir : undefined;
 		if (state.kickoff) {
 			const proc = state.kickoff;
 			sessionProcess = proc;
+			sessionItemDir = state.itemDir;
 			setState({ ...state, kickoff: undefined }, ctx);
 			const applied = await applyProcessModel(ctx, proc);
 			if (applied) ctx.ui.notify(`piHarness: ${PROCESS_LABELS[proc]} のモデル → ${applied}`, "info");
 		}
 		applyProcessTools();
+		activity = undefined;
+		await updateBranch(ctx).catch(() => undefined);
 		refreshUI(ctx);
 		const { warnings } = loadConfig(ctx.cwd);
 		for (const w of warnings) ctx.ui.notify(`[piHarness] ${w}`, "warning");
@@ -650,6 +734,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	// ターンの区切りでしきい値を確認し、超えていれば圧縮を予約する（実行中の圧縮は中断を伴うため、次の区切りで止める）
 	pi.on("turn_end", async (_e, ctx) => {
+		refreshUI(ctx);
 		const usage = ctx.getContextUsage();
 		if (compactRequested || !shouldCompact(state, usage, cfgOf(ctx).compaction, compacting)) return;
 		compactRequested = true;

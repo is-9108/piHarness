@@ -6,6 +6,7 @@
  *   node test/e2e/natural.ts
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -28,6 +29,14 @@ mkdirSync(join(project, "docs/issues"), { recursive: true });
 writeFileSync(join(project, ".gitignore"), "");
 writeFileSync(join(project, "docs/issues/01-login.md"), "---\ntitle: \"ログイン API\"\n---\n\n# ログイン API\n\n## 受け入れ条件\n\n- [ ] 200 を返す\n");
 
+// ブランチ表示の確認のため git リポジトリにする
+const git = (...args: string[]) => execFileSync("git", args, { cwd: project, encoding: "utf8" }).trim();
+git("init", "-q", "-b", "main");
+git("config", "user.name", "t");
+git("config", "user.email", "t@example.com");
+git("add", "-A");
+git("commit", "-q", "-m", "init");
+
 const faux = fauxProvider({ models: [{ id: "m" }] });
 const call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 const say = (text: string) => fauxAssistantMessage(text);
@@ -35,6 +44,9 @@ const say = (text: string) => fauxAssistantMessage(text);
 // 確認ダイアログの応答（順番に使う）と、表示された内容の記録
 const confirmAnswers: boolean[] = [];
 const confirms: { title: string; message: string }[] = [];
+// ダッシュボード（setWidget）と作業中表示（setWorkingMessage）の記録
+let widget: string[] = [];
+const working: string[] = [];
 // Pi は UI コンテキストのメソッドを個別に参照するので、必要なメソッドをすべて持つ素のオブジェクトにする
 const noop = () => undefined;
 const methods = [
@@ -44,6 +56,12 @@ const methods = [
 ];
 const ui = Object.fromEntries(methods.map((m) => [m, noop])) as unknown as ExtensionUIContext;
 Object.assign(ui, {
+	setWidget: (key: string, content: string[] | undefined) => {
+		if (key === "harness") widget = content ?? [];
+	},
+	setWorkingMessage: (m?: string) => {
+		if (m) working.push(m);
+	},
 	confirm: async (title: string, message: string) => {
 		confirms.push({ title, message });
 		return confirmAnswers.shift() ?? false;
@@ -113,6 +131,9 @@ const userText = (s: AgentSession) =>
 		.map((m) => (typeof m.content === "string" ? m.content : m.content.map((c) => ("text" in c ? c.text : "")).join("")))
 		.join("\n");
 
+// フロー外のダッシュボード: 待機中・ブランチ・話しかけ方
+assert.match(widget[0], /待機中 │ ⎇ main │ 話しかけて開始/);
+
 // フロー外の通常の会話では、harness ツールは状態確認と開始だけ
 const idleTools = sessions[0].getActiveToolNames().filter((t) => t.startsWith("harness_")).sort();
 assert.deepEqual(idleTools, ["harness_control", "harness_status"]);
@@ -155,6 +176,14 @@ assert.match(implConfirm.message, /⚠ 進行中のフロー（requirements \/ �
 assert.equal(sessions.length, 3);
 assert.equal(state().phase, "impl_context");
 assert.match(userText(sessions[2]), /<skill name="harness-plan"/);
+// ダッシュボード: フロー・Issue・作業ブランチ・工程の現在位置・トークン
+assert.match(widget[0], /🧭 TDD 実装 │ ログイン API │ ⎇ issue-01-login-api/);
+assert.equal(widget[1], "▶ 読込 › ○ プラン › ○ 承認 › ○ TDD 実装 › ○ レビュー › ○ 完了");
+assert.match(widget.at(-1) ?? "", /このセッション 入 [\d.]+k? \/ 出/);
+assert.match(widget.at(-1) ?? "", /faux\/m/);
+assert.ok(working.includes("🧭 あなたの確認待ち"), "ツール実行中の作業が表示される");
+assert.match(widget.at(-1) ?? "", /作業合計 [\d.]+k? \$[\d.]+（1 セッション）/, "前のフロー・通常の会話のセッションは新しい作業の合計に含めない");
+if (process.env.SHOW_WIDGET) console.log(`\n${widget.join("\n")}\n`);
 
 // 4) 状態を自然言語で聞く（確認なし・読み取りのみ）
 await talk("今どうなってる？", [call("harness_status", {}), say("プラン作成中です。")]);

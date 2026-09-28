@@ -22,6 +22,7 @@ piHarness/
 │   ├── usage.ts                  # モデル利用量の集計
 │   ├── tools.ts                  # プロセスごとに有効にするツール
 │   ├── compaction.ts             # しきい値による自動圧縮の判断と要約の指示
+│   ├── dashboard.ts              # TUI のダッシュボード（工程・いまの作業・ブランチ・トークン）
 │   └── text.ts                   # 整形ヘルパー
 ├── scripts/install.mjs           # プロジェクトへの組み込み（.pi/settings.json・harness.json・.gitignore）
 ├── templates/harness.json        # 組み込み時に作る .pi/harness.json の雛形

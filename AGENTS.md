@@ -10,7 +10,7 @@ pi-coding-agent の拡張 + Skill。要件定義 → TDD 実装 → レビュー
 | `extensions/harness/index.ts` | Pi との接続だけ（ツール・コマンド・イベント）。ロジックは下の純粋モジュールへ |
 | `extensions/harness/state.ts` | 状態機械（フェーズ・承認・ループ・エスカレーション・プロセス境界）。**純粋関数** |
 | `extensions/harness/handoff.ts` | プロセス間の引き継ぎ（成果物パス・入力/参照/出力・開始メッセージ） |
-| `extensions/harness/*.ts` | guard（書き込み制限）/ git / integrity（テスト保護）/ progress（Issue 進捗）/ usage / tools / compaction / config |
+| `extensions/harness/*.ts` | guard（書き込み制限）/ git / integrity（テスト保護）/ progress（Issue 進捗）/ usage / tools / compaction / dashboard（TUI 表示）/ config |
 | `skills/harness-*/SKILL.md` | プロセスごとの手順（1 プロセス = 1 スキル、各 2〜3KB に保つ） |
 | `scripts/install.mjs` | 他プロジェクトへの組み込み（`.pi/piHarness` に clone して実行） |
 | `test/*.test.ts` / `test/e2e/*.ts` | ユニットテスト / 偽モデルで実際の Pi を動かす E2E（natural.ts は確認ダイアログをスクリプトで応答） |
