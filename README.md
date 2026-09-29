@@ -220,7 +220,8 @@ pi（TUI）を起動して、**やりたいことを普通の言葉で話しか�
     "commitArtifacts": false,
     "pr": "ask",
     "draft": false,
-    "dirtyStart": "ask"
+    "dirtyStart": "ask",
+    "pullBase": true
   },
   "models": {
     "default": "anthropic/claude-sonnet-5",
@@ -277,8 +278,10 @@ pi（TUI）を起動して、**やりたいことを普通の言葉で話しか�
 
 git リポジトリであれば自動で有効になります。
 
-1. **開始時:** `/impl` で作業ブランチ（`issue-12-add-login` など。タイトルが日本語だけなら `issue-12`）を作成し、開始時点のコミットを**差分の基準**として記録します。
-   - 作成元（= PR のマージ先）は `baseBranch`、未指定なら現在のブランチです。前の Issue の作業ブランチ上にいる場合は、既定ブランチ（`origin/HEAD` / `main` / `master`）から作るか、積み上げるかを確認します（UI が無ければ既定ブランチ）。
+1. **開始時:** 開始元ブランチ（`main` など）を **origin から pull してから**、作業ブランチ（`issue-12-add-login` など。タイトルが日本語だけなら `issue-12`）を作成し、開始時点のコミットを**差分の基準**として記録します。
+   - 作成元（= PR のマージ先）は `baseBranch`、未指定なら既定ブランチ（`origin/HEAD` / `main` / `master`）です。前の Issue の作業ブランチ上にいる場合は、既定ブランチから作るか、積み上げるかを確認します（UI が無ければ既定ブランチ）。
+   - pull は早送りだけです（`main` 上なら `git pull --ff-only`、別のブランチ上なら `git fetch origin main:main`）。現在のブランチは変えません。
+   - pull できない場合（ネットワーク・認証・ローカルの `main` に origin に無いコミットがある）は開始を止め、確認ダイアログで「最新化せずに開始」を選んだときだけ続けます。origin が無いリポジトリでは何もしません。`pullBase: false` で無効にできます。
    - 既存のブランチなら切り替えて再開します。未コミットの変更がある場合は確認します（`dirtyStart`: `ask` / `allow` / `refuse`）。
 2. **作業中:** レビュー・修正・バグ修正の各セッションには「`git diff <基準>` で差分を確認する」と案内します。関係ない変更がレビューに混ざりません。
 3. **完了時:** レビューを通過すると変更をコミットします（件名 `タイトル (#12)`、本文に `Closes #12`）。成果物（`.pi/harness/`）は既定ではコミットしません（`commitArtifacts`）。

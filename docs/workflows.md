@@ -108,7 +108,7 @@ flowchart LR
 | `impl_fix_review` | ブロッキング指摘の修正 | 制限なし | 全テスト green かつ未テスト変更なしで `harness_phase → impl_review` |
 | `impl_done` | 完了（Issue を完了にし、コミット、設定に応じて PR） | `.pi/harness/` のみ | — |
 
-`/impl` の開始時に作業ブランチを作成し、開始時点のコミットを差分の基準として記録します（git リポジトリの場合）。
+`/impl` の開始時に開始元ブランチ（`main` など）を origin から pull し（`git.pullBase`、早送りのみ）、そこから作業ブランチを作成して、開始時点のコミットを差分の基準として記録します（git リポジトリの場合）。
 レビュー通過時に拡張がコミットし、`git.pr` に従って PR を作成します（既定は確認してから作成）。
 PR 本文・Issue 本文・レビュー記録は日本語のテンプレート（`templates/pr.md` / `issue.md` / `review.md`）から組み立てます。
 
