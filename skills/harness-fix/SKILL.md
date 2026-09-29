@@ -15,8 +15,9 @@ disable-model-invocation: true
 
 ## 手順
 
-1. 最新の `review-N.md` のブロッキング指摘（blocker/major）を読む。背景が必要なときだけ `implementation.md` / `plan.md` / `issue.md` を参照する。
+1. 最新の `review-N.md` のブロッキング指摘（blocker/major）を読む。`decisions.md` があれば、その解釈（ユーザーの回答）に合わせて直す。背景が必要なときだけ `implementation.md` / `plan.md` / `issue.md` を参照する。
 2. 指摘ごとに修正する。指摘が誤っていると判断したら、根拠を `fix-N.md` に書く（黙って無視しない）。
-3. `harness_run_tests`（`expect: "green"`）で全テスト（+ チェック）を合格させる。失敗時は原因の仮説を書いてから直す（連続 3 回でエスカレーション）。テストを弱める変更は止められる（正当な場合のみ `testChangeReason`）。
+3. `harness_run_tests`（`expect: "green"`）で全テスト（+ チェック）を合格させる。失敗時は原因の仮説を書いてから直す（連続 3 回、または同じ失敗が 2 回続くとエスカレーション）。テストを弱める変更は止められる（正当な場合のみ `testChangeReason`）。
+   レビュー時点のテストは**ロック**されていて変更できない（新しいテストファイルの追加はできる）。既存のテストのほうが誤っているときだけ `harness_request_test_change` でユーザーの承認を得る。
 4. `templates/fix-report.md` に従い **`fix-N.md`**（N = レビュー周回）を書く。**次の軽量レビューは主にこれと前回からの差分を見る**ので、新たに変更した箇所も書く。
 5. `harness_phase` で `impl_review` へ（`fix-N.md` が無いと拒否される）。

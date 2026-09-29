@@ -167,6 +167,7 @@ const planSession = runtime.session;
 // 人間が承認 → [S3] TDD 実装 → implementation.md 必須 → レビューへ
 r = await run("/harness approve 境界値も見ておいて", [
 	call("harness_run_tests", { expect: "red" }),
+	call("write", { path: "test/lock.test.js", content: "it('x', () => {});\n" }), // Red 確認後 Green 合格まではテストを追加できない → ブロック
 	call("write", { path: "src/feature.js", content: "module.exports = 1" }),
 	call("bash", { command: "touch LINT_FAIL" }),
 	call("harness_run_tests", { expect: "green" }), // テストは通るがチェック（lint 相当）が失敗 → 失敗 1 回
@@ -198,9 +199,11 @@ r = await run("/harness approve 境界値も見ておいて", [
 for (const x of r) console.log("  ", x);
 assert.equal(sessionNo, 6, "実装 → レビュー → 修正 → レビュー がそれぞれ新しいセッション");
 const errorsOf = (session: number) => r.filter((x) => x.startsWith(`${session}:`) && x.includes("[ERROR]"));
-assert.equal(errorsOf(3).length, 2);
-assert.match(errorsOf(3)[0], /implementation\.md/);
-assert.match(errorsOf(3)[1], /再度テスト/, "bash による変更も未テスト扱いになる");
+assert.equal(errorsOf(3).length, 3);
+assert.match(errorsOf(3)[0], /test\/lock\.test\.js はロックされています/, "Red 確認後はテストをロックする");
+assert.match(errorsOf(3)[1], /implementation\.md/);
+assert.match(errorsOf(3)[2], /再度テスト/, "bash による変更も未テスト扱いになる");
+assert.ok(!existsSync(join(project, "test/lock.test.js")));
 assert.equal(errorsOf(5).length, 2);
 assert.match(errorsOf(5)[0], /fix-1\.md/);
 assert.match(errorsOf(5)[1], /テストを弱める可能性のある変更を検知/);
@@ -210,6 +213,10 @@ assert.match(s3Runs[2], /結果: PASS/);
 assert.doesNotMatch(s3Runs[2], /出力の末尾/, "合格時はテスト出力を返さない");
 assert.match(s3Runs[2], /出力は省略/);
 assert.match(s3Runs[0], /テストの出力の末尾/, "Red 確認では失敗理由を確認できる分だけ返す");
+assert.match(s3Runs[0], /Green が合格するまでロックしました/);
+assert.match(s3Runs[1], /再実行 1 回/, "green 期待の失敗は再実行して flaky かを確かめる");
+// ベースライン: /impl の開始時点でテストとチェックを実行し、結果を baseline.md に記録する
+assert.match(readFileSync(join(project, p("baseline.md")), "utf8"), /# ベースライン[\s\S]*npm test` \| ❌ 失敗（除外しない）/, "出力から失敗を特定できないものは除外しない");
 assert.equal(
 	sessionsSeen[2].messages.filter((m) => (m as { customType?: string }).customType === "harness-context").length,
 	0,
@@ -224,6 +231,7 @@ assert.match(firstUserText(sessionsSeen[3]), /変更の差分: `git diff [0-9a-f
 assert.equal(git("rev-parse", "--abbrev-ref", "HEAD"), "issue-1");
 assert.match(git("log", "-1", "--format=%B"), /\(#1\)[\s\S]*Closes #1/);
 assert.match(git("show", "--stat", "--format=", "HEAD"), /src\/feature\.js/);
+assert.doesNotMatch(git("show", "--stat", "--format=", "HEAD"), /test-lock/, "ロックの記録はコミットしない");
 assert.doesNotMatch(git("show", "--stat", "--format=", "HEAD"), /\.pi\/harness\//, "成果物は既定でコミットしない");
 assert.equal(git("status", "--porcelain", "--", "src", "test"), "");
 const issue1 = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8"));
@@ -278,24 +286,31 @@ const beforeEsc = sessionNo;
 r = await run("/harness approve", [
 	call("write", { path: "BROKEN", content: "x" }),
 	call("harness_run_tests", { expect: "green" }),
-	call("harness_run_tests", { expect: "green" }),
-	call("harness_run_tests", { expect: "green" }), // 3 回目 → エスカレーション（UI なし → 停止）
+	call("harness_run_tests", { expect: "green" }), // 同じ失敗が 2 回続く → 上限（3 回）を待たずにエスカレーション（UI なし → 停止）
 ]);
 assert.equal(sessionNo, beforeEsc + 1);
-assert.ok(existsSync(join(project, ".pi/harness/issue-2/escalation-1.md")));
+assert.match(r.at(-1) ?? "", /同じ失敗が続いており、修正が進んでいません/);
+assert.match(readFileSync(join(project, ".pi/harness/issue-2/escalation-1.md"), "utf8"), /理由: no_progress（同じ失敗が続き、修正が進んでいない）/);
 
 r = await run("/bugfix BROKEN ファイルが残る", [
-	call("harness_run_tests", { expect: "red" }),
+	call("write", { path: "test/bug.test.js", content: "it('BROKEN が残らない', () => {});\n" }),
+	call("harness_run_tests", { expect: "red" }), // → 再現テストをロック
 	call("harness_phase", { to: "bug_analyze" }),
 	call("write", { path: "src/feature.js", content: "y" }), // 分析中 → ブロック
 	call("harness_phase", { to: "bug_fix" }),
 	call("bash", { command: "rm BROKEN && mkdir -p src && echo 'module.exports = 1' > src/feature.js" }), // issue-2 は main から作成されている
+	call("bash", { command: "echo \"it.todo('x')\" >> test/bug.test.js" }), // bash でロック中のテストを変更
+	call("harness_run_tests", { expect: "green" }), // → 元に戻して拒否
 	call("harness_run_tests", { expect: "green" }),
 	call("harness_phase", { to: "bug_done" }), // bug-1.md が無い → 拒否
 	call("write", { path: ".pi/harness/issue-2/bug-1.md", content: "# 原因" }),
 	call("harness_phase", { to: "bug_done" }), // → 合流 → 新しいレビューセッション
-	call("harness_record_review", { summary: "LGTM", findings: [] }),
-	done("合流して完了"),
+	// 仕様の曖昧さはループに数えずユーザーに聞く（UI なし → 止まって /harness answer を待つ）
+	call("harness_record_review", {
+		summary: "指摘なし。仕様の確認 1 件",
+		findings: [],
+		specGaps: [{ criterion: "AC-1", question: "BROKEN が空ファイルのときも異常とみなしますか？", interpretations: ["異常とみなす", "無視する"], evidence: "src/feature.js:1" }],
+	}),
 ]);
 for (const x of r) console.log("  ", x);
 const bugSession = beforeEsc + 2;
@@ -304,10 +319,30 @@ assert.match(firstUserText(sessionsSeen[bugSession - 1]), /<skill name="harness-
 assert.match(firstUserText(sessionsSeen[bugSession - 1]), /escalation-1\.md — エスカレーション記録 #1/);
 assert.deepEqual(
 	r.filter((x) => x.includes("[ERROR]")).map((x) => x.replace(/: .*/, "")),
-	[`${bugSession}:write [ERROR]`, `${bugSession}:harness_phase [ERROR]`],
+	[`${bugSession}:write [ERROR]`, `${bugSession}:harness_run_tests [ERROR]`, `${bugSession}:harness_phase [ERROR]`],
 );
-assert.ok(r.some((x) => x.startsWith(`${bugSession + 1}:harness_record_review: レビュー 1 周目（フル）`)));
+assert.match(r.find((x) => x.startsWith(`${bugSession}:harness_run_tests [ERROR]`)) ?? "", /ロック中のテストファイルが変更されていました/);
+assert.equal(readFileSync(join(project, "test/bug.test.js"), "utf8"), "it('BROKEN が残らない', () => {});\n", "bash で変更されたロック中のテストは元に戻る");
+assert.ok(r.some((x) => x.startsWith(`${bugSession + 1}:harness_record_review: レビュー 1 周目: 仕様の確認 1 件`)));
 assert.match(firstUserText(sessionsSeen[bugSession]), /bug-1\.md — バグレポート #1/);
+let st = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8"));
+assert.equal(st.phase, "impl_spec_gap");
+assert.equal(st.testLock.mode, "review");
+assert.ok("test/bug.test.js" in st.testLock.files, "合流時にテストをロックし直す");
+assert.match(readFileSync(join(project, ".pi/harness/issue-2/review-1.md"), "utf8"), /## 仕様の確認[\s\S]*Q1\. \[AC-1\][\s\S]*解釈 2: 無視する[\s\S]*回答待ち/);
+
+// ユーザーが回答 → 決まった解釈でもう一度フルレビュー（新しいセッション。周回に数えない）
+r = await run("/harness answer 異常とみなす", [call("harness_record_review", { summary: "LGTM", findings: [] }), done("合流して完了")]);
+for (const x of r) console.log("  ", x);
+assert.equal(sessionNo, bugSession + 2);
+assert.match(firstUserText(sessionsSeen[bugSession + 1]), /<skill name="harness-review"/, "回答後は差分の全体をフルレビュー");
+assert.match(firstUserText(sessionsSeen[bugSession + 1]), /decisions\.md — 仕様の確認へのユーザーの回答/);
+assert.ok(r.some((x) => x.startsWith(`${bugSession + 2}:harness_record_review: レビュー 2 周目（フル）: ブロッキング指摘なし`)));
+assert.match(readFileSync(join(project, ".pi/harness/issue-2/decisions.md"), "utf8"), /Q1（AC-1）[\s\S]*\*\*決定:\*\* 異常とみなす/);
+assert.match(readFileSync(join(project, ".pi/harness/issue-2/issue-comment-draft.md"), "utf8"), /投稿はしていません[\s\S]*AC-1[\s\S]*決定: 異常とみなす/);
+st = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8"));
+assert.equal(st.phase, "impl_done");
+assert.equal(st.review.max, 4, "仕様の確認だけの周回はレビューループに数えない");
 // issue-2 は既定ブランチ main から作成され（issue-1 の変更を含まない）、合流後のレビュー通過でコミットされる
 assert.equal(git("rev-parse", "--abbrev-ref", "HEAD"), "issue-2");
 assert.match(git("log", "-1", "--format=%s"), /\(#2\)$/);
@@ -372,7 +407,7 @@ assert.match(readFileSync(join(project, "docs/issues/02-sqlite-保存.md"), "utf
 
 // プロセスごとのモデル:
 //   レビュー・要件定義書作成 → reviewer + thinking high / ヒアリング → cheap / それ以外 → worker
-const reviewSessions = new Set([4, 6, bugSession + 1]);
+const reviewSessions = new Set([4, 6, bugSession + 1, bugSession + 2]);
 const hearingSessions = new Set([hearing1, hearing1 + 2]);
 const documentSessions = new Set([hearing1 + 1, hearing1 + 3]);
 sessionsSeen.forEach((session, i) => {

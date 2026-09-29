@@ -18,7 +18,7 @@ disable-model-invocation: true
 ## 手順
 
 1. **把握**: 入力（特に `escalation-N.md` の経緯と直近のテストログ）を読み、`templates/bug-report.md` に従い **`bug-N.md`** に症状・期待/実際・これまでの試行を書く。不明点は `harness_ask`。
-2. **再現（bug_reproduce）**: バグを再現する最小のテストを書き `harness_run_tests`（`expect: "red"`）で失敗を確認。合格したら再現できていない。環境依存（Pi 固有のハードウェア・タイミング・メモリ）はモックや注入で再現する。→ `harness_phase` で `bug_analyze`。
+2. **再現（bug_reproduce）**: バグを再現する最小のテストを書き `harness_run_tests`（`expect: "red"`）で失敗を確認。合格したら再現できていない。確認したテストは修正が合格するまでロックされる（直したいときは `bug_analyze` から `bug_reproduce` へ戻る）。環境依存（Pi 固有のハードウェア・タイミング・メモリ）はモックや注入で再現する。→ `harness_phase` で `bug_analyze`。
 3. **分析（bug_analyze、コード変更不可）**: 症状→原因の因果連鎖を説明できるまで調べる。過去の修正が失敗した理由、既存テスト/レビューが見逃した理由、影響範囲も `bug-N.md` に書く。方針をユーザーに簡潔に共有して `bug_fix` へ。
 4. **修正（bug_fix）**: 根本原因への最小限の修正（例外の握りつぶし・テスト緩和・リトライでの誤魔化しは不可）。`expect: "green"` で全テスト合格（連続 3 回失敗で再エスカレーション。必要なら `bug_analyze` に戻る）。類似箇所があれば報告。
 5. **完了**: `bug-N.md` に修正内容と追加テストを書き（無いと進めない）`harness_phase` で `bug_done`。合流先があれば新しいセッションのフルレビューで再開される。単独起動なら根本原因・修正・追加テストを報告して終了。

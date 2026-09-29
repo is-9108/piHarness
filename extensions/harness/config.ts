@@ -81,6 +81,14 @@ export interface HarnessConfig {
 	git: GitSettings;
 	/** テストを弱める変更（テスト削除・スキップ追加・アサーション減少）を検知して理由の記録を求めるか */
 	testIntegrity: boolean;
+	/** 同じ失敗（失敗の指紋が同じ）がこの回数続いたら、maxTestLoops を待たずにエスカレーションする。0 で無効 */
+	sameFailureLimit: number;
+	/** green 期待で失敗したコマンドを再実行する回数。再実行で合格したものは flaky として記録し、ループ回数に数えない。0 で無効 */
+	flakyRetries: number;
+	/** 実装開始時点でテストとチェックを実行し、もともと失敗しているものを判定から除外する */
+	baseline: boolean;
+	/** Red で失敗を確かめたテストを Green の合格までロックし、レビュー以降はレビュー時点のテストをロックする */
+	testLock: boolean;
 	/** しきい値による自動圧縮 */
 	compaction: { enabled: boolean; thresholdPercent: number };
 	/** TUI の入力欄の上にダッシュボード（工程・いまの作業・ブランチ・トークン等）を表示するか */
@@ -117,6 +125,10 @@ export const DEFAULT_CONFIG: HarnessConfig = {
 	models: {},
 	git: DEFAULT_GIT,
 	testIntegrity: true,
+	sameFailureLimit: 2,
+	flakyRetries: 1,
+	baseline: true,
+	testLock: true,
 	compaction: { enabled: true, thresholdPercent: 60 },
 	dashboard: true,
 	issueLimits: { maxAcceptanceCriteria: 5, allowedSizes: ["S", "M"], maxPlanTestCases: 12 },
@@ -165,6 +177,20 @@ export function mergeConfig(raw: Partial<HarnessConfig>, warnings: string[] = []
 	}
 	c.git = normalizeGit(raw.git as unknown, warnings);
 	if (typeof c.testIntegrity !== "boolean") c.testIntegrity = DEFAULT_CONFIG.testIntegrity;
+	for (const key of ["baseline", "testLock"] as const) {
+		if (typeof c[key] !== "boolean") {
+			if (raw[key] !== undefined) warnings.push(`${key} は true / false で指定してください。既定値を使用します。`);
+			c[key] = DEFAULT_CONFIG[key];
+		}
+	}
+	if (!Number.isInteger(c.sameFailureLimit) || c.sameFailureLimit < 0 || c.sameFailureLimit === 1) {
+		warnings.push(`sameFailureLimit は 0（無効）または 2 以上の整数で指定してください。既定値 ${DEFAULT_CONFIG.sameFailureLimit} を使用します。`);
+		c.sameFailureLimit = DEFAULT_CONFIG.sameFailureLimit;
+	}
+	if (!Number.isInteger(c.flakyRetries) || c.flakyRetries < 0 || c.flakyRetries > 5) {
+		warnings.push(`flakyRetries は 0〜5 の整数で指定してください。既定値 ${DEFAULT_CONFIG.flakyRetries} を使用します。`);
+		c.flakyRetries = DEFAULT_CONFIG.flakyRetries;
+	}
 	c.compaction = normalizeCompaction(raw.compaction as unknown, warnings);
 	if (typeof c.dashboard !== "boolean") c.dashboard = DEFAULT_CONFIG.dashboard;
 	c.issueLimits = normalizeIssueLimits(raw.issueLimits as unknown, warnings);

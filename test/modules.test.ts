@@ -35,6 +35,17 @@ describe("config", () => {
 		assert.equal(detectTestCommand(d), "python3 -m pytest -q");
 	});
 
+	it("同じ失敗・flaky・ベースライン・テストのロックの設定", () => {
+		const d = mergeConfig({});
+		assert.deepEqual([d.sameFailureLimit, d.flakyRetries, d.baseline, d.testLock], [2, 1, true, true]);
+		const off = mergeConfig({ sameFailureLimit: 0, flakyRetries: 0, baseline: false, testLock: false });
+		assert.deepEqual([off.sameFailureLimit, off.flakyRetries, off.baseline, off.testLock], [0, 0, false, false]);
+		const w: string[] = [];
+		const bad = mergeConfig({ sameFailureLimit: 1, flakyRetries: 9, testLock: "yes" as never }, w);
+		assert.deepEqual([bad.sameFailureLimit, bad.flakyRetries, bad.testLock], [2, 1, true]);
+		assert.equal(w.length, 3);
+	});
+
 	it("不正な値は既定値に戻して警告する", () => {
 		const w: string[] = [];
 		const c = mergeConfig({ maxTestLoops: 0, blockingSeverities: ["fatal" as never] }, w);
@@ -82,6 +93,13 @@ describe("guard", () => {
 		const s = startRequirements(initialState(), "t", DEFAULT_LIMITS, ".pi/harness/req-x");
 		assert.equal(checkBash(s, "gh issue create --title x").block, true);
 		assert.equal(checkBash(s, "gh issue list").block, false);
+	});
+
+	it("仕様の確認待ちの間はコードを変更できない", () => {
+		const s = { ...startImplement(initialState(), { title: "x" }, DEFAULT_LIMITS, ".pi/harness/issue-1"), phase: "impl_spec_gap" as const };
+		assert.equal(checkWrite(s, "src/a.ts", paths).block, true);
+		assert.match(checkWrite(s, "src/a.ts", paths).reason ?? "", /仕様の確認/);
+		assert.equal(checkWrite(s, ".pi/harness/issue-1/notes.md", paths).block, false);
 	});
 
 	it("作業ファイル判定", () => {
@@ -148,5 +166,22 @@ describe("text / guidance", () => {
 		assert.match(text, /#3 API/);
 		assert.match(text, /npm test/);
 		assert.match(text, /impl_plan/);
+	});
+
+	it("同じ失敗の回数・ベースライン・テストのロック・回答待ちの仕様の確認を伝える", () => {
+		const base = startImplement(initialState(), { number: 3, title: "API" }, DEFAULT_LIMITS, ".pi/harness/issue-1");
+		const s = {
+			...base,
+			phase: "impl_tdd" as const,
+			test: { ...base.test, failures: 1, failureHistory: ["a"] },
+			baseline: { at: "", commands: ["npm test"], failures: [{ command: "npm test", killed: false, lines: [], recognized: true }] },
+			testLock: { mode: "green" as const, at: "", files: { "a.test.ts": "h" }, allowed: [] },
+		};
+		const text = buildContext(s, mergeConfig({}));
+		assert.match(text, /同じ失敗: 1\/2 回/);
+		assert.match(text, /ベースライン（開始時点ですでに失敗。同じ失敗だけなら判定から除外）: npm test/);
+		assert.match(text, /テストのロック: Red で確かめたテスト（1 ファイル）は Green の合格まで変更・追加できない/);
+		const gap = { ...base, phase: "impl_spec_gap" as const, specGaps: [{ id: "Q1", criterion: "AC-1", question: "q?", interpretations: ["a", "b"], round: 1 }] };
+		assert.match(buildContext(gap, mergeConfig({})), /回答待ちの仕様の確認:\n- Q1 \[AC-1\] q\?（解釈: a \/ b）[\s\S]*answer_spec_gap/);
 	});
 });

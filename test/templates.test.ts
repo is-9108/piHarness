@@ -81,6 +81,14 @@ describe("レビュー記録", () => {
 		assert.match(md, /✅ 修正必須の指摘なし/);
 		assert.match(md, /前回の指摘の解消と前回レビュー以降の差分だけ/);
 		assert.match(md, /## 指摘\n\nなし/);
+		assert.match(md, /## 仕様の確認（ユーザーに確認する曖昧な点）\n\nなし/);
+	});
+
+	it("仕様の確認は解釈の候補と回答（または回答待ち）を載せる", () => {
+		const gap = { id: "Q1", criterion: "AC-2", question: "空白は？", interpretations: ["空文字", "エラー"], evidence: "src/a.ts:3", round: 1 };
+		const md = renderTemplate(tpl("review"), reviewVars({ ...base, mode: "full", findings: [], specGaps: [gap] }));
+		assert.match(md, /判定 \| ❓ 仕様の確認が必要（1 件）/);
+		assert.match(md, /### Q1\. \[AC-2\] 空白は？\n\n- 解釈 1: 空文字\n- 解釈 2: エラー\n- 箇所: `src\/a\.ts:3`\n- 回答: （ユーザーの回答待ち）/);
 	});
 });
 
@@ -139,6 +147,7 @@ describe("PR 本文", () => {
 			"## テスト",
 			"## テストの変更（削除・スキップなど）",
 			"## レビュー（piHarness）",
+			"## 仕様の確認（レビュー中にユーザーが決めたこと）",
 			"## プランからの逸脱",
 			"## レビューで特に見てほしい点",
 			"## 既知の制約",
@@ -159,5 +168,32 @@ describe("PR 本文", () => {
 		assert.doesNotMatch(body, /Closes/);
 		assert.match(body, /## テストの変更（削除・スキップなど）\n\n- 仕様変更/);
 		assert.match(body, /---\n$/);
+		assert.match(body, /## 仕様の確認（レビュー中にユーザーが決めたこと）\n\nなし/);
+	});
+
+	it("ベースラインの除外・不安定なテスト・仕様の確認の回答を載せる", () => {
+		const body = renderTemplate(
+			tpl("pr"),
+			prVars({
+				implementation: "",
+				test: { runs: 5, lastResult: "pass" },
+				checkCommands: [],
+				testChangeReasons: [],
+				history: [],
+				remaining: [],
+				baseline: { at: "", commands: ["npm test", "npm run lint"], failures: [{ command: "npm run lint", killed: false, lines: ["x"], recognized: true }] },
+				flaky: [
+					{ command: "npm test", killed: false, lines: [], at: "", phase: "impl_tdd" },
+					{ command: "npm test", killed: false, lines: [], at: "", phase: "impl_fix_review" },
+				],
+				specGaps: [
+					{ id: "Q1", criterion: "AC-2", question: "空白は？", interpretations: ["a", "b"], round: 1, answer: "空文字" },
+					{ id: "Q2", criterion: "AC-3", question: "未回答", interpretations: ["a", "b"], round: 1 },
+				],
+			}),
+		);
+		assert.match(body, /- ベースライン: 開始時点ですでに失敗していたため判定から除外 — `npm run lint`/);
+		assert.match(body, /- ⚠ 不安定（再実行で合格。修正ループに数えていない）: `npm test`\n/);
+		assert.match(body, /## 仕様の確認（レビュー中にユーザーが決めたこと）\n\n- \[AC-2\] 空白は？ → \*\*空文字\*\*\n\n## /);
 	});
 });

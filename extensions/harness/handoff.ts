@@ -7,7 +7,9 @@
  */
 import { join } from "node:path";
 import {
+	type Baseline,
 	describeIssue,
+	type EscalationReason,
 	type HarnessState,
 	type Phase,
 	type ProcessKind,
@@ -32,6 +34,14 @@ export interface ArtifactPaths {
 	usage: string;
 	delta: (round: number) => string;
 	logs: string;
+	/** 仕様の確認（spec_gap）への回答の記録 */
+	decisions: string;
+	/** Issue へのコメントの下書き（投稿はしない） */
+	issueCommentDraft: string;
+	/** 実装開始時点のテスト・チェックの結果 */
+	baseline: string;
+	/** ロックしたテストファイルの内容（テストのロックの照合と復元に使う） */
+	testLock: string;
 }
 
 export function artifactPaths(itemDir: string): ArtifactPaths {
@@ -52,6 +62,10 @@ export function artifactPaths(itemDir: string): ArtifactPaths {
 		usage: join(itemDir, "usage.json"),
 		delta: (r) => join(itemDir, `delta-${r}.diff`),
 		logs: join(itemDir, "logs"),
+		decisions: join(itemDir, "decisions.md"),
+		issueCommentDraft: join(itemDir, "issue-comment-draft.md"),
+		baseline: join(itemDir, "baseline.md"),
+		testLock: join(itemDir, "test-lock"),
 	};
 }
 
@@ -170,6 +184,7 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 		case "implement":
 			add(p.issue, "対象 Issue の本文");
 			add(p.plan, "承認済みのテスト/実装プラン");
+			ref(p.baseline, "実装開始時点ですでに失敗しているテスト・チェック（判定から除外される）");
 			outputs.push({ path: p.implementation, why: "実装レポート（レビュー担当への引き継ぎ。レビューへ進む前に必須）" });
 			break;
 		case "review":
@@ -179,6 +194,7 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 				add(p.fix(s.review.round), `前回の指摘への対応記録`);
 				add(p.delta(s.review.round + 1), "前回レビュー以降の差分（これを中心に確認する）");
 				add(p.testChanges, "テストの削除・スキップ等とその理由（新しい記録があれば検証する）");
+				add(p.decisions, "仕様の確認へのユーザーの回答（この解釈を正として確認する。回答済みの論点は再び聞かない）");
 				ref(p.implementation, "実装レポート");
 				ref(p.plan, "承認済みのテスト/実装プラン");
 				ref(p.issue, "対象 Issue の本文");
@@ -188,6 +204,7 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 				add(p.implementation, "実装レポート");
 				bugs(add);
 				add(p.testChanges, "テストの削除・スキップ・アサーション減少と、その理由（妥当か必ず検証する）");
+				add(p.decisions, "仕様の確認へのユーザーの回答（この解釈を正としてレビューする。回答済みの論点は再び聞かない）");
 				for (let r = 1; r <= s.review.round; r++) {
 					ref(p.review(r), `レビュー ${r} 周目の記録`);
 					ref(p.fix(r), `レビュー ${r} 周目の指摘への対応記録`);
@@ -197,6 +214,7 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 			break;
 		case "fix":
 			add(p.review(s.review.round), "修正対象のレビュー記録");
+			add(p.decisions, "仕様の確認へのユーザーの回答（この解釈に合わせて直す）");
 			ref(p.implementation, "実装レポート");
 			ref(p.plan, "承認済みのテスト/実装プラン");
 			ref(p.issue, "対象 Issue の本文");
@@ -281,6 +299,43 @@ export function handoffRecord(s: HarnessState, exists: (path: string) => boolean
 	);
 }
 
+/** 実装開始時点のテスト・チェックの結果（baseline.md） */
+export function baselineMarkdown(b: Baseline, log?: string): string {
+	const lines = [
+		"# ベースライン（実装開始時点のテストとチェック）",
+		"",
+		`- 日時: ${b.at}`,
+		b.commit ? `- コミット: ${b.commit}` : "",
+		log ? `- 全ログ: ${log}` : "",
+		"",
+		"開始時点ですでに失敗しているものは、同じ失敗だけが残っている場合に限り、テストの合否の判定から除外します。新しい失敗が加わった場合は除外しません。",
+		"",
+		"| コマンド | 結果 |",
+		"|---|---|",
+		...b.commands.map((c) => {
+			const f = b.failures.find((x) => x.command === c);
+			return `| \`${c}\` | ${!f ? "✅ 合格" : f.recognized && !f.killed ? "❌ 失敗（同じ失敗なら判定から除外）" : "❌ 失敗（除外しない）"} |`;
+		}),
+	];
+	for (const f of b.failures) {
+		const note = f.killed
+			? "（タイムアウト / 中断。判定から除外しない）"
+			: f.recognized
+				? ""
+				: "（失敗したテストを出力から特定できないため、判定から除外しない）";
+		lines.push("", `## \`${f.command}\` の失敗${note}`, "", "```text", ...f.lines.slice(0, 60), "```");
+	}
+	return `${lines.filter((l, i, a) => l !== "" || a[i - 1] !== "").join("\n")}\n`;
+}
+
+export const ESCALATION_LABELS: Record<EscalationReason, string> = {
+	test_loop: "テスト修正ループの上限",
+	no_progress: "同じ失敗が続き、修正が進んでいない",
+	review_loop: "レビューループの上限",
+	bugfix_loop: "バグ修正ループの上限",
+	manual: "手動",
+};
+
 /** エスカレーション記録（バグ修正セッションやユーザー判断の入力になる） */
 export function escalationMarkdown(s: HarnessState, n: number): string {
 	const e = s.escalation;
@@ -290,7 +345,7 @@ export function escalationMarkdown(s: HarnessState, n: number): string {
 		"",
 		`- 日時: ${e?.at ?? ""}`,
 		`- フロー / フェーズ: ${e?.flow} / ${e?.phase}`,
-		`- 理由: ${e?.reason}`,
+		`- 理由: ${e?.reason}${e?.reason ? `（${ESCALATION_LABELS[e.reason]}）` : ""}`,
 		`- 対象: ${describeIssue(s.issue)}`,
 		"",
 		"## 状況",

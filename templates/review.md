@@ -1,7 +1,7 @@
 <!--
 piHarness のレビュー記録テンプレート（review-N.md）。harness_record_review が {{名前}} を埋めて保存する。
 プロジェクトで変えたいときは <workDir>/templates/review.md にコピーして編集する。
-使える値: round mode target date verdict counts summary perspectives findings
+使える値: round mode target date verdict counts summary perspectives findings specGaps
 指摘修正のセッションはこのファイルだけを見て直すので、findings は残すこと。
 -->
 # レビュー {{round}} 周目（{{mode}}）
@@ -24,3 +24,7 @@ piHarness のレビュー記録テンプレート（review-N.md）。harness_rec
 ## 指摘
 
 {{findings}}
+
+## 仕様の確認（ユーザーに確認する曖昧な点）
+
+{{specGaps}}

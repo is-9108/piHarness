@@ -7,6 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -44,6 +45,9 @@ const say = (text: string) => fauxAssistantMessage(text);
 // 確認ダイアログの応答（順番に使う）と、表示された内容の記録
 const confirmAnswers: boolean[] = [];
 const confirms: { title: string; message: string }[] = [];
+// 選択ダイアログの応答（選択肢の先頭一致。順番に使う）と、表示された内容の記録
+const selectAnswers: string[] = [];
+const selects: { title: string; options: string[] }[] = [];
 // ダッシュボード（setWidget）と作業中表示（setWorkingMessage）の記録
 let widget: string[] = [];
 const working: string[] = [];
@@ -66,7 +70,11 @@ Object.assign(ui, {
 		confirms.push({ title, message });
 		return confirmAnswers.shift() ?? false;
 	},
-	select: async () => undefined,
+	select: async (title: string, options: string[]) => {
+		selects.push({ title, options });
+		const a = selectAnswers.shift();
+		return a === undefined ? undefined : options.find((o) => o.startsWith(a));
+	},
 	input: async () => undefined,
 	editor: async () => undefined,
 });
@@ -189,7 +197,52 @@ if (process.env.SHOW_WIDGET) console.log(`\n${widget.join("\n")}\n`);
 await talk("今どうなってる？", [call("harness_status", {}), say("プラン作成中です。")]);
 assert.match(results.at(-1) ?? "", /^3:harness_status: \[piHarness ワークフロー制御中\]/);
 
-// 5) 「やめたい」→ 確認 → 中止
+// 5) レビューで見つかった仕様の曖昧さに、自然言語で答える（回答ダイアログ → 決まった解釈でもう一度レビュー）
+const writeState = (patch: Record<string, unknown>) =>
+	writeFileSync(join(project, ".pi/harness/state.json"), `${JSON.stringify({ ...state(), ...patch }, null, 2)}\n`);
+const item = state().itemDir as string;
+writeState({
+	phase: "impl_spec_gap",
+	review: { ...state().review, round: 1, lastBlocking: 0 },
+	specGaps: [{ id: "Q1", criterion: "AC-1", question: "パスワードが空のときは？", interpretations: ["400 を返す", "401 を返す"], round: 1 }],
+});
+await talk("/harness status", []); // state.json を読み直す
+selectAnswers.push("401");
+await talk("401 でお願いします", [
+	call("harness_control", { action: "answer_spec_gap", request: "401 を返す" }),
+	// ↑ で回答 → 新しいセッションでフルレビュー
+	say("レビューを始めます。"),
+]);
+assert.match(selects.at(-1)!.title, /仕様の確認 Q1（AC-1）\nパスワードが空のときは？/);
+assert.deepEqual(selects.at(-1)!.options, ["400 を返す", "401 を返す", "（自由入力で回答する）"]);
+assert.equal(sessions.length, 4, "回答後、新しいセッションでレビューし直す");
+assert.equal(state().phase, "impl_review");
+assert.match(userText(sessions[3]), /<skill name="harness-review"/);
+assert.match(userText(sessions[3]), /decisions\.md — 仕様の確認へのユーザーの回答/);
+assert.match(readFileSync(join(project, item, "decisions.md"), "utf8"), /\*\*決定:\*\* 401 を返す/);
+assert.equal(confirms.length, 3, "回答ダイアログそのものが確認なので、別の確認は出さない");
+
+// 6) 指摘修正中にロックされたテストを変えたい → 変更申請 → ユーザーが承認したら編集できる
+mkdirSync(join(project, "test"), { recursive: true });
+writeFileSync(join(project, "test/login.test.js"), "expect(status).toBe(400);\n");
+const hash = createHash("sha256").update(readFileSync(join(project, "test/login.test.js"))).digest("hex");
+writeState({ phase: "impl_fix_review", testLock: { mode: "review", at: "", files: { "test/login.test.js": hash }, allowed: [] } });
+await talk("/harness next", [say("修正を始めます。")]);
+assert.equal(sessions.length, 5);
+selectAnswers.push("承認する");
+await talk("続けて", [
+	call("write", { path: "test/login.test.js", content: "expect(status).toBe(401);\n" }), // ロック中 → ブロック
+	call("harness_request_test_change", { files: ["test/login.test.js"], reason: "Q1 の回答で 401 に決まったため", criterion: "AC-1" }),
+	call("write", { path: "test/login.test.js", content: "expect(status).toBe(401);\n" }),
+	say("テストを直しました。"),
+]);
+assert.match(results.at(-3) ?? "", /^5:write \[ERROR\]: .*test\/login\.test\.js はロックされています/);
+assert.match(selects.at(-1)!.title, /【テストの変更申請】\nファイル: test\/login\.test\.js\n根拠: AC-1/);
+assert.match(results.at(-2) ?? "", /^5:harness_request_test_change: ユーザーが承認しました/);
+assert.match(results.at(-1) ?? "", /^5:write: Successfully/);
+assert.match(readFileSync(join(project, item, "test-changes.md"), "utf8"), /ユーザーが承認[\s\S]*test\/login\.test\.js[\s\S]*\[AC-1\] Q1 の回答で 401/);
+
+// 7) 「やめたい」→ 確認 → 中止
 confirmAnswers.push(true);
 // 中止は作業を止めるためターンを終える（続けて作業しない）
 await talk("やっぱりやめたい", [call("harness_control", { action: "abort", request: "作業をやめたい" })]);
