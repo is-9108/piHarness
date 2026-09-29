@@ -13,6 +13,10 @@
   "ensureLabels": true,
   "autoHandoff": true,
   "testIntegrity": true,
+  "testLock": true,
+  "baseline": true,
+  "flakyRetries": 1,
+  "sameFailureLimit": 2,
   "git": {
     "enabled": true,
     "branchPrefix": "issue-",

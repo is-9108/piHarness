@@ -20,6 +20,7 @@ disable-model-invocation: true
 2. `delta-N.diff` の変更に新たな blocker/major（correctness / tests / security 中心）が無いか。
 3. 「対応不要」とされた指摘の根拠が妥当か。妥当でなければ再指摘。
 4. `test-changes.md` に新しい記録があれば理由を検証する。
+5. `decisions.md`（仕様の確認への回答）があれば、その解釈を正として確認する。新たに受け入れ条件の解釈が分かれる点を見つけたら、指摘ではなく `specGaps` に書く（回答済みの論点は書かない）。
 
 前回 minor/nit の再掲や新規の minor/nit は原則記録しない。差分外のコードは、指摘の確認に必要なときだけ読む。
 

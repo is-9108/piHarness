@@ -23,6 +23,11 @@ describe("プロセスごとのツール", () => {
 		assert.deepEqual(toolsForProcess(active, registered, "review").filter((x) => x.startsWith("harness_")).sort(), ["harness_control", "harness_record_review", "harness_status"]);
 	});
 
+	it("テストの変更申請はテストを書き換えうるプロセスだけ", () => {
+		for (const proc of ["implement", "fix", "bugfix"] as const) assert.ok(toolsForProcess(active, registered, proc).includes("harness_request_test_change"), proc);
+		for (const proc of ["review", "plan", "hearing"] as const) assert.ok(!toolsForProcess(active, registered, proc).includes("harness_request_test_change"), proc);
+	});
+
 	it("フロー外では状態確認と自然言語からの開始だけ（他のツールはそのまま）", () => {
 		const t = toolsForProcess(active, registered, null);
 		assert.deepEqual(t.filter((x) => x.startsWith("harness_")).sort(), ["harness_control", "harness_status"]);

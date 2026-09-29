@@ -24,7 +24,9 @@ const NEXT: Record<Phase, string> = {
 	impl_tdd:
 		"承認済みプランに従い TDD（Red → Green → Refactor）で実装する。Red は harness_run_tests (expect: red)、Green は (expect: green)。全体が green になり未テスト変更が無くなったら、実装レポート implementation.md を書いて harness_phase で impl_review へ。",
 	impl_review:
-		"開始時のスキル（フル / 軽量レビュー）に従ってコードレビューを行い、harness_record_review で結果を記録する。レビュー中はコードを変更しない。",
+		"開始時のスキル（フル / 軽量レビュー）に従ってコードレビューを行い、harness_record_review で結果を記録する。受け入れ条件の解釈が分かれる点は指摘ではなく specGaps に書く。レビュー中はコードを変更しない。",
+	impl_spec_gap:
+		"仕様の確認（spec_gap）へのユーザーの回答待ち。自分で解釈を決めず、作業を止めて質問と解釈の候補をユーザーに示す。ユーザーが回答したら harness_control (action: answer_spec_gap) で回答ダイアログを出して確定する（/harness answer <回答> でも可）。",
 	impl_fix_review:
 		"ブロッキング指摘を修正し harness_run_tests (expect: green) で全テストを合格させ、指摘ごとの対応を fix-<周回>.md に書いてから harness_phase で impl_review へ戻る。",
 	impl_done: "実装フロー完了。変更内容・テスト結果・残った軽微な指摘をユーザーに報告する。",
@@ -60,6 +62,22 @@ export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO
 		);
 		lines.push(`テストコマンド: ${cfg.testCommand ?? "(未設定: harness_run_tests 実行時にユーザーへ確認)"}`);
 		if (cfg.checkCommands.length) lines.push(`green 判定で合格が必要なチェック: ${cfg.checkCommands.join(" / ")}`);
+		const history = s.test.failureHistory ?? [];
+		const same = history.length && history.every((h) => h === history[history.length - 1]) ? history.length : 0;
+		if (same >= 1 && cfg.sameFailureLimit >= 2) {
+			lines.push(`同じ失敗: ${same}/${cfg.sameFailureLimit} 回（同じ失敗が続くと上限を待たずにエスカレーション。前回と違うアプローチで直す）`);
+		}
+		if (s.baseline?.failures.length) {
+			lines.push(`ベースライン（開始時点ですでに失敗。同じ失敗だけなら判定から除外）: ${s.baseline.failures.map((f) => f.command).join(" / ")}`);
+		}
+		if (s.testLock) {
+			lines.push(
+				s.testLock.mode === "green"
+					? `テストのロック: Red で確かめたテスト（${Object.keys(s.testLock.files).length} ファイル）は Green の合格まで変更・追加できない`
+					: `テストのロック: レビュー時点のテスト（${Object.keys(s.testLock.files).length} ファイル）は変更できない（新しいテストファイルの追加は可）`,
+			);
+			if (s.testLock.allowed.length) lines.push(`変更を承認されたテスト: ${s.testLock.allowed.join(", ")}`);
+		}
 	}
 	if (s.flow === "implement") {
 		lines.push(`レビューループ: ${s.review.round}/${s.review.max} 周実施済み（次回: ${reviewMode(s) === "full" ? "フルレビュー" : "軽量レビュー"}）`);
@@ -67,6 +85,11 @@ export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO
 	if (s.bug) lines.push(`バグ: ${s.bug.description}`);
 	if (s.suspended) lines.push(`合流予定の実装フロー: ${describeIssue(s.suspended.issue)}（退避フェーズ ${s.suspended.phase}）`);
 	if (s.escalation) lines.push(`エスカレーション理由: ${s.escalation.detail}`);
+	const pending = (s.specGaps ?? []).filter((g) => !g.answer);
+	if (s.phase === "impl_spec_gap" && pending.length) {
+		lines.push("ユーザーの回答待ちの仕様の確認:");
+		for (const g of pending) lines.push(`- ${g.id} [${g.criterion}] ${g.question}（解釈: ${g.interpretations.join(" / ")}）`);
+	}
 	if (s.phase === "impl_fix_review" && s.review.lastFindings.length) {
 		lines.push("修正すべき前回のレビュー指摘:");
 		for (const f of s.review.lastFindings.filter((f) => cfg.blockingSeverities.includes(f.severity))) {

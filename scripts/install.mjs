@@ -193,7 +193,7 @@ export function install({ project, uninstall = false, dryRun = false, root = har
 
 	// 3. .gitignore
 	const ignoreFile = join(project, ".gitignore");
-	const lines = [".pi/harness/state.json", ".pi/harness/**/logs/"];
+	const lines = [".pi/harness/state.json", ".pi/harness/**/logs/", ".pi/harness/**/test-lock/"];
 	const cloneRel = relative(project, root).split(sep).join("/");
 	const inside = !cloneRel.startsWith("..") && !isAbsolute(cloneRel);
 	if (inside && !isSubmodule(project, root)) lines.push(`${cloneRel}/`);

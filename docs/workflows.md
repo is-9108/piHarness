@@ -14,8 +14,8 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
 | Issue 登録 | req_issues → req_done | 承認済みドキュメント, `hearing.md`, `qa.md` | GitHub Issue（または `docs/issues/*.md`）, `issues.md` |
 | プラン作成 | impl_context → impl_plan → impl_plan_approval | `issue.md` | `plan.md` |
 | TDD 実装 | impl_tdd | `issue.md`, `plan.md` | コード, `implementation.md` |
-| コードレビュー（周回ごと） | impl_review | `issue.md`, `plan.md`, `implementation.md`, 過去の `review-*.md` / `fix-*.md` / `bug-*.md` | `review-N.md` |
-| レビュー指摘修正（周回ごと） | impl_fix_review | `review-N.md`, `plan.md`, `implementation.md` | コード, `fix-N.md` |
+| コードレビュー（周回ごと） | impl_review → impl_spec_gap | `issue.md`, `plan.md`, `implementation.md`, `decisions.md`, 過去の `review-*.md` / `fix-*.md` / `bug-*.md` | `review-N.md`（仕様の確認に回答すると `decisions.md`, `issue-comment-draft.md`） |
+| レビュー指摘修正（周回ごと） | impl_fix_review | `review-N.md`, `decisions.md`, `plan.md`, `implementation.md` | コード, `fix-N.md` |
 | バグ修正 | bug_reproduce → bug_analyze → bug_fix | `escalation-N.md`, 直近のテストログ, `issue.md`, `plan.md`, `implementation.md`, 直近の `review-N.md` | コード, `bug-N.md` |
 
 成果物は作業項目ごとのディレクトリに置かれます（Issue 登録先の要件定義書は `docs/`）。
@@ -27,11 +27,15 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
 ├── req-2026-09-28-温度ロガー/   # 要件定義: qa.md, hearing.md, open-questions.md, issues.md, handoff.md
 └── issue-12/                  # 実装フロー（バグ修正もここ）
     ├── issue.md               # /impl 時に gh issue view で取得した本文
+    ├── baseline.md            # 開始時点のテスト・チェックの結果（もともと失敗しているもの）
     ├── plan.md                # テスト/実装プラン（承認対象）
     ├── implementation.md      # 実装レポート
     ├── review-1.md, fix-1.md, delta-2.diff, review-2.md …
     ├── escalation-1.md, bug-1.md
-    ├── test-changes.md        # テストの削除・スキップ等とその理由（あれば）
+    ├── test-changes.md        # テストの削除・スキップ等・ロック中のテストの変更申請とその理由（あれば）
+    ├── decisions.md           # 仕様の確認（spec_gap）へのユーザーの回答
+    ├── issue-comment-draft.md # Issue へのコメントの下書き（投稿はしない）
+    ├── test-lock/             # ロックしたテストファイルの内容（照合と復元に使う。コミットしない）
     ├── usage.json             # セッションごとのモデル利用量
     ├── handoff.md             # セッション切り替えの履歴（入力/出力の一覧）
     └── logs/test-*.log        # テストの全文ログ
@@ -105,6 +109,7 @@ flowchart LR
 | `impl_plan_approval` | **人間の承認ゲート** | `.pi/harness/` のみ | 承認ダイアログ または `/harness approve` |
 | `impl_tdd` | Red → Green → Refactor | 制限なし | 全テスト green かつ未テスト変更なしで `harness_phase → impl_review` |
 | `impl_review` | 多角的コードレビュー（1 周目フル / 2 周目以降軽量） | `.pi/harness/` のみ | `harness_record_review` |
+| `impl_spec_gap` | **仕様の確認**（ユーザーの回答待ち） | `.pi/harness/` のみ | 回答ダイアログ・`harness_control (answer_spec_gap)`・`/harness answer` |
 | `impl_fix_review` | ブロッキング指摘の修正 | 制限なし | 全テスト green かつ未テスト変更なしで `harness_phase → impl_review` |
 | `impl_done` | 完了（Issue を完了にし、コミット、設定に応じて PR） | `.pi/harness/` のみ | — |
 
@@ -118,6 +123,10 @@ PR 本文・Issue 本文・レビュー記録は日本語のテンプレート�
 - `expect: "red"` の失敗は TDD の Red 確認であり、ループ回数に数えません。Red 期待で合格した場合は「テストが要件を捉えていない」と警告します。
 - `expect: "green"` の **連続失敗** がループ回数です。合格でリセットされます。
 - 連続失敗が `maxTestLoops`（既定 3）に達するとエスカレーションします。
+- **同じ失敗が `sameFailureLimit`（既定 2）回続く**と、上限を待たずにエスカレーションします（理由 `no_progress`）。失敗の指紋は、失敗したコマンドと、出力から取り出した失敗を表す行（時間・行番号・パスなどを取り除いたもの）から作ります。
+- **ベースライン:** `/impl` の開始時点でテストとチェックを実行して `baseline.md` に記録し、開始時点と同じ失敗だけが残っている場合は合格扱いにします。新しい失敗が加わった場合・失敗したテストを出力から特定できない場合・タイムアウトは除外しません。
+- **不安定なテスト:** `expect: "green"` で失敗したコマンドは `flakyRetries`（既定 1）回まで再実行し、合格すれば不安定なテストとして記録します（ループ回数に数えず、PR に載せる）。
+- **テストのロック:** `expect: "red"` の失敗（Red 確認）で、その時点のテストファイルをロックします。Green が合格するまでテストの変更・追加はできません。レビューへ進む時点でもう一度ロックし、完了まで既存のテストは変更できません（新しいテストファイルの追加は可）。`edit` / `write` はブロックし、bash での変更はテスト実行と遷移の前に照合して元に戻します。変更が必要なら `harness_request_test_change` でユーザーの承認を得ます。
 - `expect: "green"` のときは `checkCommands`（lint・型チェックなど）も実行し、すべて合格して初めて合格です。
 - 最後の合格以降にファイルが変更されると（bash 経由を含め、git の作業ツリーの指紋で検知）「未テストの変更あり」となり、レビューへ進めません。
 - レビューへ進む時点で、実装開始時点からの差分にテストの削除・スキップ追加・アサーション減少があれば遷移を止めます。
@@ -131,10 +140,13 @@ PR 本文・Issue 本文・レビュー記録は日本語のテンプレート�
   軽量レビューには前回レビュー以降の差分 `delta-N.diff` と前回の指摘・対応記録だけを渡します（実装レポート等は参照扱い）。
 - レビュー記録は作業ディレクトリの `review-<N>.md` に保存され、各周回のレビュー・修正はそれぞれ新しいセッションで行います。
 - `maxReviewLoops`（既定 3）周してもブロッキング指摘が残るとエスカレーションします。
+- **仕様の確認（spec_gap）:** 受け入れ条件の解釈が分かれる点は、レビュー担当が指摘ではなく `specGaps`（根拠の AC・質問・2 つ以上の解釈）として記録します。`impl_spec_gap` でユーザーに確認し、回答を `decisions.md` に記録します（Issue へのコメントは `issue-comment-draft.md` に下書きだけ）。回答済みの質問は二度聞きません。
+  - ブロッキング指摘もあれば、回答後に指摘修正へ（周回に数える）。
+  - 仕様の確認だけなら、回答後に決まった解釈で差分の全体をもう一度フルレビューします（新しいセッション。周回に数えないよう上限を 1 増やす）。
 
 ## エスカレーション
 
-ループ上限に達すると状態は `escalated` になり、コード変更はブロックされます。UI があればその場で選択肢を表示します。
+ループ上限に達するか、同じ失敗が続いて修正が進まない（`no_progress`）と、状態は `escalated` になり、コード変更はブロックされます。UI があればその場で選択肢を表示します。
 
 | 選択 | 動作 |
 |------|------|

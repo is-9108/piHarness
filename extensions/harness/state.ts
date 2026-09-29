@@ -23,6 +23,7 @@ export type Phase =
 	| "impl_plan_approval"
 	| "impl_tdd"
 	| "impl_review"
+	| "impl_spec_gap"
 	| "impl_fix_review"
 	| "impl_done"
 	// bugfix
@@ -60,6 +61,8 @@ export interface ReviewRound {
 	mode: "full" | "light";
 	blocking: number;
 	total: number;
+	/** このレビューで新しく出た仕様の確認の数 */
+	specGaps?: number;
 	summary: string;
 	at: string;
 }
@@ -71,7 +74,52 @@ export interface IssueRef {
 	file?: string;
 }
 
-export type EscalationReason = "test_loop" | "review_loop" | "bugfix_loop" | "manual";
+export type EscalationReason = "test_loop" | "no_progress" | "review_loop" | "bugfix_loop" | "manual";
+
+/**
+ * 仕様の曖昧さ（spec_gap）。受け入れ条件の解釈が 2 つ以上に分かれ、どちらかで振る舞いが変わるもの。
+ * レビューで見つかったら、修正ループに数えずにすぐユーザーに聞く。回答は decisions.md に記録する。
+ */
+export interface SpecGap {
+	/** Q1, Q2, …（作業項目の中で通し番号） */
+	id: string;
+	/** 根拠となる受け入れ条件・要件（例: AC-2） */
+	criterion: string;
+	question: string;
+	/** 考えられる解釈（2 つ以上） */
+	interpretations: string[];
+	/** 解釈が分かれる箇所（ファイル:行など） */
+	evidence?: string;
+	/** 見つかったレビューの周回 */
+	round: number;
+	answer?: string;
+	answeredAt?: string;
+}
+
+/** 失敗したテスト・チェック（ベースラインの記録と flaky の記録に使う） */
+export interface FailureRecord {
+	command: string;
+	killed: boolean;
+	/** 失敗を表す行（正規化済み） */
+	lines: string[];
+	/** 失敗を表す行が見つかったか（false なら出力の末尾で代用している） */
+	recognized?: boolean;
+}
+
+/** 実装開始時点（ベースブランチ）でのテスト・チェックの結果。もともと失敗しているものは判定から除外する */
+export interface Baseline {
+	at: string;
+	commit?: string;
+	/** 実行したコマンドのうち失敗したもの */
+	failures: FailureRecord[];
+	/** 実行したコマンド */
+	commands: string[];
+}
+
+export interface FlakyRecord extends FailureRecord {
+	at: string;
+	phase: Phase;
+}
 
 export interface Escalation {
 	reason: EscalationReason;
@@ -88,6 +136,7 @@ export interface SuspendedImplement {
 }
 
 import type { GitInfo } from "./git.ts";
+import type { TestLock } from "./testlock.ts";
 
 /**
  * セッションを分ける単位。プロセスが変わるときは新しいセッションを開始し、
@@ -129,7 +178,17 @@ export interface HarnessState {
 		lastLog?: string;
 		/** 直近の green 合格時点の作業ツリーの指紋（bash 経由の変更も検知するため） */
 		fingerprint?: string;
+		/** 連続した green 失敗の指紋（同じ失敗が続けば修正が進んでいないとみなす）。合格でリセット */
+		failureHistory?: string[];
 	};
+	/** 実装開始時点でのテスト・チェックの結果（もともと失敗しているもの） */
+	baseline?: Baseline;
+	/** 再実行で合格した（flaky な）テスト・チェック。ループの回数には数えず、PR に載せる */
+	flaky?: FlakyRecord[];
+	/** テストファイルのロック（Red 確認後〜Green 合格、レビュー以降） */
+	testLock?: TestLock;
+	/** レビューで見つかった仕様の曖昧さと、ユーザーの回答 */
+	specGaps?: SpecGap[];
 	/** Git 連携の情報（作業ブランチ・差分の基準・コミット・PR） */
 	git?: GitInfo;
 	/** ユーザー/エージェントが理由を記録したうえで許可したテストの変更（同じ内容を二度確認しない） */
@@ -142,6 +201,10 @@ export interface HarnessState {
 		lastFindings: ReviewFinding[];
 		/** 直近のレビュー時点の作業ツリーのスナップショット（git tree）。軽量レビューの差分の起点 */
 		snapshot?: string;
+		/** 直近のレビューのブロッキング指摘の数（仕様の確認の回答後に使う） */
+		lastBlocking?: number;
+		/** 次のレビューを差分の全体に対するフルレビューにする（仕様の確認の回答後など） */
+		fullNext?: boolean;
 	};
 	escalation?: Escalation;
 	suspended?: SuspendedImplement;
@@ -153,9 +216,11 @@ export interface HarnessState {
 export interface Limits {
 	maxTestLoops: number;
 	maxReviewLoops: number;
+	/** 同じ失敗の指紋がこの回数続いたら、上限を待たずにエスカレーションする（0 なら判定しない） */
+	sameFailureLimit?: number;
 }
 
-export const DEFAULT_LIMITS: Limits = { maxTestLoops: 3, maxReviewLoops: 3 };
+export const DEFAULT_LIMITS: Limits = { maxTestLoops: 3, maxReviewLoops: 3, sameFailureLimit: 2 };
 
 const LOG_LIMIT = 50;
 
@@ -250,7 +315,9 @@ export function startBugfix(prev: HarnessState, description: string, limits: Lim
 	s.escalation = undefined;
 	s.bug = { description, startedAt: now() };
 	// 直近のテストログはバグ修正セッションの入力になるため引き継ぐ
-	s.test = { failures: 0, max: limits.maxTestLoops, dirty: false, runs: 0, lastLog: prev.test.lastLog };
+	s.test = { failures: 0, max: limits.maxTestLoops, dirty: false, runs: 0, lastLog: prev.test.lastLog, failureHistory: [] };
+	// 再現テストを書くためロックを外す（合流時にロックし直す）
+	s.testLock = undefined;
 	if (!s.suspended) s.git = undefined; // 単独のバグ修正は index 側で差分の基準を設定し直す
 	return withLog(s, `バグ修正フロー開始: ${description || "(説明なし)"}`);
 }
@@ -313,6 +380,8 @@ export function transition(prev: HarnessState, to: Phase, note?: string): Harnes
 	const s = clone(prev);
 	s.phase = to;
 	if (to === "impl_review") s.review.lastFindings = [];
+	// 再現テストを書き直すため、Red 確認時のロックを外す
+	if (to === "bug_reproduce") s.testLock = undefined;
 	return withLog(s, `${prev.phase} → ${to}${note ? `: ${note}` : ""}`);
 }
 
@@ -403,15 +472,20 @@ export type TestOutcome =
 	/** red 期待なのに合格 = テストが要件/バグを捉えていない */
 	| { kind: "red_unexpected_pass" }
 	| { kind: "pass" }
-	| { kind: "fail"; failures: number; remaining: number }
-	| { kind: "escalate"; failures: number };
+	| { kind: "fail"; failures: number; remaining: number; same: number }
+	| { kind: "escalate"; failures: number; reason: "test_loop" | "no_progress" | "bugfix_loop" };
 
+/**
+ * テストの実行結果を記録してループを進める。
+ * failure は green 期待で失敗したときの失敗の指紋。同じ指紋が sameFailureLimit 回続いたら、上限を待たずにエスカレーションする。
+ */
 export function recordTestRun(
 	prev: HarnessState,
 	expect: "red" | "green",
 	passed: boolean,
 	log?: string,
 	fingerprint?: string,
+	failure?: { fingerprint: string; sameFailureLimit: number },
 ): { state: HarnessState; outcome: TestOutcome } {
 	if (!TEST_PHASES.includes(prev.phase)) {
 		throw new TransitionError(`現在のフェーズ (${prev.phase}) ではテストループは実行できません。`);
@@ -431,23 +505,79 @@ export function recordTestRun(
 
 	if (passed) {
 		s.test.failures = 0;
+		s.test.failureHistory = [];
+		// Green が合格したら、Red 確認時のロックを外す（次のテストを書けるようにする。レビュー以降のロックは残す）
+		if (s.testLock?.mode === "green") s.testLock = undefined;
 		return { state: withLog(s, "テスト合格"), outcome: { kind: "pass" } };
 	}
 
 	s.test.failures += 1;
+	const history = [...(s.test.failureHistory ?? []), failure?.fingerprint ?? `unknown-${s.test.runs}`];
+	s.test.failureHistory = history.slice(-10);
+	const limit = failure?.sameFailureLimit ?? 0;
+	const same = sameTail(history);
+	if (failure && limit >= 2 && same >= limit && s.test.failures < s.test.max) {
+		const escalated = escalate(
+			s,
+			"no_progress",
+			`同じ失敗が ${same} 回続きました（修正ループ ${s.test.failures}/${s.test.max}）。同じアプローチでは直らないため、上限を待たずに止めます。`,
+		);
+		return { state: escalated, outcome: { kind: "escalate", failures: s.test.failures, reason: "no_progress" } };
+	}
 	if (s.test.failures >= s.test.max) {
-		const reason: EscalationReason = s.flow === "bugfix" ? "bugfix_loop" : "test_loop";
+		const reason = s.flow === "bugfix" ? "bugfix_loop" : "test_loop";
 		const escalated = escalate(
 			s,
 			reason,
 			`テスト失敗の修正ループが ${s.test.failures} 周しても改善しませんでした。`,
 		);
-		return { state: escalated, outcome: { kind: "escalate", failures: s.test.failures } };
+		return { state: escalated, outcome: { kind: "escalate", failures: s.test.failures, reason } };
 	}
 	return {
-		state: withLog(s, `テスト失敗 (${s.test.failures}/${s.test.max})`),
-		outcome: { kind: "fail", failures: s.test.failures, remaining: s.test.max - s.test.failures },
+		state: withLog(s, `テスト失敗 (${s.test.failures}/${s.test.max}${same >= 2 ? `、同じ失敗 ${same} 回連続` : ""})`),
+		outcome: { kind: "fail", failures: s.test.failures, remaining: s.test.max - s.test.failures, same },
 	};
+}
+
+/** 末尾から同じ値が何回続いているか */
+function sameTail(history: string[]): number {
+	let n = 0;
+	for (let i = history.length - 1; i >= 0 && history[i] === history[history.length - 1]; i--) n++;
+	return n;
+}
+
+// ---------------------------------------------------------------------------
+// ベースライン・flaky・テストのロック
+// ---------------------------------------------------------------------------
+
+export function recordBaseline(prev: HarnessState, baseline: Baseline): HarnessState {
+	const s = clone(prev);
+	s.baseline = baseline;
+	const n = baseline.failures.length;
+	return withLog(s, n ? `ベースライン: ${n} 件のコマンドが開始時点ですでに失敗（判定から除外）` : "ベースライン: すべて合格");
+}
+
+export function recordFlaky(prev: HarnessState, records: FailureRecord[]): HarnessState {
+	if (records.length === 0) return prev;
+	const s = clone(prev);
+	const at = now();
+	s.flaky = [...(s.flaky ?? []), ...records.map((r) => ({ ...r, at, phase: prev.phase }))].slice(-20);
+	return withLog(s, `flaky: ${records.map((r) => r.command).join(", ")}（再実行で合格。ループ回数に数えない）`);
+}
+
+export function lockTests(prev: HarnessState, mode: TestLock["mode"], files: Record<string, string>): HarnessState {
+	const s = clone(prev);
+	s.testLock = { mode, at: now(), files, allowed: [] };
+	return withLog(s, `テストをロック（${mode === "green" ? "Green 合格まで" : "レビュー以降"}、${Object.keys(files).length} ファイル）`);
+}
+
+/** ユーザーが承認したテストファイルの変更を許可する（次にロックし直すまで） */
+export function allowTestChange(prev: HarnessState, files: string[], reason: string): HarnessState {
+	if (!prev.testLock) throw new TransitionError("テストはロックされていません。");
+	const s = clone(prev);
+	s.testLock!.allowed = [...new Set([...s.testLock!.allowed, ...files])];
+	s.testChangeAcks = [...(s.testChangeAcks ?? []), { signature: `lock:${[...files].sort().join(",")}:${now()}`, reason, at: now() }];
+	return withLog(s, `テストの変更をユーザーが承認: ${files.join(", ")}（${reason}）`);
 }
 
 export function acknowledgeTestChanges(prev: HarnessState, signature: string, reason: string): HarnessState {
@@ -474,19 +604,33 @@ export function markDirty(prev: HarnessState): HarnessState {
 export const BLOCKING: Severity[] = ["blocker", "major"];
 
 export function reviewMode(s: HarnessState): "full" | "light" {
-	return s.review.round === 0 ? "full" : "light";
+	return s.review.round === 0 || s.review.fullNext ? "full" : "light";
 }
 
 export type ReviewOutcome =
 	| { kind: "clean"; round: number; nonBlocking: number }
 	| { kind: "fix"; round: number; blocking: number; remaining: number }
-	| { kind: "escalate"; round: number; blocking: number };
+	| { kind: "escalate"; round: number; blocking: number }
+	/** 仕様の曖昧さをユーザーに確認中（回答するまで先へ進まない） */
+	| { kind: "spec_gap"; round: number; blocking: number; questions: number }
+	/** 仕様の確認だけで、ブロッキング指摘は無い → 決まった解釈で差分の全体をもう一度レビューする（周回に数えない） */
+	| { kind: "rereview"; round: number };
+
+/** 仕様の確認の質問（受け入れ条件と質問）の同一性。回答済みの質問を二度聞かない */
+export function specGapKey(g: Pick<SpecGap, "criterion" | "question">): string {
+	return `${g.criterion}\u0000${g.question}`.replace(/\s+/g, "").toLowerCase();
+}
+
+export function pendingSpecGaps(s: HarnessState): SpecGap[] {
+	return (s.specGaps ?? []).filter((g) => !g.answer);
+}
 
 export function recordReview(
 	prev: HarnessState,
 	findings: ReviewFinding[],
 	summary: string,
 	blockingSeverities: Severity[] = BLOCKING,
+	specGaps: Omit<SpecGap, "id" | "round">[] = [],
 ): { state: HarnessState; outcome: ReviewOutcome } {
 	if (prev.phase !== "impl_review") {
 		throw new TransitionError(`レビュー結果は impl_review フェーズでのみ記録できます（現在: ${prev.phase}）。`);
@@ -496,13 +640,66 @@ export function recordReview(
 	const blocking = findings.filter((f) => blockingSeverities.includes(f.severity)).length;
 	s.review.round += 1;
 	s.review.lastFindings = findings;
-	s.review.history.push({ round: s.review.round, mode, blocking, total: findings.length, summary, at: now() });
+	s.review.lastBlocking = blocking;
+	s.review.fullNext = undefined;
 
+	// 回答済み・確認中の質問は二度聞かない
+	const known = new Set((s.specGaps ?? []).map(specGapKey));
+	const fresh: SpecGap[] = [];
+	for (const g of specGaps) {
+		if (g.interpretations.length < 2 || known.has(specGapKey(g))) continue;
+		known.add(specGapKey(g));
+		fresh.push({ ...g, id: `Q${(s.specGaps?.length ?? 0) + fresh.length + 1}`, round: s.review.round });
+	}
+	s.specGaps = [...(s.specGaps ?? []), ...fresh];
+	s.review.history.push({ round: s.review.round, mode, blocking, total: findings.length, summary, at: now(), ...(fresh.length ? { specGaps: fresh.length } : {}) });
+
+	if (fresh.length) {
+		s.phase = "impl_spec_gap";
+		return {
+			state: withLog(s, `レビュー ${s.review.round} 周目: 仕様の確認 ${fresh.length} 件（ブロッキング指摘 ${blocking} 件）→ ユーザーに確認`),
+			outcome: { kind: "spec_gap", round: s.review.round, blocking, questions: fresh.length },
+		};
+	}
+	return settleReview(s, blocking, findings.length);
+}
+
+/** 仕様の確認に回答する。すべて回答したら、保留していたレビューの結果に従って進める */
+export function answerSpecGap(prev: HarnessState, id: string, answer: string): { state: HarnessState; outcome?: ReviewOutcome } {
+	if (prev.phase !== "impl_spec_gap") throw new TransitionError(`仕様の確認待ちではありません（現在: ${prev.phase}）。`);
+	const gap = (prev.specGaps ?? []).find((g) => g.id === id);
+	if (!gap) throw new TransitionError(`仕様の確認 ${id} が見つかりません。`);
+	if (gap.answer) throw new TransitionError(`仕様の確認 ${id} は回答済みです。`);
+	const s = clone(prev);
+	const target = s.specGaps!.find((g) => g.id === id)!;
+	target.answer = answer.trim();
+	target.answeredAt = now();
+	withLog(s, `仕様の確認 ${id} に回答: ${target.answer}`);
+	if (pendingSpecGaps(s).length) return { state: s };
+	const blocking = s.review.lastBlocking ?? 0;
+	if (blocking === 0) {
+		// ブロッキング指摘が無ければ、決まった解釈で差分の全体をもう一度レビューする。周回に数えないよう上限を 1 つ増やす
+		s.phase = "impl_review";
+		s.review.max += 1;
+		s.review.fullNext = true;
+		s.review.lastFindings = [];
+		s.pendingHandoff = { from: "review", to: "review", at: now() };
+		return {
+			state: withLog(s, "仕様の確認に回答 → 決まった解釈でもう一度フルレビュー（周回に数えない）"),
+			outcome: { kind: "rereview", round: s.review.round },
+		};
+	}
+	s.phase = "impl_review";
+	return settleReview(s, blocking, s.review.lastFindings.length);
+}
+
+/** レビュー 1 周分の結果に従って、完了・修正・エスカレーションのいずれかへ進める */
+function settleReview(s: HarnessState, blocking: number, total: number): { state: HarnessState; outcome: ReviewOutcome } {
 	if (blocking === 0) {
 		s.phase = "impl_done";
 		return {
 			state: withLog(s, `レビュー ${s.review.round} 周目: 指摘なし（ブロッキング 0 件）→ 完了`),
-			outcome: { kind: "clean", round: s.review.round, nonBlocking: findings.length },
+			outcome: { kind: "clean", round: s.review.round, nonBlocking: total },
 		};
 	}
 	if (s.review.round >= s.review.max) {
@@ -515,6 +712,7 @@ export function recordReview(
 	}
 	s.phase = "impl_fix_review";
 	s.test.failures = 0;
+	s.test.failureHistory = [];
 	return {
 		state: withLog(s, `レビュー ${s.review.round} 周目: ブロッキング指摘 ${blocking} 件 → 修正`),
 		outcome: { kind: "fix", round: s.review.round, blocking, remaining: s.review.max - s.review.round },
@@ -544,6 +742,7 @@ export function resumeAfterEscalation(prev: HarnessState, limits: Limits): Harne
 	s.flow = esc.flow;
 	s.escalation = undefined;
 	s.test.failures = 0;
+	s.test.failureHistory = [];
 	s.test.max = limits.maxTestLoops;
 	if (esc.reason === "review_loop") {
 		// 追加でレビューループを max 周分許可する（ブロッキング指摘の修正から再開）
@@ -572,7 +771,7 @@ export function rejoinImplement(prev: HarnessState, limits: Limits): HarnessStat
 	s.issue = prev.suspended.issue ?? prev.issue;
 	s.suspended = undefined;
 	s.bug = undefined;
-	s.test = { ...s.test, failures: 0, max: limits.maxTestLoops };
+	s.test = { ...s.test, failures: 0, max: limits.maxTestLoops, failureHistory: [] };
 	s.review.round = 0;
 	s.review.max = limits.maxReviewLoops;
 	s.review.lastFindings = [];
@@ -604,6 +803,7 @@ const PROCESS_OF: Record<Exclude<Phase, "idle" | "escalated">, ProcessKind> = {
 	impl_plan_approval: "plan",
 	impl_tdd: "implement",
 	impl_review: "review",
+	impl_spec_gap: "review",
 	impl_fix_review: "fix",
 	impl_done: "review",
 	bug_reproduce: "bugfix",
@@ -661,6 +861,7 @@ export const PHASE_LABELS: Record<Phase, string> = {
 	impl_plan_approval: "プラン承認待ち",
 	impl_tdd: "TDD 実装",
 	impl_review: "コードレビュー",
+	impl_spec_gap: "仕様の確認待ち",
 	impl_fix_review: "レビュー指摘修正",
 	impl_done: "実装完了",
 	bug_reproduce: "バグ再現",

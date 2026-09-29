@@ -16,7 +16,7 @@ disable-model-invocation: true
 
 ## 準備
 
-1. 入力成果物を読む。判断基準は `issue.md` の受け入れ条件と `plan.md`。
+1. 入力成果物を読む。判断基準は `issue.md` の受け入れ条件と `plan.md`。`decisions.md` があれば、その解釈を正とする。
 2. 差分: 開始メッセージの `git diff <基準>`（未コミット含む）と `git status`（新規ファイル）。周辺コード（呼び出し元・先）も読む。必要ならテストを bash で実行。
 3. `test-changes.md` があれば、テストの削除・スキップ等の**理由が妥当か必ず検証**し、妥当でなければ `tests` の blocker/major にする（「一時的に」は原則不可）。
 
@@ -30,8 +30,13 @@ disable-model-invocation: true
 `blocker` 誤動作・データ破損・脆弱性・何も検証しないテスト / `major` 受け入れ条件未達・重要な異常系の欠落・明確な設計問題・Pi で実用にならない性能 /
 `minor` 動作に影響しない改善 / `nit` 好み。blocker/major が修正必須（`blockingSeverities` で変更可）。根拠のある事実だけを指摘し、重大度を水増ししない。
 
+## 仕様の曖昧さ（specGaps）
+
+受け入れ条件が 2 通り以上に読め、どちらを取るかで実装やテストが変わるものは、推測で指摘にせず `specGaps` に書く（`criterion`: AC の ID、`question`、`interpretations`: 2 つ以上、`evidence`: 箇所）。
+ユーザーにすぐ確認され、修正ループの回数には数えない。`decisions.md` で回答済みの論点は書かない。単なる好みや、受け入れ条件から一意に決まるものは specGaps にしない。
+
 ## 記録
 
-`harness_record_review`（`summary`、`findings`: severity・perspective・title・detail・file・line・suggestion。無ければ `[]`）。**すべて日本語**で書く。`perspective` は上の観点名（英語のキー）を使う。記録の形は拡張がテンプレートで揃える。
+`harness_record_review`（`summary`、`findings`: severity・perspective・title・detail・file・line・suggestion。無ければ `[]`。必要なら `specGaps`）。**すべて日本語**で書く。`perspective` は上の観点名（英語のキー）を使う。記録の形は拡張がテンプレートで揃える。
 修正は別セッションが `review-N.md` だけを見て行うので、`detail` と `suggestion` に根拠・場所・修正案を書く。
 指摘なしで完了した場合: 変更概要・受け入れ条件の充足・テスト結果・残した minor/nit・コミット/PR の結果・利用量を報告し、`/impl next` を案内する。

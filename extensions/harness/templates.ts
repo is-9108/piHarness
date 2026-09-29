@@ -7,7 +7,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { IssueDraft } from "./issues.ts";
-import type { ReviewFinding, ReviewRound } from "./state.ts";
+import type { Baseline, FlakyRecord, ReviewFinding, ReviewRound, SpecGap } from "./state.ts";
 
 export type TemplateName = "issue" | "pr" | "review";
 export const TEMPLATE_NAMES: TemplateName[] = ["issue", "pr", "review"];
@@ -132,6 +132,22 @@ export function findingsMarkdown(findings: ReviewFinding[], blocking: string[]):
 		.join("\n\n");
 }
 
+/** 仕様の確認（spec_gap）の一覧。回答があれば一緒に載せる */
+export function specGapsMarkdown(gaps: SpecGap[]): string {
+	if (gaps.length === 0) return NONE;
+	return gaps
+		.map((g) =>
+			[
+				`### ${g.id}. [${g.criterion}] ${g.question}`,
+				"",
+				...g.interpretations.map((x, i) => `- 解釈 ${i + 1}: ${x}`),
+				...(g.evidence ? [`- 箇所: \`${g.evidence}\``] : []),
+				`- 回答: ${g.answer ?? "（ユーザーの回答待ち）"}`,
+			].join("\n"),
+		)
+		.join("\n\n");
+}
+
 export function reviewVars(args: {
 	round: number;
 	mode: "full" | "light";
@@ -140,6 +156,7 @@ export function reviewVars(args: {
 	summary: string;
 	findings: ReviewFinding[];
 	blocking: string[];
+	specGaps?: SpecGap[];
 }): Record<string, string> {
 	const must = args.findings.filter((f) => args.blocking.includes(f.severity)).length;
 	return {
@@ -147,11 +164,16 @@ export function reviewVars(args: {
 		mode: args.mode === "full" ? "フルレビュー" : "軽量レビュー",
 		target: args.target,
 		date: args.at,
-		verdict: must ? `🔴 修正が必要（修正必須 ${must} 件）` : "✅ 修正必須の指摘なし",
+		verdict: args.specGaps?.length
+			? `❓ 仕様の確認が必要（${args.specGaps.length} 件）${must ? `・🔴 修正必須 ${must} 件` : ""}`
+			: must
+				? `🔴 修正が必要（修正必須 ${must} 件）`
+				: "✅ 修正必須の指摘なし",
 		counts: severityCounts(args.findings, args.blocking),
 		summary: args.summary,
 		perspectives: perspectiveTable(args.findings, args.mode),
 		findings: findingsMarkdown(args.findings, args.blocking),
+		specGaps: specGapsMarkdown(args.specGaps ?? []),
 	};
 }
 
@@ -196,6 +218,9 @@ export function prVars(args: {
 	history: ReviewRound[];
 	remaining: ReviewFinding[];
 	usage?: string;
+	baseline?: Baseline;
+	flaky?: FlakyRecord[];
+	specGaps?: SpecGap[];
 }): Record<string, string> {
 	const impl = args.implementation;
 	const section = (h: string) => extractSection(impl, h) ?? "（実装レポートに記載なし）";
@@ -207,8 +232,14 @@ export function prVars(args: {
 		args.testCommand ? `- テストコマンド: \`${args.testCommand}\`` : "",
 		args.checkCommands.length ? `- チェック: ${args.checkCommands.map((c) => `\`${c}\``).join(", ")}` : "",
 	].filter(Boolean);
+	if (args.baseline?.failures.length) {
+		head.push(`- ベースライン: 開始時点ですでに失敗していたため判定から除外 — ${args.baseline.failures.map((f) => `\`${f.command}\``).join(", ")}`);
+	}
+	const flaky = [...new Set((args.flaky ?? []).map((f) => f.command))];
+	if (flaky.length) head.push(`- ⚠ 不安定（再実行で合格。修正ループに数えていない）: ${flaky.map((c) => `\`${c}\``).join(", ")}`);
 	const detail = extractSection(impl, "テスト結果");
 	const tests = detail ? `${head.join("\n")}\n\n${detail}` : head.join("\n");
+	const answered = (args.specGaps ?? []).filter((g) => g.answer);
 	const rounds = args.history.length
 		? `| 周回 | 種別 | 修正必須 | 全指摘 |\n|---|---|---|---|\n${args.history
 				.map((h) => `| ${h.round} | ${h.mode === "full" ? "フル" : "軽量"} | ${h.blocking} 件 | ${h.total} 件 |`)
@@ -228,6 +259,7 @@ export function prVars(args: {
 		deviations: extractSection(impl, "プランからの逸脱") ?? NONE,
 		reviewFocus: extractSection(impl, "レビューで特に見てほしい点") ?? NONE,
 		limitations: extractSection(impl, "既知の制約") ?? NONE,
+		specDecisions: answered.length ? answered.map((g) => `- [${g.criterion}] ${g.question} → **${g.answer}**`).join("\n") : NONE,
 		usage: args.usage ?? "",
 		closes: args.issue?.number ? `Closes #${args.issue.number}` : "",
 	};

@@ -24,6 +24,7 @@ function writableRoots(phase: Phase, p: GuardPaths): string[] | undefined {
 		case "impl_plan":
 		case "impl_plan_approval":
 		case "impl_review":
+		case "impl_spec_gap":
 		case "impl_done":
 		case "escalated":
 		case "bug_analyze":
@@ -54,6 +55,7 @@ const WHY: Partial<Record<Phase, string>> = {
 	impl_plan: "テスト/実装プランが承認されるまでコードは変更できません。",
 	impl_plan_approval: "テスト/実装プランの承認待ちです。",
 	impl_review: "レビュー中はコードを変更できません。harness_record_review で指摘を記録してから修正してください。",
+	impl_spec_gap: "仕様の確認（ユーザーの回答）待ちです。",
 	impl_done: "実装フローは完了しています。",
 	escalated: "ユーザーへエスカレーション中です。ユーザーの判断を待ってください。",
 	bug_analyze: "原因分析中はコードを変更できません。分析後 harness_phase で bug_fix へ進んでください。",

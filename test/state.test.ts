@@ -21,6 +21,13 @@ import {
 	TransitionError,
 	markDirty,
 	type HarnessState,
+	allowTestChange,
+	answerSpecGap,
+	lockTests,
+	pendingSpecGaps,
+	processOf,
+	recordFlaky,
+	withHandoff,
 } from "../extensions/harness/state.ts";
 
 const L = DEFAULT_LIMITS;
@@ -105,7 +112,7 @@ describe("実装フロー: テストループ", () => {
 	it("green 失敗が 3 回連続でエスカレーション", () => {
 		let s = toTdd();
 		let r = recordTestRun(s, "green", false);
-		assert.deepEqual(r.outcome, { kind: "fail", failures: 1, remaining: 2 });
+		assert.deepEqual(r.outcome, { kind: "fail", failures: 1, remaining: 2, same: 1 });
 		r = recordTestRun(r.state, "green", false);
 		assert.equal(r.outcome.kind, "fail");
 		r = recordTestRun(r.state, "green", false);
@@ -255,5 +262,130 @@ describe("バグ修正フロー", () => {
 	it("原因分析フェーズからコード修正を飛ばして完了できない", () => {
 		const s = transition(startBugfix(initialState(), "b", L, ".pi/harness/bug-x"), "bug_analyze");
 		assert.throws(() => transition(s, "bug_done"), TransitionError);
+	});
+});
+
+describe("同じ失敗での早期エスカレーション", () => {
+	const same = { fingerprint: "fp-a", sameFailureLimit: 2 };
+
+	it("同じ失敗が 2 回続いたら、上限（3 回）を待たずに no_progress でエスカレーション", () => {
+		let r = recordTestRun(toTdd(), "green", false, undefined, undefined, same);
+		assert.equal(r.outcome.kind, "fail");
+		r = recordTestRun(r.state, "green", false, undefined, undefined, same);
+		assert.deepEqual(r.outcome, { kind: "escalate", failures: 2, reason: "no_progress" });
+		assert.equal(r.state.escalation?.reason, "no_progress");
+		assert.equal(r.state.escalation?.phase, "impl_tdd");
+	});
+
+	it("失敗の内容が変わっていれば続けられる。合格・継続で履歴をリセットする", () => {
+		let r = recordTestRun(toTdd(), "green", false, undefined, undefined, same);
+		r = recordTestRun(r.state, "green", false, undefined, undefined, { ...same, fingerprint: "fp-b" });
+		assert.deepEqual(r.outcome, { kind: "fail", failures: 2, remaining: 1, same: 1 });
+		const passed = recordTestRun(r.state, "green", true).state;
+		assert.deepEqual(passed.test.failureHistory, []);
+		r = recordTestRun(passed, "green", false, undefined, undefined, same);
+		r = recordTestRun(r.state, "green", false, undefined, undefined, same);
+		const resumed = resumeAfterEscalation(r.state, L);
+		assert.equal(resumed.phase, "impl_tdd");
+		assert.deepEqual(resumed.test.failureHistory, []);
+	});
+
+	it("sameFailureLimit が 0 なら判定しない。3 回目は通常の上限で test_loop", () => {
+		let s = toTdd();
+		for (let i = 0; i < 2; i++) s = recordTestRun(s, "green", false, undefined, undefined, { ...same, sameFailureLimit: 0 }).state;
+		assert.equal(s.phase, "impl_tdd");
+		const r = recordTestRun(s, "green", false, undefined, undefined, { ...same, sameFailureLimit: 0 });
+		assert.deepEqual(r.outcome, { kind: "escalate", failures: 3, reason: "test_loop" });
+	});
+
+	it("flaky の記録はループの回数に影響しない", () => {
+		const s = recordFlaky(toTdd(), [{ command: "npm test", killed: false, lines: ["✖ x"] }]);
+		assert.equal(s.flaky?.length, 1);
+		assert.equal(s.flaky?.[0].phase, "impl_tdd");
+		assert.equal(s.test.failures, 0);
+	});
+});
+
+describe("テストのロックの状態", () => {
+	it("Green のロックは合格で外れ、レビューのロックは残る", () => {
+		let s = lockTests(toTdd(), "green", { "a.test.ts": "h" });
+		s = recordTestRun(s, "green", false).state;
+		assert.equal(s.testLock?.mode, "green", "失敗では外れない");
+		s = recordTestRun(s, "green", true).state;
+		assert.equal(s.testLock, undefined);
+		s = lockTests(transition(s, "impl_review"), "review", { "a.test.ts": "h" });
+		assert.equal(s.testLock?.mode, "review");
+	});
+
+	it("バグ修正の開始と、再現テストへ戻るときはロックを外す", () => {
+		let s = lockTests(toReview(), "review", { "a.test.ts": "h" });
+		s = startBugfix(escalate(s, "manual", "x"), "bug", L, ".pi/harness/bug-x");
+		assert.equal(s.testLock, undefined);
+		s = lockTests(transition(s, "bug_analyze"), "green", { "bug.test.ts": "h" });
+		s = transition(s, "bug_reproduce");
+		assert.equal(s.testLock, undefined);
+	});
+
+	it("ユーザーが承認したテストは、ロックし直すまで変更できる（理由は PR に載る）", () => {
+		assert.throws(() => allowTestChange(toTdd(), ["a.test.ts"], "r"), /ロックされていません/);
+		let s = lockTests(toTdd(), "green", { "a.test.ts": "h" });
+		s = allowTestChange(s, ["a.test.ts"], "[AC-2] 期待値が受け入れ条件と逆");
+		assert.deepEqual(s.testLock?.allowed, ["a.test.ts"]);
+		assert.equal(s.testChangeAcks.at(-1)?.reason, "[AC-2] 期待値が受け入れ条件と逆");
+		s = lockTests(s, "green", { "a.test.ts": "h2" });
+		assert.deepEqual(s.testLock?.allowed, []);
+	});
+});
+
+describe("仕様の確認（spec_gap）", () => {
+	const gap = { criterion: "AC-2", question: "空白だけの入力はどう扱いますか？", interpretations: ["空文字として扱う", "エラーにする"] };
+
+	it("ブロッキング指摘が無ければ、回答後に決まった解釈でもう一度フルレビューする（周回に数えない）", () => {
+		let r = recordReview(toReview(), [nit], "s", undefined, [gap]);
+		assert.deepEqual(r.outcome, { kind: "spec_gap", round: 1, blocking: 0, questions: 1 });
+		assert.equal(r.state.phase, "impl_spec_gap");
+		assert.equal(processOf(r.state), "review");
+		assert.deepEqual(pendingSpecGaps(r.state).map((g) => g.id), ["Q1"]);
+		const a = answerSpecGap(r.state, "Q1", "空文字として扱う");
+		assert.deepEqual(a.outcome, { kind: "rereview", round: 1 });
+		assert.equal(a.state.phase, "impl_review");
+		assert.equal(a.state.review.max, L.maxReviewLoops + 1);
+		assert.equal(reviewMode(a.state), "full", "差分の全体をフルレビュー");
+		assert.deepEqual(a.state.pendingHandoff?.to, "review", "新しいセッションでレビューし直す");
+		assert.equal(withHandoff(r.state, a.state).pendingHandoff?.to, "review");
+		// 同じ質問は二度聞かない
+		r = recordReview({ ...a.state, pendingHandoff: undefined }, [], "s", undefined, [{ ...gap, question: " 空白だけの入力は どう扱いますか？" }]);
+		assert.equal(r.outcome.kind, "clean");
+		assert.equal(r.state.review.fullNext, undefined);
+	});
+
+	it("ブロッキング指摘があれば、回答後に指摘修正へ進む（周回に数える）", () => {
+		const r = recordReview(toReview(), [blocker], "s", undefined, [gap, { ...gap, criterion: "AC-3", question: "上限は？" }]);
+		let a = answerSpecGap(r.state, "Q1", "エラーにする");
+		assert.equal(a.outcome, undefined, "未回答が残っている間は進まない");
+		assert.equal(a.state.phase, "impl_spec_gap");
+		assert.throws(() => answerSpecGap(a.state, "Q1", "x"), /回答済み/);
+		a = answerSpecGap(a.state, "Q2", "100 件");
+		assert.equal(a.outcome?.kind, "fix");
+		assert.equal(a.state.phase, "impl_fix_review");
+		assert.equal(a.state.review.max, L.maxReviewLoops);
+	});
+
+	it("最後の周回でブロッキング指摘が残れば、回答後にエスカレーション", () => {
+		let s = toReview();
+		for (let i = 0; i < 2; i++) {
+			s = recordReview(s, [blocker], "s").state;
+			s = transition(recordTestRun(s, "green", true).state, "impl_review");
+		}
+		const r = recordReview(s, [blocker], "s", undefined, [gap]);
+		assert.equal(r.state.phase, "impl_spec_gap");
+		const a = answerSpecGap(r.state, "Q1", "x");
+		assert.equal(a.outcome?.kind, "escalate");
+		assert.equal(a.state.escalation?.reason, "review_loop");
+	});
+
+	it("解釈が 1 つしかないものは質問にしない", () => {
+		const r = recordReview(toReview(), [], "s", undefined, [{ ...gap, interpretations: ["一つだけ"] }]);
+		assert.equal(r.outcome.kind, "clean");
 	});
 });

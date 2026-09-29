@@ -42,7 +42,7 @@ const STEPS: Record<"requirements" | "implement" | "bugfix", Step[]> = {
 		{ label: "プラン", phases: ["impl_plan"] },
 		{ label: "承認", phases: ["impl_plan_approval"] },
 		{ label: "TDD 実装", phases: ["impl_tdd"] },
-		{ label: "レビュー", phases: ["impl_review", "impl_fix_review"] },
+		{ label: "レビュー", phases: ["impl_review", "impl_spec_gap", "impl_fix_review"] },
 		{ label: "完了", phases: ["impl_done"] },
 	],
 	bugfix: [
@@ -65,6 +65,7 @@ const NEXT: Partial<Record<Phase, string>> = {
 	impl_plan_approval: "あなたの承認待ち",
 	impl_tdd: "Red → Green → Refactor を繰り返す → 実装レポート",
 	impl_review: "レビューして結果を記録",
+	impl_spec_gap: "仕様の確認: あなたの回答待ち",
 	impl_fix_review: "指摘を修正 → 全テスト green → fix レポート",
 	impl_done: "完了（コミット・PR を確認）",
 	bug_reproduce: "再現テストを書いて失敗を確認",
@@ -94,7 +95,12 @@ export function stepsLine(s: HarnessState, paint: Paint = plain): string {
 	const parts = steps.map((st, i) => {
 		let label = st.label;
 		if (st.label === "レビュー" && (s.review.round > 0 || phase === "impl_review" || phase === "impl_fix_review")) {
-			label = phase === "impl_fix_review" ? `レビュー ${s.review.round}/${s.review.max}（修正中）` : `レビュー ${s.review.round + (i === current ? 1 : 0)}/${s.review.max}`;
+			label =
+				phase === "impl_fix_review"
+					? `レビュー ${s.review.round}/${s.review.max}（修正中）`
+					: phase === "impl_spec_gap"
+						? `レビュー ${s.review.round}/${s.review.max}（仕様の確認中）`
+						: `レビュー ${s.review.round + (i === current ? 1 : 0)}/${s.review.max}`;
 		}
 		if (i < current || (i === current && st.label === "完了")) return paint("success", `✓ ${label}`);
 		if (i === current) return paint(s.phase === "escalated" ? "error" : "accent", `${s.phase === "escalated" ? "⚠" : "▶"} ${label}`);
@@ -169,6 +175,8 @@ export function describeActivity(toolName: string, args: Record<string, unknown>
 			return "⏸ あなたの承認待ち";
 		case "harness_record_review":
 			return "📝 レビュー結果を記録中";
+		case "harness_request_test_change":
+			return "⏸ テストの変更の承認待ち";
 		case "harness_create_issues":
 			return "📋 Issue を登録中";
 		case "harness_phase":

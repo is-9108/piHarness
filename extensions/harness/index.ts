@@ -22,10 +22,22 @@ import { checkBash, checkWrite, type GuardPaths, isHarnessFile, isInside, STATE_
 import { buildContext } from "./guidance.ts";
 import { emptyRegistry, type IssueRegistry, nextIssue, progressTable, registerIssues, setStatus } from "./progress.ts";
 import { analyzeTestDiff, findingsMarkdown, signature as integritySignature } from "./integrity.ts";
+import { analyzeOutput, type CommandFailure, failureFingerprint, onlyBaselineFailures } from "./failures.ts";
+import {
+	checkLockedWrite,
+	findViolations,
+	hasViolations,
+	listTestFiles,
+	restoreFiles,
+	snapshotFiles,
+	toRel,
+	violationsMarkdown,
+} from "./testlock.ts";
 import { commitAll, currentBranch, defaultBranch, diffTrees, snapshotTree, diffSince, dirtyFiles, fingerprint, type GitInfo, headSha, isGitRepo, prepareBranch, pullBaseBranch, branchName, type Run } from "./git.ts";
 import { type UsageFile, sumSession, summarize as summarizeUsage, upsertSession, usageMarkdown } from "./usage.ts";
 import {
 	artifactPaths,
+	baselineMarkdown,
 	escalationMarkdown,
 	KICKOFF_MARKER,
 	handoffRecord,
@@ -47,6 +59,14 @@ import {
 } from "./issues.ts";
 import {
 	acknowledgeTestChanges,
+	allowTestChange,
+	answerSpecGap,
+	lockTests,
+	pendingSpecGaps,
+	recordBaseline,
+	recordFlaky,
+	type ReviewOutcome,
+	type SpecGap,
 	type ApprovalDecision,
 	type ApprovalKind,
 	isAcknowledged,
@@ -350,7 +370,10 @@ export default function piHarness(pi: ExtensionAPI): void {
 			return lines.join("\n");
 		}
 		const run = gitRun(ctx);
-		const excludes = cfg.git.commitArtifacts ? gitExcludes(ctx, cfg).filter((e) => e !== cfg.workDir) : gitExcludes(ctx, cfg);
+		// 成果物をコミットする設定でも、テストのロックの記録（内容のコピー）はコミットしない
+		const excludes = cfg.git.commitArtifacts
+			? [...gitExcludes(ctx, cfg).filter((e) => e !== cfg.workDir), `${cfg.workDir}/*/test-lock/*`]
+			: gitExcludes(ctx, cfg);
 		const title = `${issue?.title ?? "piHarness 実装"}${issue?.number ? ` (#${issue.number})` : ""}`;
 		let next: GitInfo = { ...git };
 		if (cfg.git.commit && !git.commit) {
@@ -425,6 +448,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 				history: state.review.history,
 				remaining: state.review.lastFindings,
 				usage: usageSummaryLine(ctx),
+				baseline: state.baseline,
+				flaky: state.flaky,
+				specGaps: state.specGaps,
 			}),
 		});
 		const args = ["pr", "create", "--base", git.baseBranch, "--head", git.branch, "--title", title, "--body", body];
@@ -518,6 +544,163 @@ export default function piHarness(pi: ExtensionAPI): void {
 			true,
 		);
 		setState(acknowledgeTestChanges(state, sig, reason.trim()), ctx);
+	}
+
+	// -----------------------------------------------------------------------
+	// テストの実行・ベースライン・テストのロック
+	// -----------------------------------------------------------------------
+
+	type CommandRun = { label: string; command: string; code: number; killed: boolean; secs: string; output: string };
+
+	async function runCommand(ctx: ExtensionContext, cfg: HarnessConfig, c: { label: string; command: string }, signal?: AbortSignal): Promise<CommandRun> {
+		const started = Date.now();
+		const result = await pi.exec("bash", ["-lc", c.command], { cwd: ctx.cwd, timeout: cfg.testTimeoutSec * 1000, signal });
+		return {
+			...c,
+			code: result.code,
+			killed: result.killed,
+			secs: ((Date.now() - started) / 1000).toFixed(1),
+			output: `${result.stdout}\n${result.stderr}`,
+		};
+	}
+
+	const commandOk = (r: CommandRun) => r.code === 0 && !r.killed;
+	const toFailure = (ctx: { cwd: string }, r: CommandRun): CommandFailure => ({ command: r.command, killed: r.killed, ...analyzeOutput(r.output, ctx.cwd) });
+	const logText = (runs: CommandRun[]) => runs.map((r) => `\n$ ${r.command}\n# exit=${r.code} killed=${r.killed} ${r.secs}s\n\n${r.output}`).join("\n");
+
+	/**
+	 * 実装開始時点でテストとチェックを実行し、もともと失敗しているものを記録する（以降、同じ失敗だけなら判定から除外する）。
+	 * 戻り値はユーザー向けの報告文。
+	 */
+	async function runBaseline(ctx: ExtensionContext, cfg: HarnessConfig): Promise<string> {
+		if (!cfg.baseline || !cfg.testCommand || !state.itemDir) return "";
+		setActivity(ctx, "🧪 ベースラインを確認中（開始時点のテストとチェック）");
+		const commands = [{ label: "テスト", command: cfg.testCommand }, ...cfg.checkCommands.map((c) => ({ label: "チェック", command: c }))];
+		const runs: CommandRun[] = [];
+		try {
+			for (const c of commands) runs.push(await runCommand(ctx, cfg, c));
+		} finally {
+			setActivity(ctx, undefined);
+		}
+		const p = pathsOf(state);
+		const log = writeItemFile(ctx, join(p.logs, `baseline-${timestamp()}.log`), `# baseline\n${logText(runs)}`);
+		const baseline = {
+			at: new Date().toISOString(),
+			commit: state.git?.base,
+			commands: commands.map((c) => c.command),
+			failures: runs.filter((r) => !commandOk(r)).map((r) => toFailure(ctx, r)),
+		};
+		setState(recordBaseline(state, baseline), ctx);
+		writeItemFile(ctx, p.baseline, baselineMarkdown(baseline, log));
+		return baseline.failures.length
+			? `⚠ 開始時点ですでに失敗しているもの: ${baseline.failures.map((f) => f.command).join(" / ")}（同じ失敗だけが残る場合は判定から除外します。詳細: ${p.baseline}）`
+			: "ベースライン: 開始時点のテストとチェックはすべて合格。";
+	}
+
+	async function currentTestFiles(ctx: ExtensionContext, cfg: HarnessConfig): Promise<string[]> {
+		const run = gitRun(ctx);
+		return listTestFiles((await isGitRepo(run)) ? run : undefined, ctx.cwd, gitExcludes(ctx, cfg));
+	}
+
+	/** 現在のテストファイルをロックする（内容は作業ディレクトリの test-lock/ に保存）。戻り値はロックしたファイル数 */
+	async function lockTestFiles(ctx: ExtensionContext, cfg: HarnessConfig, mode: "green" | "review"): Promise<number | undefined> {
+		if (!cfg.testLock || !state.itemDir) return undefined;
+		const hashes = snapshotFiles(ctx.cwd, await currentTestFiles(ctx, cfg), pathsOf(state).testLock);
+		setState(lockTests(state, mode, hashes), ctx);
+		return Object.keys(hashes).length;
+	}
+
+	/**
+	 * bash など edit / write 以外で、ロック中のテストファイルが変更されていないかを確かめる。
+	 * 変更・削除されていればロック時の内容に戻し、エラーにする（テストの実行や遷移はしない）。
+	 */
+	async function enforceTestLock(ctx: ExtensionContext, cfg: HarnessConfig): Promise<void> {
+		const lock = state.testLock;
+		if (!cfg.testLock || !lock || !state.itemDir) return;
+		const v = findViolations(ctx.cwd, lock, lock.mode === "green" ? await currentTestFiles(ctx, cfg) : []);
+		if (!hasViolations(v)) return;
+		const { restored, failed } = restoreFiles(ctx.cwd, lock, [...v.changed, ...v.deleted], pathsOf(state).testLock);
+		if (TEST_PHASES.includes(state.phase)) setState(markDirty(state), ctx);
+		throw new Error(
+			`[piHarness] ロック中のテストファイルが変更されていました:\n${violationsMarkdown(v)}\n\n` +
+				(restored.length ? `ロック時の内容に戻しました: ${restored.join(", ")}\n` : "") +
+				(failed.length ? `⚠ 元に戻せませんでした（手で戻してください）: ${failed.join(", ")}\n` : "") +
+				(v.added.length ? `Green が合格するまで新しいテストファイルは追加できません。削除してください: ${v.added.join(", ")}\n` : "") +
+				"テストではなく実装で合格させてください。テストのほうが誤っている場合は harness_request_test_change でユーザーの承認を得てください。",
+		);
+	}
+
+	/** レビューへ進む時点のテストをロックし直す（レビュー・指摘修正の間は変更できない） */
+	async function lockForReview(ctx: ExtensionContext, cfg: HarnessConfig): Promise<string> {
+		const n = await lockTestFiles(ctx, cfg, "review");
+		return n === undefined ? "" : `レビュー時点のテスト（${n} ファイル）をロックしました。`;
+	}
+
+	// -----------------------------------------------------------------------
+	// 仕様の確認（spec_gap）
+	// -----------------------------------------------------------------------
+
+	/** 回答を記録する: state.json、decisions.md（以降のレビュー・修正の入力）、Issue へのコメントの下書き（投稿はしない） */
+	function applySpecAnswer(ctx: ExtensionContext, gap: SpecGap, answer: string): ReviewOutcome | undefined {
+		const { state: next, outcome } = answerSpecGap(state, gap.id, answer);
+		const p = pathsOf(state);
+		setState(next, ctx);
+		writeItemFile(
+			ctx,
+			p.decisions,
+			`${existsSync(join(ctx.cwd, p.decisions)) ? "" : "# 仕様の確認への回答\n\nレビュー中に見つかった仕様の曖昧な点と、ユーザーが決めた解釈です。以降のレビュー・修正はこの解釈を正とします。\n"}` +
+				`\n## ${gap.id}（${gap.criterion}）\n\n**質問:** ${gap.question}\n\n${gap.interpretations.map((x, i) => `- 解釈 ${i + 1}: ${x}`).join("\n")}\n\n**決定:** ${answer}（${new Date().toISOString()}）\n`,
+			true,
+		);
+		writeItemFile(
+			ctx,
+			p.issueCommentDraft,
+			`${existsSync(join(ctx.cwd, p.issueCommentDraft)) ? "" : `<!-- piHarness が作成した ${describeIssue(state.issue)} へのコメントの下書きです。投稿はしていません。必要なら確認して Issue に投稿してください。 -->\n\n### 仕様の確認（実装中のレビューで決定）\n`}` +
+				`\n- **${gap.criterion}**: ${gap.question}\n  - 決定: ${answer}\n`,
+			true,
+		);
+		return outcome;
+	}
+
+	/** 回答待ちの仕様の確認をダイアログで聞く。すべて回答されたら、保留していたレビューの結果に従って進める */
+	async function askSpecGaps(ctx: ExtensionContext): Promise<ToolText> {
+		let outcome: ReviewOutcome | undefined;
+		if (ctx.hasUI) {
+			for (const g of pendingSpecGaps(state)) {
+				const free = "（自由入力で回答する）";
+				const title = `❓ 仕様の確認 ${g.id}（${g.criterion}）\n${g.question}${g.evidence ? `\n箇所: ${g.evidence}` : ""}`;
+				const choice = await ctx.ui.select(title, [...g.interpretations, free]);
+				const answer = (choice === free ? await ctx.ui.input(g.question) : choice)?.trim();
+				if (!answer) break;
+				outcome = applySpecAnswer(ctx, g, answer);
+			}
+		}
+		const pending = pendingSpecGaps(state);
+		if (pending.length || !outcome) {
+			return reply(
+				`仕様の確認 ${pending.length} 件がユーザーの回答待ちです（修正ループの回数には数えません）:\n` +
+					pending.map((g) => `- ${g.id} [${g.criterion}] ${g.question}\n  ${g.interpretations.map((x, i) => `解釈 ${i + 1}: ${x}`).join(" / ")}`).join("\n") +
+					"\n\n自分で解釈を決めず、作業を止めて質問と解釈の候補をユーザーに示してください。" +
+					"ユーザーが回答したら harness_control（action: answer_spec_gap）で回答ダイアログを出して確定します（/harness answer <回答> でも可）。",
+				true,
+			);
+		}
+		return specGapSettled(ctx, outcome);
+	}
+
+	/** 仕様の確認にすべて回答した後の案内 */
+	async function specGapSettled(ctx: ExtensionContext, outcome: ReviewOutcome): Promise<ToolText> {
+		const p = pathsOf(state);
+		switch (outcome.kind) {
+			case "rereview":
+				return reply(`仕様の確認に回答しました（記録: ${p.decisions}）。決まった解釈で差分の全体をもう一度フルレビューします（新しいセッション。レビューの周回には数えません）。`);
+			case "fix":
+				return reply(`仕様の確認に回答しました（記録: ${p.decisions}）。ブロッキング指摘 ${outcome.blocking} 件の修正は新しいセッションで行います（レビューループ残り ${outcome.remaining} 周）。`);
+			case "escalate":
+				return handleEscalation(ctx, `レビューループが上限 (${outcome.round} 周) に達してもブロッキング指摘 ${outcome.blocking} 件が残っています`);
+			default:
+				return reply(`仕様の確認に回答しました（記録: ${p.decisions}）。`);
+		}
 	}
 
 	/**
@@ -796,6 +979,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			const d = checkWrite(state, path, guardPaths(ctx, cfg));
 			if (d.block) return { block: true, reason: d.reason };
+			if (isActive(state) && state.itemDir && path) {
+				if (isInside(path, pathsOf(state).testLock, ctx.cwd)) {
+					return { block: true, reason: "[piHarness] テストのロックの記録（test-lock/）は編集できません。" };
+				}
+				if (cfg.testLock && !isHarnessFile(path, guardPaths(ctx, cfg))) {
+					const l = checkLockedWrite(state.testLock, path, ctx.cwd);
+					if (l.block) return { block: true, reason: l.reason };
+				}
+			}
 		}
 		if (!isActive(state)) return;
 		if (compactRequested && !state.pendingHandoff) {
@@ -866,14 +1058,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 		description:
 			"ユーザーの自然言語の依頼から piHarness のフローを開始・操作する。実行前に必ずユーザーへ確認ダイアログを出し、承認された場合だけ実行する。" +
 			"action: start_requirements（新しい機能・アプリを作りたい、要件を固めたい）/ start_implement（Issue を実装したい。issue に番号・URL・docs/issues/*.md、指定が無ければ next = 次に着手できる Issue）/ " +
-			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ continue_loop（エスカレーション後にループを続けたい）/ rejoin（バグ修正を実装フローへ合流させたい）/ abort（フローをやめたい）。",
+			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ continue_loop（エスカレーション後にループを続けたい）/ rejoin（バグ修正を実装フローへ合流させたい）/ " +
+			"answer_spec_gap（仕様の確認に回答したい。回答ダイアログを出す）/ abort（フローをやめたい）。",
 		promptSnippet: "Start or control a piHarness flow from the user's natural-language request (always confirmed by the user)",
 		promptGuidelines: [
 			"ユーザーが作りたいもの・実装したい Issue・直したい不具合を話したら、自分で作業を始めず harness_control で対応するフローの開始を提案する（ツールがユーザーに確認する）。",
 			"依頼の意図がどのフローか曖昧なときは、harness_control を呼ぶ前にユーザーに聞く。ユーザーが取り消したら、無理に進めず意図を確認する。",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "continue_loop", "rejoin", "abort"] as const),
+			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "continue_loop", "rejoin", "answer_spec_gap", "abort"] as const),
 			request: Type.String({ description: "ユーザーの依頼の要約（確認ダイアログに表示する）" }),
 			topic: Type.Optional(Type.String({ description: "start_requirements: 作りたいもののテーマ" })),
 			issue: Type.Optional(Type.String({ description: "start_implement: Issue 番号・URL・docs/issues/*.md・next" })),
@@ -885,6 +1078,13 @@ export default function piHarness(pi: ExtensionAPI): void {
 				throw new Error("ユーザーの確認が必要なため、確認ダイアログを出せない環境では実行できません。/req・/impl・/bugfix・/harness コマンドを案内してください。");
 			}
 			const cfg = cfgOf(ctx);
+			if (params.action === "answer_spec_gap") {
+				// 回答ダイアログそのものがユーザーの確認になる
+				if (state.phase !== "impl_spec_gap") return reply("仕様の確認（ユーザーの回答）待ちではありません。");
+				const result = await askSpecGaps(ctx);
+				if (state.pendingHandoff) forceHandoff = true;
+				return result;
+			}
 			const inProgress = isActive(state) && !["impl_done", "req_done", "bug_done"].includes(state.phase);
 			const current = inProgress ? `${state.flow} / ${PHASE_LABELS[state.phase]}${state.issue ? `（${describeIssue(state.issue)}）` : ""}` : "";
 			let title: string;
@@ -941,6 +1141,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 					lines.push(`合流先: ${describeIssue(state.suspended.issue)}`, "新しいセッションでフルレビューから再開します。");
 					run = async () => {
 						setState(rejoinImplement(state, limitsOf(cfg)), ctx);
+						await lockForReview(ctx, cfg);
 						return { ok: true, message: "実装フローへ合流します。" };
 					};
 					break;
@@ -1021,6 +1222,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 			if (!isActive(state)) throw new Error("アクティブなフローがありません。");
 			const cfg = cfgOf(ctx);
 			const gated = isTestGatedTransition(state.phase, params.to);
+			// bash などでロック中のテストが変更されていれば、元に戻してから止める
+			if (gated) await enforceTestLock(ctx, cfg);
 			// 合格時点から作業ツリーが変わっていれば（bash 経由の変更を含む）未テスト扱いにする
 			if (gated && state.test.fingerprint && !state.test.dirty) {
 				const current = await fingerprint(gitRun(ctx), ctx.cwd, gitExcludes(ctx, cfg));
@@ -1058,9 +1261,12 @@ export default function piHarness(pi: ExtensionAPI): void {
 				}
 				if (!rejoin) return reply("バグ修正完了。ユーザーは合流を保留しました。状況を報告して待機してください。", true);
 				setState(rejoinImplement(state, limitsOf(cfgOf(ctx))), ctx);
-				return reply(`バグ修正完了 → 実装フロー（${describeIssue(state.issue)}）へ合流します。合流後はフルレビューから再開します。`);
+				const locked = await lockForReview(ctx, cfg);
+				return reply(`バグ修正完了 → 実装フロー（${describeIssue(state.issue)}）へ合流します。合流後はフルレビューから再開します。${locked}`);
 			}
-			return reply(`フェーズを ${state.phase}（${PHASE_LABELS[state.phase]}）へ遷移しました。`);
+			// レビューへ進む時点のテストをロックする（レビュー・指摘修正の間は書き換えられない）
+			const locked = state.phase === "impl_review" ? await lockForReview(ctx, cfg) : "";
+			return reply(`フェーズを ${state.phase}（${PHASE_LABELS[state.phase]}）へ遷移しました。${locked}`);
 		},
 	});
 
@@ -1163,36 +1369,60 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			if (!command) throw new Error("テストコマンドが未設定です。.pi/harness.json の testCommand を設定してください。");
 
+			// bash などでロック中のテストが変更されていれば、元に戻してから止める
+			await enforceTestLock(ctx, cfg);
+
 			// green 判定ではテストに加えて lint・型チェックなどのチェックも合格を必須にする
 			const commands = [
 				{ label: "テスト", command },
 				...(params.expect === "green" ? cfg.checkCommands.map((c) => ({ label: "チェック", command: c })) : []),
 			];
-			const runs: { label: string; command: string; code: number; killed: boolean; secs: string; output: string }[] = [];
-			for (const c of commands) {
-				const started = Date.now();
-				const result = await pi.exec("bash", ["-lc", c.command], { cwd: ctx.cwd, timeout: cfg.testTimeoutSec * 1000, signal });
-				runs.push({
-					...c,
-					code: result.code,
-					killed: result.killed,
-					secs: ((Date.now() - started) / 1000).toFixed(1),
-					output: `${result.stdout}\n${result.stderr}`,
-				});
+			type Judged = CommandRun & { known?: boolean; flaky?: boolean; retries?: CommandRun[] };
+			const runs: Judged[] = [];
+			for (const c of commands) runs.push(await runCommand(ctx, cfg, c, signal));
+
+			// 開始時点ですでに失敗していたもの（ベースライン）と同じ失敗だけなら、判定から除外する
+			const baselineOf = (r: CommandRun) => state.baseline?.failures.find((f) => f.command === r.command);
+			for (const r of runs) {
+				if (!commandOk(r) && onlyBaselineFailures(toFailure(ctx, r), baselineOf(r))) r.known = true;
 			}
-			const ok = (r: (typeof runs)[number]) => r.code === 0 && !r.killed;
+			// green 期待で失敗したコマンドは再実行し、合格すれば flaky として記録する（ループの回数には数えない）
+			const flaky: CommandFailure[] = [];
+			if (params.expect === "green") {
+				for (const r of runs) {
+					if (commandOk(r) || r.known || signal?.aborted) continue;
+					r.retries = [];
+					for (let i = 0; i < cfg.flakyRetries && !r.flaky; i++) {
+						const again = await runCommand(ctx, cfg, { label: r.label, command: r.command }, signal);
+						r.retries.push(again);
+						if (commandOk(again) || onlyBaselineFailures(toFailure(ctx, again), baselineOf(r))) {
+							r.flaky = true;
+							flaky.push(toFailure(ctx, r));
+						}
+					}
+				}
+			}
+			const ok = (r: Judged) => commandOk(r) || !!r.known || !!r.flaky;
 			const passed = runs.every(ok);
 			const log = writeItemFile(
 				ctx,
 				join(pathsOf(state).logs, `test-${timestamp()}.log`),
 				`# phase=${state.phase} expect=${params.expect}\n# reason: ${params.reason ?? ""}\n` +
-					runs.map((r) => `\n$ ${r.command}\n# exit=${r.code} killed=${r.killed} ${r.secs}s\n\n${r.output}`).join("\n"),
+					logText(runs.flatMap((r) => [r, ...(r.retries ?? []).map((x) => ({ ...x, command: `${x.command}  # 再実行` }))])),
 			);
 			// モデルに渡す出力は必要な分だけ: 合格時は要約のみ、Red 確認は失敗理由の確認に足る分、失敗時は失敗したコマンドの末尾
 			const shown = runs.find((r) => !ok(r)) ?? runs[0];
 			const lines = passed ? 0 : params.expect === "red" ? Math.min(cfg.testOutputLines, RED_OUTPUT_LINES) : cfg.testOutputLines;
+			const verdict = (r: Judged) =>
+				commandOk(r)
+					? "PASS"
+					: r.known
+						? "FAIL（開始時点と同じ失敗だけ。ベースラインとして判定から除外）"
+						: r.flaky
+							? "FAIL → 再実行で PASS（不安定なテストとして記録。ループ回数に数えない）"
+							: "FAIL";
 			const summary = runs
-				.map((r) => `$ ${r.command}\n  → ${ok(r) ? "PASS" : "FAIL"} (exit ${r.code}${r.killed ? ", タイムアウト/中断" : ""}, ${r.secs}s)`)
+				.map((r) => `$ ${r.command}\n  → ${verdict(r)} (exit ${r.code}${r.killed ? ", タイムアウト/中断" : ""}, ${r.secs}s${r.retries?.length ? `、再実行 ${r.retries.length} 回` : ""})`)
 				.join("\n");
 			let header = `${summary}\n結果: ${passed ? "PASS" : "FAIL"}\n全ログ: ${log}${lines ? "" : "（出力は省略。必要ならログを読む）"}\n\n`;
 			if (lines) {
@@ -1201,12 +1431,24 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			// 実行後の作業ツリーの指紋（合格後に bash 経由でファイルが変わってもレビューへ進めないようにする）
 			const fp = passed && params.expect === "green" ? await fingerprint(gitRun(ctx), ctx.cwd, gitExcludes(ctx, cfg)) : undefined;
+			// 失敗の指紋（同じ失敗が続いていれば、修正が進んでいないとみなす）
+			const failure =
+				!passed && params.expect === "green"
+					? { fingerprint: failureFingerprint(runs.filter((r) => !ok(r)).map((r) => toFailure(ctx, r))), sameFailureLimit: cfg.sameFailureLimit }
+					: undefined;
 
-			const { state: next, outcome } = recordTestRun(state, params.expect, passed, log, fp);
+			if (flaky.length) setState(recordFlaky(state, flaky), ctx);
+			const { state: next, outcome } = recordTestRun(state, params.expect, passed, log, fp, failure);
 			setState(next, ctx);
 			switch (outcome.kind) {
-				case "red_confirmed":
-					return reply(`${header}Red を確認しました（期待どおり失敗）。失敗理由が「未実装/バグ」によるものか確認し、最小限の実装で Green にしてください。`);
+				case "red_confirmed": {
+					// Red で確かめたテストは、Green が合格するまで書き換えられないようにする
+					const locked = ["impl_tdd", "bug_reproduce"].includes(state.phase) ? await lockTestFiles(ctx, cfg, "green") : undefined;
+					return reply(
+						`${header}Red を確認しました（期待どおり失敗）。失敗理由が「未実装/バグ」によるものか確認し、最小限の実装で Green にしてください。` +
+							(locked !== undefined ? `\nテスト（${locked} ファイル）を Green が合格するまでロックしました（テストの変更・追加はできません）。` : ""),
+					);
+				}
 				case "red_unexpected_pass":
 					return reply(`${header}⚠ 失敗するはずのテストが合格しました。テストが要件やバグを捉えていません。テストを見直してください（ループ回数には数えません）。`);
 				case "pass": {
@@ -1219,17 +1461,65 @@ export default function piHarness(pi: ExtensionAPI): void {
 								: state.phase === "bug_fix"
 									? `バグレポート ${p.bug(state.counters.bugs)} を完成させて harness_phase で bug_done へ。`
 									: "次のステップへ進んでください。";
-					return reply(`${header}✅ 全テスト合格。${hint}`);
+					const note = flaky.length ? `\n⚠ 再実行で合格した不安定なテスト・チェックがあります（${flaky.map((f) => f.command).join(", ")}）。PR に記録します。` : "";
+					return reply(`${header}✅ 全テスト合格。${hint}${note}`);
 				}
 				case "fail":
 					return reply(
 						`${header}❌ テスト失敗（修正ループ ${outcome.failures}/${state.test.max}、残り ${outcome.remaining} 回）。\n` +
+							(outcome.same >= 2 ? `⚠ 前回と同じ失敗です（${outcome.same} 回連続）。同じアプローチを繰り返さず、根本原因の仮説から立て直してください。\n` : "") +
 							"1) 失敗したテストとエラーを特定 2) 根本原因の仮説を立てる 3) 仮説を確認 4) 最小限の修正 5) harness_run_tests を再実行。\n" +
 							"テストを弱める・スキップする・削除することで合格させてはいけません。",
 					);
 				case "escalate":
-					return handleEscalation(ctx, `テスト修正ループが上限 (${outcome.failures} 周) に達しました（直近ログ: ${log}）`);
+					return handleEscalation(
+						ctx,
+						outcome.reason === "no_progress"
+							? `同じ失敗が続いており、修正が進んでいません（修正ループ ${outcome.failures}/${state.test.max}、直近ログ: ${log}）`
+							: `テスト修正ループが上限 (${outcome.failures} 周) に達しました（直近ログ: ${log}）`,
+					);
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "harness_request_test_change",
+		label: "Request Test Change",
+		description:
+			"ロック中のテストファイルの変更をユーザーに申請する。テストのほうが受け入れ条件と合っていない場合だけ使う（実装を合格させるためにテストを変えるのは不可）。承認されると、次にロックし直すまでそのファイルを編集できる。申請と理由は test-changes.md に記録され、レビューで検証される。",
+		promptSnippet: "Ask the user to approve changing a locked test file (only when the test contradicts the acceptance criteria)",
+		parameters: Type.Object({
+			files: Type.Array(Type.String(), { minItems: 1, description: "変更したいテストファイル（cwd からの相対パス）" }),
+			reason: Type.String({ description: "なぜテストのほうが誤っているのか（日本語。どう変えるかも書く）" }),
+			criterion: Type.Optional(Type.String({ description: "根拠となる受け入れ条件・要件の ID（例: AC-2）" })),
+		}),
+		executionMode: "sequential",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!isActive(state) || !state.testLock) return reply("テストはロックされていません。そのまま編集できます。");
+			const files = [...new Set(params.files.map((f) => toRel(f, ctx.cwd)))];
+			if (!ctx.hasUI) {
+				throw new Error(
+					"確認ダイアログを出せない環境ではテストの変更を承認できません。作業を止め、変更したいテストと理由をユーザーに報告してください" +
+						"（ユーザーは .pi/harness.json の testLock: false でロックを無効にできます）。",
+				);
+			}
+			const options = ["承認する（このテストの変更を許可）", "却下する（テストは変えずに実装で対応）"];
+			const title =
+				`【テストの変更申請】\nファイル: ${files.join(", ")}\n${params.criterion ? `根拠: ${params.criterion}\n` : ""}理由: ${params.reason.slice(0, 1200)}\n\n` +
+				(state.testLock.mode === "green" ? "Red で失敗を確かめたテストを、Green の合格前に変更しようとしています。" : "レビュー時点のテストを変更しようとしています。");
+			const choice = await ctx.ui.select(title, options);
+			if (choice !== options[0]) {
+				return reply("ユーザーはテストの変更を承認しませんでした。テストは変えずに実装で対応してください。どうしても必要なら、作業を止めて理由をユーザーに報告してください。");
+			}
+			const reason = `${params.criterion ? `[${params.criterion}] ` : ""}${params.reason.trim()}`;
+			setState(allowTestChange(state, files, reason), ctx);
+			writeItemFile(
+				ctx,
+				pathsOf(state).testChanges,
+				`\n## ${new Date().toISOString()}（テストの変更申請: ユーザーが承認）\n\n${files.map((f) => `- ${f}`).join("\n")}\n\n**理由:** ${reason}\n`,
+				true,
+			);
+			return reply(`ユーザーが承認しました。次にロックし直すまで ${files.join(", ")} を編集できます。変更したら harness_run_tests で確認してください（変更はレビューで検証されます）。`);
 		},
 	});
 
@@ -1249,24 +1539,50 @@ export default function piHarness(pi: ExtensionAPI): void {
 		name: "harness_record_review",
 		label: "Record Review",
 		description:
-			"コードレビュー結果を記録（review-<周回>.md に書き出し）し、レビューループを進める。ブロッキング指摘 (blocker/major) が無ければ実装完了、あれば指摘修正プロセスへ。上限周回でも残る場合はユーザーへエスカレーションする。",
-		promptSnippet: "Record code review findings and advance the review loop",
+			"コードレビュー結果を記録（review-<周回>.md に書き出し）し、レビューループを進める。ブロッキング指摘 (blocker/major) が無ければ実装完了、あれば指摘修正プロセスへ。上限周回でも残る場合はユーザーへエスカレーションする。" +
+			"受け入れ条件の解釈が分かれる点（仕様の曖昧さ）は指摘ではなく specGaps に書く。ユーザーにすぐ確認し、修正ループの回数には数えない。",
+		promptSnippet: "Record code review findings (and spec ambiguities to ask the user) and advance the review loop",
 		parameters: Type.Object({
 			summary: Type.String({ description: "レビュー全体の所見（日本語、2〜5 文）" }),
 			findings: Type.Array(FindingSchema, { description: "指摘一覧（無ければ空配列）" }),
+			specGaps: Type.Optional(
+				Type.Array(
+					Type.Object({
+						criterion: Type.String({ description: "根拠となる受け入れ条件・要件の ID（例: AC-2）。Issue の記述なら短く引用する" }),
+						question: Type.String({ description: "ユーザーに聞く質問（日本語、1 文）" }),
+						interpretations: Type.Array(Type.String(), {
+							minItems: 2,
+							description: "考えられる解釈（2 つ以上。それぞれで振る舞いがどう変わるかを書く。推奨があれば先頭）",
+						}),
+						evidence: Type.Optional(Type.String({ description: "解釈が分かれる箇所（ファイル:行 など）" })),
+					}),
+					{
+						description:
+							"仕様の曖昧さ（spec_gap）: 受け入れ条件が 2 通り以上に読め、どちらを取るかで実装やテストが変わるもの。推測で指摘にせず、ここに書くとユーザーに確認する。decisions.md で回答済みの論点は書かない",
+					},
+				),
+			),
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const cfg = cfgOf(ctx);
 			const mode = reviewMode(state);
 			const findings = params.findings as ReviewFinding[];
-			const { state: recorded, outcome } = recordReview(state, findings, params.summary, cfg.blockingSeverities);
+			const { state: recorded, outcome } = recordReview(state, findings, params.summary, cfg.blockingSeverities, params.specGaps ?? []);
 			// レビューした時点の作業ツリーを記録し、次の軽量レビューでは「ここからの差分」だけを見せる
 			const snapshot = state.git ? await snapshotTree(gitRun(ctx), tempIndexFile(), gitExcludes(ctx, cfg)) : undefined;
 			const next = snapshot ? { ...recorded, review: { ...recorded.review, snapshot } } : recorded;
-			const report = writeItemFile(ctx, pathsOf(state).review(outcome.round), reviewMarkdown(outcome.round, mode, params.summary, findings, cfg, ctx.cwd));
+			const gaps = (recorded.specGaps ?? []).filter((g) => g.round === outcome.round);
+			const report = writeItemFile(ctx, pathsOf(state).review(outcome.round), reviewMarkdown(outcome.round, mode, params.summary, findings, cfg, ctx.cwd, gaps));
 			setState(next, ctx);
 			switch (outcome.kind) {
+				case "spec_gap": {
+					const asked = await askSpecGaps(ctx);
+					asked.content[0].text = `レビュー ${outcome.round} 周目: 仕様の確認 ${outcome.questions} 件・ブロッキング指摘 ${outcome.blocking} 件。記録: ${report}\n${asked.content[0].text}`;
+					return asked;
+				}
+				case "rereview":
+					return reply(`レビュー ${outcome.round} 周目の記録: ${report}`);
 				case "clean": {
 					const finalized = await finalizeImplementation(ctx, cfg);
 					return reply(
@@ -1287,12 +1603,20 @@ export default function piHarness(pi: ExtensionAPI): void {
 		},
 	});
 
-	function reviewMarkdown(round: number, mode: "full" | "light", summary: string, findings: ReviewFinding[], cfg: HarnessConfig, cwd: string): string {
+	function reviewMarkdown(
+		round: number,
+		mode: "full" | "light",
+		summary: string,
+		findings: ReviewFinding[],
+		cfg: HarnessConfig,
+		cwd: string,
+		specGaps: SpecGap[],
+	): string {
 		return renderNamed(
 			cwd,
 			cfg,
 			"review",
-			reviewVars({ round, mode, target: describeIssue(state.issue), at: new Date().toISOString(), summary, findings, blocking: cfg.blockingSeverities }),
+			reviewVars({ round, mode, target: describeIssue(state.issue), at: new Date().toISOString(), summary, findings, blocking: cfg.blockingSeverities, specGaps }),
 		);
 	}
 
@@ -1563,9 +1887,13 @@ export default function piHarness(pi: ExtensionAPI): void {
 					? `# #${issue.number} ${issue.title}\n\nURL: ${issue.url}\n\n${body}\n`
 					: `# Issue #${issue.number}\n\n（本文を自動取得できませんでした。\`gh issue view ${issue.number}\` や docs/issues/ から内容を確認し、このファイルに本文を保存してください）\n`,
 		);
+		// 開始時点でテストとチェックを実行し、もともと失敗しているものを記録する
+		const baselineNote = await runBaseline(ctx, cfg).catch((e: Error) => `⚠ ベースラインを確認できませんでした: ${e.message}`);
 		return {
 			ok: true,
-			message: `${describeIssue(issue)} の実装フローを開始します。${pullNote}${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}`,
+			message:
+				`${describeIssue(issue)} の実装フローを開始します。${pullNote}${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}` +
+				(baselineNote ? `\n${baselineNote}` : ""),
 		};
 	}
 
@@ -1623,11 +1951,11 @@ export default function piHarness(pi: ExtensionAPI): void {
 		},
 	});
 
-	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "continue", "rejoin", "abort", "pr", "issues", "usage", "models", "config"];
+	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "answer", "continue", "rejoin", "abort", "pr", "issues", "usage", "models", "config"];
 
 	pi.registerCommand("harness", {
 		description:
-			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | continue [指示] | rejoin | abort | pr | issues | usage [作業ディレクトリ] | models | config",
+			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | answer [仕様の確認への回答] | continue [指示] | rejoin | abort | pr | issues | usage [作業ディレクトリ] | models | config",
 		getArgumentCompletions: (prefix) => SUBCOMMANDS.filter((s) => s.startsWith(prefix.trim())).map((s) => ({ value: s, label: s })),
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = args.trim().split(/\s+/);
@@ -1687,7 +2015,30 @@ export default function piHarness(pi: ExtensionAPI): void {
 					}
 					case "rejoin": {
 						setState(rejoinImplement(state, limitsOf(cfg)), ctx);
+						await lockForReview(ctx, cfg);
 						await startProcessSession(ctx);
+						return;
+					}
+					case "answer": {
+						if (state.phase !== "impl_spec_gap") {
+							ctx.ui.notify(`仕様の確認待ちではありません（現在: ${state.phase}）`, "warning");
+							return;
+						}
+						let result: ToolText | undefined;
+						if (text) {
+							const gap = pendingSpecGaps(state)[0];
+							const outcome = applySpecAnswer(ctx, gap, text);
+							const rest = pendingSpecGaps(state);
+							if (rest.length || !outcome) {
+								ctx.ui.notify(`${gap.id} の回答を記録しました。次の質問: ${rest[0].id} [${rest[0].criterion}] ${rest[0].question}（${rest[0].interpretations.join(" / ")}）\n/harness answer <回答> で答えてください。`, "info");
+								return;
+							}
+							result = await specGapSettled(ctx, outcome);
+						} else {
+							result = await askSpecGaps(ctx);
+						}
+						ctx.ui.notify(result.content[0].text, "info");
+						if (state.pendingHandoff) await startProcessSession(ctx);
 						return;
 					}
 					case "abort": {
