@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { compactionInstructions, shouldCompact } from "../extensions/harness/compaction.ts";
 import { mergeConfig } from "../extensions/harness/config.ts";
-import { countAcceptanceCriteria, validateDrafts } from "../extensions/harness/issues.ts";
+import { type IssueDraft, validateDrafts } from "../extensions/harness/issues.ts";
 import { DEFAULT_LIMITS, initialState, startImplement, transition, withHandoff, type HarnessState } from "../extensions/harness/state.ts";
 
 const cfg = { enabled: true, thresholdPercent: 60 };
@@ -42,20 +42,21 @@ describe("しきい値による自動圧縮", () => {
 });
 
 describe("Issue の大きさ", () => {
-	const body = (n: number) => `## 背景\nx\n## 受け入れ条件\n${Array.from({ length: n }, (_, i) => `- [ ] AC-${i}`).join("\n")}\n## テスト観点\n- [ ] これは数えない\n`;
+	const draft = (title: string, n: number, size: IssueDraft["size"]): IssueDraft => ({
+		title,
+		background: "x",
+		inScope: ["x"],
+		acceptanceCriteria: Array.from({ length: n }, (_, i) => `条件 ${i}`),
+		size,
+	});
 	const limits = mergeConfig({}).issueLimits;
 
-	it("受け入れ条件のチェック項目だけを数える", () => {
-		assert.equal(countAcceptanceCriteria(body(3)), 3);
-		assert.equal(countAcceptanceCriteria("本文のみ"), 0);
-	});
-
 	it("L 規模・受け入れ条件が多すぎる Issue は分割を求める", () => {
-		assert.deepEqual(validateDrafts([{ title: "a", body: body(5), size: "M" }], limits), []);
+		assert.deepEqual(validateDrafts([draft("a", 5, "M")], limits), []);
 		const errs = validateDrafts(
 			[
-				{ title: "big", body: body(2), size: "L" },
-				{ title: "many", body: body(6), size: "S" },
+				draft("big", 2, "L"),
+				draft("many", 6, "S"),
 			],
 			limits,
 		);
@@ -68,7 +69,7 @@ describe("Issue の大きさ", () => {
 		const w: string[] = [];
 		const c = mergeConfig({ issueLimits: { maxAcceptanceCriteria: 8, allowedSizes: ["S", "M", "L"], maxPlanTestCases: 20 } } as never, w);
 		assert.deepEqual(w, []);
-		assert.deepEqual(validateDrafts([{ title: "big", body: body(8), size: "L" }], c.issueLimits), []);
+		assert.deepEqual(validateDrafts([draft("big", 8, "L")], c.issueLimits), []);
 		mergeConfig({ issueLimits: { allowedSizes: ["XL"] } } as never, w);
 		assert.equal(w.length, 1);
 	});

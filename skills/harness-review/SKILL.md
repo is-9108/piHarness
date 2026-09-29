@@ -32,6 +32,6 @@ disable-model-invocation: true
 
 ## 記録
 
-`harness_record_review`（`summary`、`findings`: severity・perspective・title・detail・file・line・suggestion。無ければ `[]`）。
+`harness_record_review`（`summary`、`findings`: severity・perspective・title・detail・file・line・suggestion。無ければ `[]`）。**すべて日本語**で書く。`perspective` は上の観点名（英語のキー）を使う。記録の形は拡張がテンプレートで揃える。
 修正は別セッションが `review-N.md` だけを見て行うので、`detail` と `suggestion` に根拠・場所・修正案を書く。
 指摘なしで完了した場合: 変更概要・受け入れ条件の充足・テスト結果・残した minor/nit・コミット/PR の結果・利用量を報告し、`/impl next` を案内する。

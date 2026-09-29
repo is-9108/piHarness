@@ -25,5 +25,5 @@ disable-model-invocation: true
 
 ## 記録
 
-`harness_record_review`（`summary`、`findings`。重大度: blocker/major が修正必須）。指摘は修正担当が `review-N.md` だけで直せるよう根拠・場所・修正案を書く。
+`harness_record_review`（`summary`、`findings`。重大度: blocker/major が修正必須）。**すべて日本語**で書き、`perspective` はフルレビューと同じ観点名（英語のキー）を使う。指摘は修正担当が `review-N.md` だけで直せるよう根拠・場所・修正案を書く。
 指摘なしで完了した場合: 変更概要・テスト結果・コミット/PR の結果・利用量を報告し、`/impl next` を案内する。

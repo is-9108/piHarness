@@ -23,9 +23,11 @@ piHarness/
 │   ├── tools.ts                  # プロセスごとに有効にするツール
 │   ├── compaction.ts             # しきい値による自動圧縮の判断と要約の指示
 │   ├── dashboard.ts              # TUI のダッシュボード（工程・いまの作業・ブランチ・トークン）
+│   ├── templates.ts              # Issue・PR・レビュー記録をテンプレートから組み立てる
 │   └── text.ts                   # 整形ヘルパー
 ├── scripts/install.mjs           # プロジェクトへの組み込み（.pi/settings.json・harness.json・.gitignore）
 ├── templates/harness.json        # 組み込み時に作る .pi/harness.json の雛形
+├── templates/{issue,pr,review}.md # Issue 本文・PR 本文・レビュー記録のテンプレート
 ├── skills/
 │   ├── harness-requirements/     # 要件定義の手順・テンプレート・Issue 分割ルール
 │   ├── harness-tdd/              # TDD 実装の手順・プランテンプレート
@@ -95,6 +97,13 @@ Pi は settings ファイルの場所を基準に相対パスを解決するた�
 `state.ts` は Pi に依存せず、`(旧状態, 入力) → 新状態` の関数だけで構成しています。
 ループ回数・エスカレーション・合流といった最も間違えやすいロジックを、Pi を起動せずにユニットテストできます。
 `index.ts` は、ツール引数を検証して状態関数を呼び、結果を永続化して UI に反映するだけの薄い層です。
+
+### 外に出す文書はテンプレートで組み立てる
+
+Issue 本文・PR 本文・レビュー記録（`review-N.md`）は、エージェントに Markdown を自由に書かせず、項目ごとに受け取って拡張がテンプレートで組み立てます。
+見出しの並び・重大度の数・判定・受け入れ条件の番号（AC-1…）が毎回同じになり、モデルやセッションが変わっても形がぶれません。
+PR 本文は実装レポート（`implementation.md`）の決まった見出しと、拡張が記録したテスト結果・レビュー履歴から作ります。
+テンプレートはプロジェクトの `<workDir>/templates/` に置けば上書きできます（無ければ同梱の `templates/`）。
 
 ### コンテキスト注入
 

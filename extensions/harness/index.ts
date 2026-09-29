@@ -44,7 +44,6 @@ import {
 	parseIssueArg,
 	parseIssueUrl,
 	validateDrafts,
-	withDependencies,
 } from "./issues.ts";
 import {
 	acknowledgeTestChanges,
@@ -89,12 +88,19 @@ import { slugify, tailLines, timestamp } from "./text.ts";
 import { toolsForProcess } from "./tools.ts";
 import { describeActivity, renderDashboard } from "./dashboard.ts";
 import { compactionInstructions, shouldCompact } from "./compaction.ts";
+import { issueVars, loadTemplate, prVars, renderTemplate, reviewVars, type TemplateName } from "./templates.ts";
 
 const CONTEXT_MESSAGE = "harness-context";
 /** Red 確認（期待どおりの失敗）で返す出力の行数。失敗理由が「未実装」かを確かめられれば十分 */
 const RED_OUTPUT_LINES = 40;
 /** piHarness 自身のディレクトリ（プロジェクト内に clone して使う場合、エージェントに書き換えさせない） */
 const HARNESS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const BUILTIN_TEMPLATES = join(HARNESS_ROOT, "templates");
+
+/** Issue・PR・レビュー記録をテンプレート（プロジェクトの上書きが優先）から組み立てる */
+function renderNamed(cwd: string, cfg: HarnessConfig, name: TemplateName, vars: Record<string, string>): string {
+	return renderTemplate(loadTemplate(cwd, cfg.workDir, BUILTIN_TEMPLATES, name), vars);
+}
 const ALL_PHASES = Object.keys(PHASE_LABELS) as Phase[];
 
 type ToolText = { content: { type: "text"; text: string }[]; details: { phase: Phase }; terminate?: boolean };
@@ -407,8 +413,20 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (push.code !== 0) return fail(`git push: ${(push.stderr || push.stdout).trim()}`);
 		const p = pathsOf(state);
 		const impl = existsSync(join(ctx.cwd, p.implementation)) ? readFileSync(join(ctx.cwd, p.implementation), "utf8") : "";
-		const reviews = state.review.history.map((h) => `- ${h.round} 周目（${h.mode === "full" ? "フル" : "軽量"}）: ブロッキング ${h.blocking} 件 / 全 ${h.total} 件`).join("\n");
-		const body = `${impl.trim()}\n\n## レビュー（piHarness）\n\n${reviews || "なし"}\n${state.issue?.number ? `\nCloses #${state.issue.number}\n` : ""}`;
+		const body = renderNamed(ctx.cwd, cfg, "pr", {
+			title,
+			...prVars({
+				implementation: impl,
+				issue: state.issue,
+				test: state.test,
+				testCommand: cfg.testCommand,
+				checkCommands: cfg.checkCommands,
+				testChangeReasons: state.testChangeAcks.map((a) => a.reason),
+				history: state.review.history,
+				remaining: state.review.lastFindings,
+				usage: usageSummaryLine(ctx),
+			}),
+		});
 		const args = ["pr", "create", "--base", git.baseBranch, "--head", git.branch, "--title", title, "--body", body];
 		if (cfg.git.draft) args.push("--draft");
 		if (cfg.issueRepo) args.push("--repo", cfg.issueRepo);
@@ -1220,11 +1238,11 @@ export default function piHarness(pi: ExtensionAPI): void {
 			description: "blocker: 誤動作/データ破損/セキュリティ, major: 要件未達/重大な設計・テスト不足, minor: 改善推奨, nit: 好み",
 		}),
 		perspective: Type.String({ description: "観点（correctness, requirements, tests, security, performance, maintainability, ...）" }),
-		title: Type.String(),
-		detail: Type.String({ description: "問題の内容と根拠" }),
+		title: Type.String({ description: "指摘の要点（日本語、1 行）" }),
+		detail: Type.String({ description: "問題の内容と根拠（日本語）" }),
 		file: Type.Optional(Type.String()),
 		line: Type.Optional(Type.Number()),
-		suggestion: Type.Optional(Type.String({ description: "修正案" })),
+		suggestion: Type.Optional(Type.String({ description: "修正案（日本語）" })),
 	});
 
 	pi.registerTool({
@@ -1234,7 +1252,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			"コードレビュー結果を記録（review-<周回>.md に書き出し）し、レビューループを進める。ブロッキング指摘 (blocker/major) が無ければ実装完了、あれば指摘修正プロセスへ。上限周回でも残る場合はユーザーへエスカレーションする。",
 		promptSnippet: "Record code review findings and advance the review loop",
 		parameters: Type.Object({
-			summary: Type.String({ description: "レビュー全体の所見" }),
+			summary: Type.String({ description: "レビュー全体の所見（日本語、2〜5 文）" }),
 			findings: Type.Array(FindingSchema, { description: "指摘一覧（無ければ空配列）" }),
 		}),
 		executionMode: "sequential",
@@ -1246,7 +1264,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			// レビューした時点の作業ツリーを記録し、次の軽量レビューでは「ここからの差分」だけを見せる
 			const snapshot = state.git ? await snapshotTree(gitRun(ctx), tempIndexFile(), gitExcludes(ctx, cfg)) : undefined;
 			const next = snapshot ? { ...recorded, review: { ...recorded.review, snapshot } } : recorded;
-			const report = writeItemFile(ctx, pathsOf(state).review(outcome.round), reviewMarkdown(outcome.round, mode, params.summary, findings, cfg));
+			const report = writeItemFile(ctx, pathsOf(state).review(outcome.round), reviewMarkdown(outcome.round, mode, params.summary, findings, cfg, ctx.cwd));
 			setState(next, ctx);
 			switch (outcome.kind) {
 				case "clean": {
@@ -1269,27 +1287,33 @@ export default function piHarness(pi: ExtensionAPI): void {
 		},
 	});
 
-	function reviewMarkdown(round: number, mode: string, summary: string, findings: ReviewFinding[], cfg: HarnessConfig): string {
-		const rows = findings.map(
-			(f, i) =>
-				`### ${i + 1}. [${f.severity}${cfg.blockingSeverities.includes(f.severity) ? " 🔴" : ""}] ${f.title}\n\n` +
-				`- 観点: ${f.perspective}\n${f.file ? `- 場所: ${f.file}${f.line ? `:${f.line}` : ""}\n` : ""}\n${f.detail}\n` +
-				(f.suggestion ? `\n**修正案:** ${f.suggestion}\n` : ""),
+	function reviewMarkdown(round: number, mode: "full" | "light", summary: string, findings: ReviewFinding[], cfg: HarnessConfig, cwd: string): string {
+		return renderNamed(
+			cwd,
+			cfg,
+			"review",
+			reviewVars({ round, mode, target: describeIssue(state.issue), at: new Date().toISOString(), summary, findings, blocking: cfg.blockingSeverities }),
 		);
-		return `# レビュー ${round} 周目（${mode === "full" ? "フルレビュー" : "軽量レビュー"}）\n\n対象: ${describeIssue(state.issue)}\n日時: ${new Date().toISOString()}\n\n## 所見\n\n${summary}\n\n## 指摘 (${findings.length} 件)\n\n${rows.join("\n") || "なし\n"}`;
 	}
 
 	pi.registerTool({
 		name: "harness_create_issues",
 		label: "Create Issues",
 		description:
-			"承認済みの要件から GitHub Issue を登録する（gh CLI 使用。使えない場合は docs/issues に Markdown で保存）。1 Issue = 1 機能のレビューしやすい小さな単位にし、本文に受け入れ条件を含めること。要件定義の承認後のみ実行可能。",
+			"承認済みの要件から GitHub Issue を登録する（gh CLI 使用。使えない場合は docs/issues に Markdown で保存）。本文は項目ごとに渡し、拡張がテンプレートで組み立てる。すべて日本語で書く。1 Issue = 1 機能のレビューしやすい小さな単位。要件定義の承認後のみ実行可能。",
 		promptSnippet: "Register small, feature-sized GitHub issues after requirements approval",
 		parameters: Type.Object({
 			issues: Type.Array(
 				Type.Object({
-					title: Type.String(),
-					body: Type.String({ description: "Markdown 本文（背景・スコープ・受け入れ条件・テスト観点・参照ドキュメント）" }),
+					title: Type.String({ description: "日本語のタイトル（1 振る舞いを表す）" }),
+					background: Type.String({ description: "背景・目的（1〜3 文）" }),
+					inScope: Type.Array(Type.String(), { description: "やること" }),
+					outOfScope: Type.Optional(Type.Array(Type.String(), { description: "やらないこと" })),
+					acceptanceCriteria: Type.Array(Type.String(), { description: "テスト可能な受け入れ条件（1 項目 = 1 条件、Given/When/Then 推奨）" }),
+					testNormal: Type.Optional(Type.Array(Type.String(), { description: "テスト観点: 正常系" })),
+					testEdge: Type.Optional(Type.Array(Type.String(), { description: "テスト観点: 異常系・境界値" })),
+					references: Type.Optional(Type.Array(Type.String(), { description: "参照（要件 ID・設計ドキュメントのパス）" })),
+					notes: Type.Optional(Type.String({ description: "補足（無ければ省略）" })),
 					size: StringEnum(["S", "M", "L"] as const, { description: "規模の見積もり: S = 〜100 行 / M = 〜300 行 / L = それ以上（L は分割が必要）" }),
 					labels: Type.Optional(Type.Array(Type.String())),
 					dependsOn: Type.Optional(Type.Array(Type.Number(), { description: "依存する Issue（この配列内の 0 始まりインデックス）" })),
@@ -1329,7 +1353,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 			for (const [i, d] of drafts.entries()) {
 				const labels = [...new Set([...cfg.issueLabels, ...(d.labels ?? [])])];
-				const body = withDependencies(d, created);
+				const deps = (d.dependsOn ?? []).map((j) => created[j]).filter(Boolean);
+				const body = renderNamed(ctx.cwd, cfg, "issue", issueVars(d, deps));
 				if (useGh) {
 					const r = await pi.exec("gh", ghIssueCreateArgs(d.title, body, labels, cfg.issueRepo), { cwd: ctx.cwd, timeout: 60_000, signal });
 					const parsed = parseIssueUrl(r.stdout);

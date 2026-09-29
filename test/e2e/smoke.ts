@@ -261,6 +261,7 @@ for (const later of sessionsSeen.slice(2)) {
 }
 assert.ok(existsSync(join(project, p("review-1.md"))));
 assert.ok(existsSync(join(project, p("review-2.md"))));
+assert.match(readFileSync(join(project, p("review-1.md")), "utf8"), /# レビュー 1 周目（フルレビュー）[\s\S]*\| 判定 \| 🔴 修正が必要[\s\S]*## 観点別の結果[\s\S]*## 指摘\n\n### 1\. /, "レビュー記録はテンプレートの形");
 const handoff = readFileSync(join(project, p("handoff.md")), "utf8");
 assert.equal(handoff.match(/^## /gm)?.length, 5, "handoff.md に 5 回分の引き継ぎ記録");
 
@@ -319,7 +320,7 @@ assert.equal(JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "u
 // それぞれ別セッション。ヒアリングは安価なモデル、要件定義書作成は高性能モデル
 // ---------------------------------------------------------------------------
 
-const issueBody = "## 背景・目的\nx\n## 受け入れ条件\n- [ ] y";
+const issueFields = { background: "x", inScope: ["x"], acceptanceCriteria: ["y"] };
 const reqItem = `.pi/harness/req-${new Date().toISOString().slice(0, 10)}-温度ロガー`;
 r = await run("/req 温度ロガー", [
 	call("write", { path: "src/x.js", content: "x" }), // 要件定義中 → ブロック
@@ -332,7 +333,7 @@ r = await run("/req 温度ロガー", [
 	call("write", { path: `${reqItem}/hearing.md`, content: "# 確定事項（保存期間: 30 日）" }),
 	call("harness_phase", { to: "req_document" }), // → 要件定義書作成セッション（2 回目）
 	call("write", { path: "docs/requirements/logger.md", content: "# 要件" }),
-	call("harness_create_issues", { issues: [{ title: "a", body: issueBody, size: "S" }], dryRun: true }), // 承認前 → 拒否
+	call("harness_create_issues", { issues: [{ title: "a", ...issueFields, size: "S" }], dryRun: true }), // 承認前 → 拒否
 	call("harness_request_approval", { kind: "requirements", summary: "s", documents: ["docs/requirements/logger.md"] }),
 ]);
 assert.ok(existsSync(join(project, reqItem, "hearing.md")));
@@ -355,8 +356,8 @@ const reqSession = sessionNo;
 r = await run("/harness approve", [
 	call("harness_create_issues", {
 		issues: [
-			{ title: "センサー読み取り", body: issueBody, labels: ["feature"], size: "S" },
-			{ title: "SQLite 保存", body: issueBody, dependsOn: [0], size: "M" },
+			{ title: "センサー読み取り", ...issueFields, labels: ["feature"], size: "S" },
+			{ title: "SQLite 保存", ...issueFields, dependsOn: [0], size: "M" },
 		],
 		dryRun: true,
 	}),
@@ -367,7 +368,7 @@ assert.equal(sessionNo, reqSession + 1, "Issue 登録は新しいセッション
 assert.match(firstUserText(runtime.session), /docs\/requirements\/logger\.md — 承認済みの要件ドキュメント/);
 assert.match(r.at(-1) ?? "", /2 件の Issue をMarkdown として docs\/issues\/ に保存/);
 assert.deepEqual(readdirSync(join(project, "docs/issues")).sort(), ["01-センサー読み取り.md", "02-sqlite-保存.md"]);
-assert.match(readFileSync(join(project, "docs/issues/02-sqlite-保存.md"), "utf8"), /## 依存関係[\s\S]*- センサー読み取り/);
+assert.match(readFileSync(join(project, "docs/issues/02-sqlite-保存.md"), "utf8"), /## 受け入れ条件\n\n- \[ \] AC-1: y[\s\S]*## 依存関係\n\n以下の Issue の完了後[\s\S]*- センサー読み取り/, "Issue 本文はテンプレートの形");
 
 // プロセスごとのモデル:
 //   レビュー・要件定義書作成 → reviewer + thinking high / ヒアリング → cheap / それ以外 → worker

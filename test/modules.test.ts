@@ -11,7 +11,6 @@ import {
 	parseIssueArg,
 	parseIssueUrl,
 	validateDrafts,
-	withDependencies,
 	draftFileName,
 } from "../extensions/harness/issues.ts";
 import { DEFAULT_LIMITS, initialState, startImplement, startRequirements, transition } from "../extensions/harness/state.ts";
@@ -92,22 +91,20 @@ describe("guard", () => {
 });
 
 describe("issues", () => {
-	const body = "## 背景\nx\n## 受け入れ条件\n- [ ] y";
+	const draft = { title: "a", background: "x", inScope: ["x"], acceptanceCriteria: ["y"] };
 
-	it("受け入れ条件の無い Issue・前方以外への依存を拒否する", () => {
-		assert.deepEqual(validateDrafts([{ title: "a", body }]), []);
+	it("必須項目の無い Issue・前方以外への依存を拒否する", () => {
+		assert.deepEqual(validateDrafts([draft]), []);
 		const errs = validateDrafts([
-			{ title: "a", body: "本文のみ" },
-			{ title: "b", body, dependsOn: [1] },
+			{ ...draft, acceptanceCriteria: [] },
+			{ ...draft, title: "b", dependsOn: [1] },
+			{ ...draft, title: "c", background: " ", inScope: [] },
 		]);
-		assert.equal(errs.length, 2);
+		assert.equal(errs.length, 4);
 		assert.match(errs[0], /受け入れ条件/);
 		assert.match(errs[1], /dependsOn/);
-	});
-
-	it("依存 Issue の番号を本文に追記する", () => {
-		const out = withDependencies({ title: "b", body, dependsOn: [0] }, [{ title: "a", number: 12 }]);
-		assert.match(out, /## 依存関係[\s\S]*- #12/);
+		assert.match(errs[2], /background/);
+		assert.match(errs[3], /inScope/);
 	});
 
 	it("gh 引数と URL 解析", () => {
