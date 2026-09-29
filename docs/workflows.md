@@ -86,7 +86,7 @@ flowchart LR
 | `req_clarify` | 要件ヒアリング | 仕様が明確になるまで `harness_ask` で質問を繰り返し、`hearing.md` にまとめる | `docs/`, `.pi/harness/` | `hearing.md` を書いて `harness_phase → req_document`（新セッション） |
 | `req_document` | 要件定義書作成 | `hearing.md` から要件定義書・設計概要・Issue 分割案を作成 | 同上 | `harness_request_approval (requirements)`／大きな未確定事項は `open-questions.md` を書いて `req_clarify` へ差し戻し（新セッション） |
 | `req_approval` | 要件定義書作成 | **人間の承認ゲート** | 同上 | 承認ダイアログ または `/harness approve / revise / reject` |
-| `req_issues` | Issue 登録 | 機能単位の小さな Issue を登録（受け入れ条件必須・依存関係付き） | 同上 | `harness_create_issues` |
+| `req_issues` | Issue 登録 | 機能単位の小さな Issue を登録（受け入れ条件必須・依存関係付き。本文はテンプレートで組み立て） | 同上 | `harness_create_issues` |
 | `req_done` | Issue 登録 | 完了報告 | 同上 | — |
 
 - ヒアリングと要件定義書作成を分けているのは、質問の繰り返しでターン数が多くなる工程に安価なモデルを、
@@ -110,6 +110,7 @@ flowchart LR
 
 `/impl` の開始時に作業ブランチを作成し、開始時点のコミットを差分の基準として記録します（git リポジトリの場合）。
 レビュー通過時に拡張がコミットし、`git.pr` に従って PR を作成します（既定は確認してから作成）。
+PR 本文・Issue 本文・レビュー記録は日本語のテンプレート（`templates/pr.md` / `issue.md` / `review.md`）から組み立てます。
 
 ### テストループ
 

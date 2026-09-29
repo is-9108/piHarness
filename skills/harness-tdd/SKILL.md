@@ -30,4 +30,4 @@ disable-model-invocation: true
 
 ## 完了
 
-全テストケース実装済み・最後の green 合格後に未変更なら、`templates/implementation.md` に従い **`implementation.md`** を書き（レビューはこれと差分だけを見る）、`harness_phase` で `impl_review` へ。
+全テストケース実装済み・最後の green 合格後に未変更なら、`templates/implementation.md` に従い **`implementation.md`** を日本語で書き（レビューはこれと差分だけを見る。**見出しは変えない**: PR 本文に使われる）、`harness_phase` で `impl_review` へ。

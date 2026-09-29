@@ -3,9 +3,24 @@
  */
 import { slugify } from "./text.ts";
 
+/** Issue 案。本文はテンプレート（templates/issue.md）で組み立てるので、項目ごとに受け取る */
 export interface IssueDraft {
 	title: string;
-	body: string;
+	/** なぜこの Issue が必要か（1〜3 文） */
+	background: string;
+	/** やること */
+	inScope: string[];
+	/** やらないこと */
+	outOfScope?: string[];
+	/** テスト可能な受け入れ条件（1 項目 = 1 条件） */
+	acceptanceCriteria: string[];
+	/** テスト観点: 正常系 */
+	testNormal?: string[];
+	/** テスト観点: 異常系・境界値 */
+	testEdge?: string[];
+	/** 参照ドキュメント（要件 ID・設計の該当箇所） */
+	references?: string[];
+	notes?: string;
 	/** 規模の見積もり: S = 〜100 行 / M = 〜300 行 / L = それ以上（既定では L は分割が必要） */
 	size?: "S" | "M" | "L";
 	labels?: string[];
@@ -18,52 +33,30 @@ export interface IssueLimits {
 	allowedSizes: ("S" | "M" | "L")[];
 }
 
-/** 本文の「受け入れ条件」セクションにあるチェック項目の数 */
-export function countAcceptanceCriteria(body: string): number {
-	const lines = body.split("\n");
-	const start = lines.findIndex((l) => /^#{1,6}\s*.*(受け入れ条件|Acceptance Criteria)/i.test(l));
-	if (start < 0) return 0;
-	let count = 0;
-	for (const line of lines.slice(start + 1)) {
-		if (/^#{1,6}\s/.test(line)) break;
-		if (/^\s*[-*]\s+\[[ xX]\]/.test(line)) count++;
-	}
-	return count;
-}
-
 export function validateDrafts(drafts: IssueDraft[], limits?: IssueLimits): string[] {
 	const errors: string[] = [];
 	if (drafts.length === 0) errors.push("issues が空です。");
 	drafts.forEach((d, i) => {
 		if (!d.title?.trim()) errors.push(`issues[${i}]: title が空です。`);
-		if (!d.body?.trim()) errors.push(`issues[${i}]: body が空です。`);
+		if (!d.background?.trim()) errors.push(`issues[${i}] "${d.title}": background（背景・目的）が空です。`);
+		if (!d.inScope?.some((s) => s.trim())) errors.push(`issues[${i}] "${d.title}": inScope（やること）が空です。`);
+		const ac = (d.acceptanceCriteria ?? []).filter((c) => c.trim()).length;
+		if (ac === 0) errors.push(`issues[${i}] "${d.title}": acceptanceCriteria（受け入れ条件）がありません。`);
 		for (const dep of d.dependsOn ?? []) {
 			if (!Number.isInteger(dep) || dep < 0 || dep >= i) {
 				errors.push(`issues[${i}]: dependsOn には自分より前の Issue のインデックス (0〜${i - 1}) を指定してください (値: ${dep})。`);
 			}
 		}
-		if (!/受け入れ条件|Acceptance Criteria/i.test(d.body ?? "")) {
-			errors.push(`issues[${i}] "${d.title}": 本文に「受け入れ条件」セクションがありません。`);
-		}
 		if (limits) {
 			if (d.size && !limits.allowedSizes.includes(d.size)) {
 				errors.push(`issues[${i}] "${d.title}": 規模 ${d.size} は大きすぎます（許可: ${limits.allowedSizes.join(" / ")}）。より小さな振る舞いに分割してください。`);
 			}
-			const ac = countAcceptanceCriteria(d.body ?? "");
 			if (ac > limits.maxAcceptanceCriteria) {
 				errors.push(`issues[${i}] "${d.title}": 受け入れ条件が ${ac} 個あります（上限 ${limits.maxAcceptanceCriteria}）。1 Issue = 1 振る舞いになるよう分割してください。`);
 			}
 		}
 	});
 	return errors;
-}
-
-/** 依存 Issue の参照（作成済み番号 or タイトル）を本文末尾に追記する */
-export function withDependencies(draft: IssueDraft, created: { number?: number; title: string }[]): string {
-	const deps = (draft.dependsOn ?? []).map((i) => created[i]).filter(Boolean);
-	if (deps.length === 0) return draft.body;
-	const lines = deps.map((d) => `- ${d.number ? `#${d.number}` : d.title}`);
-	return `${draft.body.replace(/\s+$/, "")}\n\n## 依存関係\n\n以下の Issue の完了後に着手してください。\n\n${lines.join("\n")}\n`;
 }
 
 export function ghIssueCreateArgs(title: string, body: string, labels: string[], repo?: string): string[] {
