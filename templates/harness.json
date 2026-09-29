@@ -20,7 +20,8 @@
     "commitArtifacts": false,
     "pr": "ask",
     "draft": false,
-    "dirtyStart": "ask"
+    "dirtyStart": "ask",
+    "pullBase": true
   },
   "models": {},
   "compaction": {

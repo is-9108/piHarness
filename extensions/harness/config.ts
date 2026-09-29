@@ -44,6 +44,8 @@ export interface GitSettings {
 	draft: boolean;
 	/** 未コミットの変更がある状態で /impl を開始するときの扱い: ask = 確認 / allow = そのまま / refuse = 中止 */
 	dirtyStart: "ask" | "allow" | "refuse";
+	/** 実装開始前に開始元ブランチ（main など）を origin から pull する */
+	pullBase: boolean;
 }
 
 export interface HarnessConfig {
@@ -97,6 +99,7 @@ export const DEFAULT_GIT: GitSettings = {
 	pr: "ask",
 	draft: false,
 	dirtyStart: "ask",
+	pullBase: true,
 };
 
 export const DEFAULT_CONFIG: HarnessConfig = {
@@ -262,7 +265,7 @@ export function normalizeGit(raw: unknown, warnings: string[] = []): GitSettings
 	}
 	const r = raw as Record<string, unknown>;
 	const g: GitSettings = { ...DEFAULT_GIT };
-	for (const key of ["enabled", "commit", "commitArtifacts", "draft"] as const) {
+	for (const key of ["enabled", "commit", "commitArtifacts", "draft", "pullBase"] as const) {
 		if (r[key] === undefined) continue;
 		if (typeof r[key] === "boolean") g[key] = r[key] as boolean;
 		else warnings.push(`git.${key} は true / false で指定してください。`);

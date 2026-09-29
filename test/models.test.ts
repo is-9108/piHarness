@@ -76,6 +76,7 @@ describe("Git・チェック設定", () => {
 			pr: "ask",
 			draft: false,
 			dirtyStart: "ask",
+			pullBase: true,
 		});
 		const w: string[] = [];
 		const g = normalizeGit({ pr: "always", draft: "yes", branchPrefix: "feat/", dirtyStart: "refuse" }, w);
@@ -84,6 +85,7 @@ describe("Git・チェック設定", () => {
 		assert.equal(g.branchPrefix, "feat/");
 		assert.equal(g.dirtyStart, "refuse");
 		assert.equal(normalizeGit({ branchPrefix: "bad prefix" }, w).branchPrefix, "issue-");
+		assert.equal(normalizeGit({ pullBase: false }).pullBase, false);
 	});
 
 	it("checkCommands は文字列の配列のみ", () => {

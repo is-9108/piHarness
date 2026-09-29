@@ -4,7 +4,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { branchName, diffTrees, snapshotTree, commitAll, currentBranch, diffSince, dirtyFiles, fingerprint, isGitRepo, prepareBranch, type Run } from "../extensions/harness/git.ts";
+import { branchName, diffTrees, snapshotTree, commitAll, currentBranch, diffSince, dirtyFiles, fingerprint, isGitRepo, prepareBranch, pullBaseBranch, type Run } from "../extensions/harness/git.ts";
 
 function repo(): { dir: string; run: Run; git: (...a: string[]) => string } {
 	const dir = mkdtempSync(join(tmpdir(), "pih-git-"));
@@ -25,6 +25,28 @@ function repo(): { dir: string; run: Run; git: (...a: string[]) => string } {
 }
 
 const EX = [".pi/harness"];
+
+/** origin（bare）と、そこから clone した利用者の作業リポジトリ・別の開発者のリポジトリ */
+function withOrigin() {
+	const me = repo();
+	const origin = mkdtempSync(join(tmpdir(), "pih-origin-"));
+	execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin]);
+	me.git("remote", "add", "origin", origin);
+	me.git("push", "-q", "-u", "origin", "main");
+	const other = mkdtempSync(join(tmpdir(), "pih-other-"));
+	execFileSync("git", ["clone", "-q", origin, other]);
+	const og = (...a: string[]) => execFileSync("git", a, { cwd: other, encoding: "utf8" }).trim();
+	og("config", "user.name", "o");
+	og("config", "user.email", "o@example.com");
+	const pushFromOther = (file: string) => {
+		writeFileSync(join(other, file), `${file}\n`);
+		og("add", "-A");
+		og("commit", "-q", "-m", file);
+		og("push", "-q", "origin", "main");
+		return og("rev-parse", "HEAD");
+	};
+	return { ...me, pushFromOther };
+}
 
 describe("git", () => {
 	it("作業ツリーの指紋は bash 等での変更・新規ファイルで変わり、除外ディレクトリの変更では変わらない", async () => {
@@ -84,6 +106,34 @@ describe("git", () => {
 		git("switch", "-q", "issue-1");
 		const resume = await prepareBranch(run, "issue-1");
 		assert.deepEqual(resume, { base: mainHead, baseBranch: "main", branch: "issue-1" });
+	});
+
+	it("開始元ブランチを origin から pull する（main 上でも別ブランチ上でも）", async () => {
+		const { run, git, pushFromOther } = withOrigin();
+		assert.equal((await pullBaseBranch(run, "main")).status, "up-to-date");
+		const remote1 = pushFromOther("b.js");
+		const r1 = await pullBaseBranch(run, "main");
+		assert.equal(r1.status, "updated");
+		assert.equal(git("rev-parse", "main"), remote1, "main 上では pull --ff-only");
+		git("switch", "-q", "-c", "issue-1");
+		const remote2 = pushFromOther("c.js");
+		assert.equal((await pullBaseBranch(run, "main")).status, "updated");
+		assert.equal(git("rev-parse", "main"), remote2, "別ブランチ上でもローカルの main を進める");
+		assert.equal(git("rev-parse", "--abbrev-ref", "HEAD"), "issue-1", "現在のブランチは変えない");
+		const info = await prepareBranch(run, "issue-2", "main");
+		assert.equal(info.base, remote2, "最新の main から作業ブランチを作る");
+	});
+
+	it("origin が無ければ何もせず、早送りできなければ失敗を返す", async () => {
+		assert.equal((await pullBaseBranch(repo().run, "main")).status, "no-remote");
+		const { run, git, dir, pushFromOther } = withOrigin();
+		pushFromOther("b.js");
+		writeFileSync(join(dir, "local.js"), "x\n");
+		git("add", "-A");
+		git("commit", "-q", "-m", "local only");
+		const r = await pullBaseBranch(run, "main");
+		assert.equal(r.status, "failed");
+		assert.match(r.status === "failed" ? r.error : "", /origin と揃えて/);
 	});
 
 	it("ブランチ名は英数字のタイトルだけを使う", () => {

@@ -22,7 +22,7 @@ import { checkBash, checkWrite, type GuardPaths, isHarnessFile, isInside, STATE_
 import { buildContext } from "./guidance.ts";
 import { emptyRegistry, type IssueRegistry, nextIssue, progressTable, registerIssues, setStatus } from "./progress.ts";
 import { analyzeTestDiff, findingsMarkdown, signature as integritySignature } from "./integrity.ts";
-import { commitAll, currentBranch, defaultBranch, diffTrees, snapshotTree, diffSince, dirtyFiles, fingerprint, type GitInfo, headSha, isGitRepo, prepareBranch, branchName, type Run } from "./git.ts";
+import { commitAll, currentBranch, defaultBranch, diffTrees, snapshotTree, diffSince, dirtyFiles, fingerprint, type GitInfo, headSha, isGitRepo, prepareBranch, pullBaseBranch, branchName, type Run } from "./git.ts";
 import { type UsageFile, sumSession, summarize as summarizeUsage, upsertSession, usageMarkdown } from "./usage.ts";
 import {
 	artifactPaths,
@@ -1507,6 +1507,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	/** 実装フローの状態を用意する: 作業ブランチ・差分の基準・Issue 本文（セッションはまだ開始しない） */
 	async function prepareImplement(ctx: ExtensionContext, cfg: HarnessConfig, issue: IssueRef, body: string | undefined): Promise<Prepared> {
 		let git: GitInfo | undefined;
+		let pullNote = "";
 		const run = gitRun(ctx);
 		if (cfg.git.enabled && (await isGitRepo(run))) {
 			const dirty = await dirtyFiles(run, gitExcludes(ctx, cfg));
@@ -1517,20 +1518,30 @@ export default function piHarness(pi: ExtensionAPI): void {
 					return { ok: false, message: "未コミットの変更があるため、ユーザーが開始を取り消しました。" };
 				}
 			}
-			// 作成元: 設定 → 現在のブランチ。ただし別の作業ブランチ（前の Issue）上にいる場合は既定ブランチから切る
+			// 作成元: 設定の baseBranch → 既定ブランチ（main など）。別の作業ブランチ（前の Issue）上にいる場合だけ積み上げも選べる
 			const target = branchName(cfg.git.branchPrefix, issue);
-			let startFrom = cfg.git.baseBranch;
+			const baseBranch = cfg.git.baseBranch ?? (await defaultBranch(run));
+			let startFrom = baseBranch;
 			const cur = await currentBranch(run);
-			if (!startFrom && cur && cur !== target && cfg.git.branchPrefix && cur.startsWith(cfg.git.branchPrefix)) {
-				const def = await defaultBranch(run);
-				if (def) {
-					startFrom = def;
-					if (ctx.hasUI) {
-						const options = [`${def} から作成する（推奨）`, `現在の作業ブランチ ${cur} から作成する（積み上げ）`];
-						const choice = await ctx.ui.select(`別の作業ブランチ ${cur} 上にいます。${target} をどこから作成しますか？`, options);
-						if (choice === undefined) return { ok: false, message: "ブランチの作成元が選ばれなかったため、開始を取り消しました。" };
-						if (choice === options[1]) startFrom = cur;
+			if (baseBranch && ctx.hasUI && cur && cur !== target && cur !== baseBranch && cfg.git.branchPrefix && cur.startsWith(cfg.git.branchPrefix)) {
+				const options = [`${baseBranch} から作成する（推奨）`, `現在の作業ブランチ ${cur} から作成する（積み上げ）`];
+				const choice = await ctx.ui.select(`別の作業ブランチ ${cur} 上にいます。${target} をどこから作成しますか？`, options);
+				if (choice === undefined) return { ok: false, message: "ブランチの作成元が選ばれなかったため、開始を取り消しました。" };
+				if (choice === options[1]) startFrom = cur;
+			}
+			// 開始元ブランチを必ず origin から最新化してから始める（git.pullBase）
+			if (cfg.git.pullBase && baseBranch) {
+				const pulled = await pullBaseBranch(run, baseBranch);
+				if (pulled.status === "failed") {
+					const msg = `${baseBranch} を origin から pull できませんでした:\n${pulled.error}`;
+					if (!ctx.hasUI || !(await ctx.ui.confirm(`${baseBranch} を最新化できませんでした`, `${msg}\n\n最新化せずに開始しますか？`))) {
+						return { ok: false, message: `[piHarness] ${msg}\n原因を解消してから開始してください（最新化しない場合は git.pullBase: false）。` };
 					}
+					pullNote = `⚠ ${baseBranch} を最新化せずに開始しました。`;
+				} else if (pulled.status === "updated") {
+					pullNote = `${baseBranch} を origin から pull しました（${pulled.from?.slice(0, 7) ?? "新規"} → ${pulled.to.slice(0, 7)}）。`;
+				} else if (pulled.status === "up-to-date") {
+					pullNote = `${baseBranch} は最新です。`;
 				}
 			}
 			try {
@@ -1554,7 +1565,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		);
 		return {
 			ok: true,
-			message: `${describeIssue(issue)} の実装フローを開始します。${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}`,
+			message: `${describeIssue(issue)} の実装フローを開始します。${pullNote}${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}`,
 		};
 	}
 

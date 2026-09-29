@@ -106,6 +106,38 @@ export async function defaultBranch(run: Run): Promise<string | undefined> {
 	return undefined;
 }
 
+export type PullResult =
+	| { status: "updated"; from?: string; to: string }
+	| { status: "up-to-date"; to: string }
+	| { status: "no-remote" }
+	| { status: "failed"; error: string };
+
+/**
+ * 開始元ブランチ（main など）を origin から最新化する（git pull 相当。早送りだけで、マージコミットは作らない）。
+ * そのブランチにいれば `git pull --ff-only`、いなければ `git fetch origin <b>:<b>` でローカルのブランチを進める。
+ * origin が無いリポジトリでは何もしない。
+ */
+export async function pullBaseBranch(run: Run, branch: string): Promise<PullResult> {
+	const remote = await run("git", ["remote", "get-url", "origin"]);
+	if (remote.code !== 0) return { status: "no-remote" };
+	const before = (await run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])).stdout.trim() || undefined;
+	const current = await currentBranch(run);
+	const r =
+		current === branch
+			? await run("git", ["pull", "--ff-only", "origin", branch])
+			: await run("git", ["fetch", "origin", `${branch}:${branch}`]);
+	if (r.code !== 0) {
+		const out = (r.stderr || r.stdout).trim();
+		const hint = /non-fast-forward|rejected|diverg|Not possible to fast-forward/i.test(out)
+			? `
+ローカルの ${branch} に origin に無いコミットがあります。${branch} を origin と揃えてから開始してください。`
+			: "";
+		return { status: "failed", error: `${out}${hint}` };
+	}
+	const after = (await run("git", ["rev-parse", `refs/heads/${branch}`])).stdout.trim();
+	return before === after ? { status: "up-to-date", to: after } : { status: "updated", from: before, to: after };
+}
+
 /**
  * 作業ブランチを用意する。既存なら切り替え、無ければ startFrom（省略時は現在のブランチ）から作成する。
  * 差分の基準 (base) は開始元ブランチの先端。既存ブランチの再開時は開始元との merge-base を使う。
