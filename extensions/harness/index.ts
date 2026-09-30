@@ -18,7 +18,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { findModel, type HarnessConfig, loadConfig, PROCESS_KINDS, resolveProcessModel, saveConfigPatch } from "./config.ts";
-import { checkBash, checkWrite, type GuardPaths, isHarnessFile, isInside, STATE_FILE } from "./guard.ts";
+import { checkBash, checkOtherTool, checkWrite, type GuardPaths, isHarnessFile, isInside, mayModify, STATE_FILE, type ToolMeta } from "./guard.ts";
 import { buildContext } from "./guidance.ts";
 import { emptyRegistry, type IssueRegistry, nextIssue, progressTable, registerIssues, setStatus } from "./progress.ts";
 import { analyzeTestDiff, findingsMarkdown, signature as integritySignature } from "./integrity.ts";
@@ -122,6 +122,11 @@ function renderNamed(cwd: string, cfg: HarnessConfig, name: TemplateName, vars: 
 	return renderTemplate(loadTemplate(cwd, cfg.workDir, BUILTIN_TEMPLATES, name), vars);
 }
 const ALL_PHASES = Object.keys(PHASE_LABELS) as Phase[];
+/**
+ * harness ツールはユーザーに確認したりワークフローを進めたりするので、モデルだけが呼べるようにする
+ * （codemode のスクリプトから ctx.executeTool で呼ばせない）。
+ */
+const HARNESS_TOOL_EXPOSURE = "model-only" as const;
 
 type ToolText = { content: { type: "text"; text: string }[]; details: { phase: Phase }; terminate?: boolean };
 
@@ -969,6 +974,12 @@ export default function piHarness(pi: ExtensionAPI): void {
 		}
 	});
 
+	/** 登録されているツールの宣言（MCP ツールの annotations など） */
+	function toolMeta(name: string): ToolMeta {
+		const info = pi.getAllTools().find((t) => t.name === name) as { annotations?: ToolMeta["annotations"] } | undefined;
+		return { name, annotations: info?.annotations };
+	}
+
 	// 承認ゲート前のコード変更・状態ファイルの改ざん・プロセス完了後の作業をブロック
 	pi.on("tool_call", async (event, ctx) => {
 		const cfg = cfgOf(ctx);
@@ -989,6 +1000,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 				}
 			}
 		}
+		// MCP ツールなど、名前で検査できないツールは宣言（annotations）で判断する
+		const other = checkOtherTool(state, toolMeta(event.toolName), guardPaths(ctx, cfg));
+		if (other.block) return { block: true, reason: other.reason };
 		if (!isActive(state)) return;
 		if (compactRequested && !state.pendingHandoff) {
 			interruptedForCompaction = true;
@@ -1005,7 +1019,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				terminate: true,
 			};
 		}
-		if (event.toolName === "bash") {
+		if (event.toolName === "bash" || event.toolName === "powershell") {
 			const d = checkBash(state, (event.input as { command?: string }).command);
 			if (d.block) return { block: true, reason: d.reason };
 		}
@@ -1014,9 +1028,12 @@ export default function piHarness(pi: ExtensionAPI): void {
 	// テスト合格後の変更を検知（未テストのままレビューや完了へ進ませない）
 	pi.on("tool_result", async (event, ctx) => {
 		if (!isActive(state) || event.isError) return;
-		if (event.toolName !== "edit" && event.toolName !== "write") return;
-		const path = (event.input as { path?: string }).path;
-		if (isHarnessFile(path, guardPaths(ctx, cfgOf(ctx)))) return;
+		if (event.toolName === "edit" || event.toolName === "write") {
+			const path = (event.input as { path?: string }).path;
+			if (isHarnessFile(path, guardPaths(ctx, cfgOf(ctx)))) return;
+		} else if (!mayModify(toolMeta(event.toolName))) {
+			return;
+		}
 		if (!TEST_PHASES.includes(state.phase)) return;
 		const next = markDirty(state);
 		if (next !== state) setState(next, ctx);
@@ -1027,6 +1044,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_status",
 		label: "Harness Status",
 		description:
@@ -1053,6 +1071,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	let forceHandoff = false;
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_control",
 		label: "Harness Control",
 		description:
@@ -1171,6 +1190,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_ask",
 		label: "Ask User",
 		description:
@@ -1202,6 +1222,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_phase",
 		label: "Harness Phase",
 		description:
@@ -1271,6 +1292,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_request_approval",
 		label: "Request Approval",
 		description:
@@ -1343,6 +1365,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	}
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_run_tests",
 		label: "Run Tests",
 		description:
@@ -1483,6 +1506,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_request_test_change",
 		label: "Request Test Change",
 		description:
@@ -1536,6 +1560,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_record_review",
 		label: "Record Review",
 		description:
@@ -1621,6 +1646,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	}
 
 	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_create_issues",
 		label: "Create Issues",
 		description:

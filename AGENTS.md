@@ -46,6 +46,7 @@ Node 22.19+。TypeScript は型除去で直接実行（ビルドなし）。impo
 
 ## Pi の落とし穴（実装で確認済み）
 
+- pi 0.99 以降、MCP ツールは既定で codemode のスクリプトから（有効なツールの設定に関係なく）呼べる → ツールを絞るだけでは書き込みを防げない。`tool_call` で `checkOtherTool` を通す。新しい harness ツールは `exposure: HARNESS_TOOL_EXPOSURE`（`model-only`）で登録する。
 - `/skill:<名前>` はスキル名の後ろが**空白**でないと展開されない（改行は不可）。
 - `ctx.newSession()` はコマンドからしか呼べない → ツールは「次セッション待ち」を記録し、`agent_settled` で `/harness next` を送る。
 - `ctx.compact()` はターンの区切りで呼んでも実行が止まらない → `turn_end` で予約し、次のツール呼び出しを止めて `agent_settled` で圧縮。
