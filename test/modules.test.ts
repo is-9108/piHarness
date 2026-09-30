@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { detectTestCommand, loadConfig, mergeConfig, saveConfigPatch } from "../extensions/harness/config.ts";
-import { checkBash, checkWrite, isHarnessFile } from "../extensions/harness/guard.ts";
+import { checkBash, checkOtherTool, checkWrite, isHarnessFile, mayModify } from "../extensions/harness/guard.ts";
 import { buildContext } from "../extensions/harness/guidance.ts";
 import {
 	ghIssueCreateArgs,
@@ -100,6 +100,22 @@ describe("guard", () => {
 		assert.equal(checkWrite(s, "src/a.ts", paths).block, true);
 		assert.match(checkWrite(s, "src/a.ts", paths).reason ?? "", /仕様の確認/);
 		assert.equal(checkWrite(s, ".pi/harness/issue-1/notes.md", paths).block, false);
+	});
+
+	it("MCP ツールなど名前で検査できないツールは、読み取り専用と宣言されたものだけ書き込み制限中に使える", () => {
+		assert.equal(mayModify({ name: "mcp__fs__write_file" }), true, "注釈の無い MCP ツールは MCP の既定どおり書き換えうる");
+		assert.equal(mayModify({ name: "mcp__fs__read_file", annotations: { readOnlyHint: true } }), false);
+		assert.equal(mayModify({ name: "my_tool", annotations: { readOnlyHint: false } }), true);
+		assert.equal(mayModify({ name: "my_tool" }), false, "注釈を宣言していない他の拡張のツールは判断できないので許可");
+		for (const name of ["read", "bash", "edit", "write", "codemode", "tool_search", "harness_phase"]) assert.equal(mayModify({ name }), false, name);
+
+		const plan = transition(startImplement(initialState(), { title: "x" }, DEFAULT_LIMITS, ".pi/harness/issue-1"), "impl_plan");
+		const d = checkOtherTool(plan, { name: "mcp__fs__write_file" }, paths);
+		assert.equal(d.block, true);
+		assert.match(d.reason ?? "", /プランが承認されるまで[\s\S]*readOnlyHint/);
+		assert.equal(checkOtherTool(plan, { name: "mcp__fs__read_file", annotations: { readOnlyHint: true } }, paths).block, false);
+		assert.equal(checkOtherTool({ ...plan, phase: "impl_tdd" }, { name: "mcp__fs__write_file" }, paths).block, false, "TDD 中は制限しない");
+		assert.equal(checkOtherTool(initialState(), { name: "mcp__fs__write_file" }, paths).block, false, "フロー外では制限しない");
 	});
 
 	it("作業ファイル判定", () => {

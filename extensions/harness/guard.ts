@@ -83,6 +83,46 @@ export function isHarnessFile(path: string | undefined, p: GuardPaths): boolean 
 	return !!path && (isInside(path, p.workDir, p.cwd) || isInside(path, p.docsDir, p.cwd));
 }
 
+/**
+ * 名前ごとに個別の検査をしている、またはファイルを書き換えない組み込みのツール。
+ * edit / write はパスで、bash / powershell はコマンドで検査する。codemode のスクリプトが呼ぶツールは、1 つずつ tool_call を通る。
+ */
+const BUILTIN_TOOLS = new Set(["read", "grep", "find", "ls", "bash", "powershell", "edit", "write", "codemode", "tool_search"]);
+
+/** ツールの情報（pi.getAllTools() から取れるもの）。annotations は MCP ツールの注釈と同じ意味 */
+export interface ToolMeta {
+	name: string;
+	annotations?: { readOnlyHint?: boolean };
+}
+
+/**
+ * 組み込み・harness 以外のツール（MCP ツールや他の拡張のツール）が、ファイルなどを書き換えうるか。
+ * - annotations があれば readOnlyHint で判断する
+ * - MCP ツール（mcp__<サーバー>__<ツール>）は、annotations が無ければ MCP の既定どおり書き換えうるとみなす
+ * - annotations を宣言していない他の拡張のツールは判断できないため、書き換えないものとして扱う
+ */
+export function mayModify(tool: ToolMeta): boolean {
+	if (BUILTIN_TOOLS.has(tool.name) || tool.name.startsWith("harness_")) return false;
+	if (tool.annotations) return tool.annotations.readOnlyHint !== true;
+	return tool.name.startsWith("mcp__");
+}
+
+/**
+ * 書き込みを制限しているフェーズ（承認前・レビュー中など）で、ファイルを書き換えうるツールをブロックする。
+ * MCP ツールは既定で codemode のスクリプトからいつでも呼べるため、有効なツールを絞るだけでは防げない。
+ */
+export function checkOtherTool(state: HarnessState, tool: ToolMeta, p: GuardPaths): GuardDecision {
+	if (!state.flow || state.phase === "idle" || !mayModify(tool)) return { block: false };
+	const roots = writableRoots(state.phase, p);
+	if (!roots) return { block: false };
+	return {
+		block: true,
+		reason:
+			`[piHarness] ${WHY[state.phase] ?? ""} 現在のフェーズ: ${state.phase}。` +
+			`${tool.name} は読み取り専用（readOnlyHint）と宣言されていないため、このフェーズでは使えません。成果物の作成には write を使ってください。`,
+	};
+}
+
 const ISSUE_CREATE = /\bgh\s+issue\s+create\b/;
 
 export function checkBash(state: HarnessState, command: string | undefined): GuardDecision {

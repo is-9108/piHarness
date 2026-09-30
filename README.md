@@ -22,7 +22,7 @@ AI エージェントに次の 3 つのフローを「手順書」だけでな�
 - Raspberry Pi 5（arm64 / Cortex-A76。メモリ 8GB 以上推奨）+ Raspberry Pi OS 64-bit（Bookworm 以降）
 - ストレージは SD カードより NVMe SSD（M.2 HAT）推奨: `npm install` やテストの I/O が速く、書き込み寿命の心配も減ります
 - Node.js **22.19 以上**（pi-coding-agent の要件）
-- pi-coding-agent: `npm install -g @earendil-works/pi-coding-agent`
+- pi-coding-agent **0.99 以降を推奨**: `npm install -g @earendil-works/pi-coding-agent`（0.99 で組み込みになった MCP・codemode への対策を含みます。詳しくは [docs/architecture.md](docs/architecture.md#codemode-と-mcppi-099-以降)）
 - GitHub CLI（Issue 登録・取得に使用。無くても動作し、その場合 Issue は `docs/issues/` に Markdown で保存）
   ```bash
   sudo apt install gh
@@ -77,6 +77,7 @@ node .pi/piHarness/scripts/install.mjs
 - **プロジェクトごとに独立:** ワークフローの状態（`.pi/harness/state.json`）・成果物・設定（`.pi/harness.json`）はプロジェクトごとに独立しています。
   プロジェクトごとに別のバージョンの piHarness を使うこともできます。
 - **本体は編集できない:** エージェントはプロジェクト内の piHarness 本体（`.pi/piHarness/`）を編集できません（拡張がブロックします）。
+- **MCP ツール:** プラン承認前やレビュー中など書き込みを制限している間は、読み取り専用（`readOnlyHint`）と宣言された MCP ツールだけが使えます。
 - **依存パッケージは不要:** clone 先で `npm install` は不要です。必要なパッケージは Pi 本体が提供します。
 
 ### B. 全プロジェクト共通で使う

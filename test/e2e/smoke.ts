@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFil
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import {
 	type AgentSession,
 	type CreateAgentSessionRuntimeFactory,
@@ -54,6 +55,7 @@ writeFileSync(
 		},
 	}),
 );
+let toolInfos: () => { name: string; exposure?: string }[] = () => [];
 const call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 const done = (text: string) => fauxAssistantMessage(text);
 
@@ -68,7 +70,27 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 		resourceLoaderOptions: {
 			additionalExtensionPaths: [join(root, "extensions/harness/index.ts")],
 			additionalSkillPaths: [join(root, "skills")],
-			extensionFactories: [(pi) => pi.registerProvider(faux.provider)],
+			extensionFactories: [
+				(pi) => {
+					pi.registerProvider(faux.provider);
+					// MCP サーバーのツールに見立てたもの（codemode のスクリプトからは有効なツールに関係なく呼べる）
+					const tool = (name: string, readOnly: boolean) =>
+						pi.registerTool({
+							name,
+							label: name,
+							description: name,
+							parameters: Type.Object({ path: Type.String() }),
+							annotations: readOnly ? { readOnlyHint: true } : undefined,
+							async execute(_id, params) {
+								if (!readOnly) writeFileSync(join(project, params.path), "mcp\n");
+								return { content: [{ type: "text", text: `${name} ok` }], details: undefined };
+							},
+						});
+					tool("mcp__fs__write_file", false);
+					tool("mcp__fs__read_file", true);
+					toolInfos = () => pi.getAllTools();
+				},
+			],
 		},
 	});
 	const created = await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model: faux.getModel() });
@@ -152,8 +174,17 @@ let r = await run("/impl 1", [
 	call("write", { path: "src/feature.js", content: "x" }), // 承認前 → ブロック
 	call("write", { path: p("plan.md"), content: "# プラン" }),
 	call("write", { path: join(root, "skills/harness-tdd/SKILL.md"), content: "x" }), // piHarness 本体 → ブロック
+	call("mcp__fs__write_file", { path: "src/mcp.js" }), // 書き換えうる MCP ツール → 承認前はブロック
+	call("mcp__fs__read_file", { path: "src/mcp.js" }), // 読み取り専用と宣言された MCP ツール → 使える
 	call("harness_request_approval", { kind: "plan", summary: "PLAN-SESSION-MARKER", documents: [p("plan.md")] }),
 ]);
+assert.match(r[4], /^2:mcp__fs__write_file \[ERROR\]: .*readOnlyHint/);
+assert.ok(!existsSync(join(project, "src/mcp.js")));
+assert.match(r[5], /^2:mcp__fs__read_file: mcp__fs__read_file ok/);
+// harness ツールはモデルだけが呼べる（codemode のスクリプトから呼ばせない）
+const harnessTools = toolInfos().filter((t) => t.name.startsWith("harness_"));
+assert.equal(harnessTools.length, 9);
+assert.ok(harnessTools.every((t) => t.exposure === "model-only"));
 assert.match(r[3], /^2:write \[ERROR\]: .*piHarness 本体/);
 assert.match(readFileSync(join(root, "skills/harness-tdd/SKILL.md"), "utf8"), /^---\nname: harness-tdd/);
 assert.equal(sessionNo, 2, "/impl でプラン作成用の新しいセッションが作られる");
