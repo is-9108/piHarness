@@ -89,6 +89,8 @@ export interface HarnessConfig {
 	baseline: boolean;
 	/** Red で失敗を確かめたテストを Green の合格までロックし、レビュー以降はレビュー時点のテストをロックする */
 	testLock: boolean;
+	/** プロバイダーの利用上限で止まったとき、models の次の候補に切り替えて同じセッションで再開する */
+	fallback: FallbackSettings;
 	/** しきい値による自動圧縮 */
 	compaction: { enabled: boolean; thresholdPercent: number };
 	/** TUI の入力欄の上にダッシュボード（工程・いまの作業・ブランチ・トークン等）を表示するか */
@@ -98,6 +100,16 @@ export interface HarnessConfig {
 }
 
 export type IssueSize = "S" | "M" | "L";
+
+export interface FallbackSettings {
+	enabled: boolean;
+	/** 利用枠・課金の上限のとき、解除の時刻が分からなければこの時間（分）だけそのプロバイダーを避ける */
+	quotaCooldownMinutes: number;
+	/** 一時的な混雑・レート制限（pi の再試行でも回復しなかったもの）のときに避ける時間（分） */
+	transientCooldownMinutes: number;
+}
+
+export const DEFAULT_FALLBACK: FallbackSettings = { enabled: true, quotaCooldownMinutes: 60, transientCooldownMinutes: 10 };
 
 export const DEFAULT_GIT: GitSettings = {
 	enabled: true,
@@ -129,6 +141,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
 	flakyRetries: 1,
 	baseline: true,
 	testLock: true,
+	fallback: DEFAULT_FALLBACK,
 	compaction: { enabled: true, thresholdPercent: 60 },
 	dashboard: true,
 	issueLimits: { maxAcceptanceCriteria: 5, allowedSizes: ["S", "M"], maxPlanTestCases: 12 },
@@ -192,6 +205,7 @@ export function mergeConfig(raw: Partial<HarnessConfig>, warnings: string[] = []
 		c.flakyRetries = DEFAULT_CONFIG.flakyRetries;
 	}
 	c.compaction = normalizeCompaction(raw.compaction as unknown, warnings);
+	c.fallback = normalizeFallback(raw.fallback as unknown, warnings);
 	if (typeof c.dashboard !== "boolean") c.dashboard = DEFAULT_CONFIG.dashboard;
 	c.issueLimits = normalizeIssueLimits(raw.issueLimits as unknown, warnings);
 	return c;
@@ -258,6 +272,26 @@ export function normalizeCompaction(raw: unknown, warnings: string[] = []): Harn
 		const n = r.thresholdPercent;
 		if (typeof n === "number" && n >= 20 && n <= 95) out.thresholdPercent = n;
 		else warnings.push("compaction.thresholdPercent は 20〜95 の数値で指定してください。");
+	}
+	return out;
+}
+
+export function normalizeFallback(raw: unknown, warnings: string[] = []): FallbackSettings {
+	const out = { ...DEFAULT_FALLBACK };
+	if (raw === undefined || raw === null) return out;
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		warnings.push("fallback はオブジェクトで指定してください。既定値を使用します。");
+		return out;
+	}
+	const r = raw as Record<string, unknown>;
+	if (r.enabled !== undefined) {
+		if (typeof r.enabled === "boolean") out.enabled = r.enabled;
+		else warnings.push("fallback.enabled は true / false で指定してください。");
+	}
+	for (const key of ["quotaCooldownMinutes", "transientCooldownMinutes"] as const) {
+		if (r[key] === undefined) continue;
+		if (Number.isInteger(r[key]) && (r[key] as number) >= 1) out[key] = r[key] as number;
+		else warnings.push(`fallback.${key} は 1 以上の整数（分）で指定してください。`);
 	}
 	return out;
 }

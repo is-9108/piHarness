@@ -22,7 +22,7 @@ AI エージェントに次の 3 つのフローを「手順書」だけでな�
 - Raspberry Pi 5（arm64 / Cortex-A76。メモリ 8GB 以上推奨）+ Raspberry Pi OS 64-bit（Bookworm 以降）
 - ストレージは SD カードより NVMe SSD（M.2 HAT）推奨: `npm install` やテストの I/O が速く、書き込み寿命の心配も減ります
 - Node.js **22.19 以上**（pi-coding-agent の要件）
-- pi-coding-agent **0.99 以降を推奨**: `npm install -g @earendil-works/pi-coding-agent`（0.99 で組み込みになった MCP・codemode への対策を含みます。詳しくは [docs/architecture.md](docs/architecture.md#codemode-と-mcppi-099-以降)）
+- pi-coding-agent **1.0 以降を推奨**（0.99 以降で動作）: `npm install -g @earendil-works/pi-coding-agent`（0.99 で組み込みになった MCP・codemode への対策を含みます。詳しくは [docs/architecture.md](docs/architecture.md#codemode-と-mcppi-099-以降)）
 - GitHub CLI（Issue 登録・取得に使用。無くても動作し、その場合 Issue は `docs/issues/` に Markdown で保存）
   ```bash
   sudo apt install gh
@@ -56,7 +56,7 @@ pi        # 起動してプロジェクトを信頼（trust）する
 |------|------|
 | `.pi/settings.json` | `packages` に `"./piHarness"` を追加（既存の設定・パッケージは保持） |
 | `.pi/harness.json` | 無ければ雛形を作成（あれば変更しない）。プロジェクトごとのテストコマンド・モデルはここで設定 |
-| `.gitignore` | `.pi/harness/state.json`, `.pi/harness/**/logs/`, `.pi/harness/**/test-lock/`, `.pi/piHarness/` を追加 |
+| `.gitignore` | `.pi/harness/state.json`, `.pi/harness/provider-status.json`, `.pi/harness/**/logs/`, `.pi/harness/**/test-lock/`, `.pi/piHarness/` を追加 |
 | 環境チェック | Node.js 22.19 以上・pi・gh（ログイン状態）を確認して表示 |
 
 - **更新:** `git -C .pi/piHarness pull`（pi 起動中なら `/reload`）
@@ -132,6 +132,7 @@ pi（TUI）を起動して、**やりたいことを普通の言葉で話しか�
 - **コンテキスト使用率:** 自動圧縮のしきい値に近づくと黄色、超えると赤になります。
 - **色分け:** エスカレーション中は工程が ⚠ で赤く表示され、どう伝えればよいかも表示します。
 - **非表示にする:** 何も進めていないときは「待機中」と現在のブランチ・話しかけ方を表示します。`.pi/harness.json` の `"dashboard": false` で非表示にできます（ステータス行の 1 行表示になります）。
+- **pi 1.0 のフルスクリーン表示:** pi 1.0 から TUI は既定でフルスクリーンになりました。テストのログなどを端末のスクロールバックで見返したい場合や、表示が崩れる場合は、pi の設定 `tuiMode` を `"regular"` にするか `pi --tui-mode regular` で起動してください。
 
 コマンドでも同じ操作ができます（RPC など確認ダイアログを出せない環境ではコマンドを使います）。
 
@@ -267,6 +268,7 @@ pi（TUI）を起動して、**やりたいことを普通の言葉で話しか�
 | `issueLimits` | AC 5 個・S/M・テスト 12 件 | Issue とプランの大きさの上限（下記） |
 | `git` | 下記 | Git 連携（作業ブランチ・差分の基準・コミット・PR） |
 | `models` | {} | プロセスごとのモデル・思考レベル（下記） |
+| `fallback` | 有効・60 分・10 分 | 利用上限で止まったときに models の次の候補へ切り替える（下記）。`enabled` / `quotaCooldownMinutes`（利用枠・課金の上限で避ける時間）/ `transientCooldownMinutes`（混雑・レート制限で避ける時間） |
 
 ### トークン消費の効率化
 
@@ -399,7 +401,19 @@ Issue 本文・PR 本文・レビュー記録（`review-N.md`）は、エージ�
 - `thinking` は `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` から選びます。モデルの対応範囲に丸められます。
 - プロセス個別の指定にない項目は `default` の値を使います。どちらにもなければ Pi の既定値のままです。
 - 候補がすべて使えない場合（見つからない・認証が未設定）は、警告を出して既定のモデルで続行します。
-- `/harness models` で各プロセスに実際に使われるモデルを確認できます。利用可能なモデルの一覧は `pi --list-models` で確認できます。
+- `/harness models` で各プロセスに実際に使われるモデルと、利用上限で避けているプロバイダーを確認できます。利用可能なモデルの一覧は `pi --list-models` で確認できます。
+
+#### 利用上限での切り替え（`fallback`）
+
+pi は一時的なエラー（429・overloaded・5xx など）を自分で数回再試行しますが、サブスクリプションや利用枠の上限（OpenCode Go の月間上限、ChatGPT サブスクリプションの上限、`insufficient_quota` など）は再試行せず、そのまま止まります。
+piHarness はそのエラーで止まったプロセスを見つけて、次のように続けます。
+
+1. そのプロバイダーを「上限」として `.pi/harness/provider-status.json` に記録します。解除の時刻はエラーの本文（`Try again in 2 hours` など）から読み、読めなければ `quotaCooldownMinutes`（混雑・レート制限なら `transientCooldownMinutes`）だけ避けます。
+2. そのプロセスの models の候補から、上限中でない次のモデルに切り替え、**同じセッションで**「中断したところから続けて」と送り直します（会話は引き継がれます）。
+3. 以降のプロセスも、解除されるまではそのプロバイダーの候補を飛ばします。
+4. 候補がすべて上限なら、解除の目安を表示して止まります。解除後に「続けて」と伝えてください。
+
+例えば `"default": ["opencode-go/kimi-k3", "openai/gpt-6.1-sol"]` のように**別のプロバイダーの候補を並べておく**と、片方の上限に達しても作業が止まりません。認証エラー（401 など）は切り替えの対象にしません（`/login` で直してください）。
 
 例えば「ヒアリングは安価な Flash 系モデル、要件定義書作成は高性能モデル」「計画とレビューは高性能モデル、実装は速いモデル」「ラズパイ上のローカル LLM（Ollama など）は Issue 登録のような軽いプロセスだけ」といった使い分けができます。
 
@@ -419,7 +433,7 @@ piHarness 自体を変更するときの構成・守ること・Pi の落とし�
 npm install
 npm run typecheck   # tsc
 npm test            # 状態機械・ガード・設定・Git・テスト保護・テストのロック・失敗の指紋・進み具合・利用量・セットアップスクリプトのユニットテスト (node --test)
-npm run test:e2e    # 偽モデルで実際の Pi セッションランタイムを動かし、3 フロー・セッション切り替え・自動圧縮を通す E2E
+npm run test:e2e    # 偽モデルで実際の Pi セッションランタイムを動かし、3 フロー・セッション切り替え・自動圧縮・利用上限でのモデルの切り替えを通す E2E
 npm run check       # 上記すべて
 ```
 

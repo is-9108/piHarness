@@ -18,6 +18,16 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { findModel, type HarnessConfig, loadConfig, PROCESS_KINDS, resolveProcessModel, saveConfigPatch } from "./config.ts";
+import {
+	classifyProviderError,
+	earliestReset,
+	emptyStatus,
+	formatUntil,
+	limitedUntil,
+	type ProviderStatus,
+	pruneStatus,
+	recordLimit,
+} from "./quota.ts";
 import { checkBash, checkOtherTool, checkWrite, type GuardPaths, isHarnessFile, isInside, mayModify, STATE_FILE, type ToolMeta } from "./guard.ts";
 import { buildContext } from "./guidance.ts";
 import { emptyRegistry, type IssueRegistry, nextIssue, progressTable, registerIssues, setStatus } from "./progress.ts";
@@ -111,6 +121,8 @@ import { compactionInstructions, shouldCompact } from "./compaction.ts";
 import { issueVars, loadTemplate, prVars, renderTemplate, reviewVars, type TemplateName } from "./templates.ts";
 
 const CONTEXT_MESSAGE = "harness-context";
+/** プロバイダーの利用上限の記録（作業項目をまたいで使う。workDir 直下） */
+const PROVIDER_STATUS_FILE = "provider-status.json";
 /** Red 確認（期待どおりの失敗）で返す出力の行数。失敗理由が「未実装」かを確かめられれば十分 */
 const RED_OUTPUT_LINES = 40;
 /** piHarness 自身のディレクトリ（プロジェクト内に clone して使う場合、エージェントに書き換えさせない） */
@@ -377,7 +389,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		const run = gitRun(ctx);
 		// 成果物をコミットする設定でも、テストのロックの記録（内容のコピー）はコミットしない
 		const excludes = cfg.git.commitArtifacts
-			? [...gitExcludes(ctx, cfg).filter((e) => e !== cfg.workDir), `${cfg.workDir}/*/test-lock/*`]
+			? [...gitExcludes(ctx, cfg).filter((e) => e !== cfg.workDir), `${cfg.workDir}/*/test-lock/*`, `${cfg.workDir}/${PROVIDER_STATUS_FILE}`]
 			: gitExcludes(ctx, cfg);
 		const title = `${issue?.title ?? "piHarness 実装"}${issue?.number ? ` (#${issue.number})` : ""}`;
 		let next: GitInfo = { ...git };
@@ -763,13 +775,18 @@ export default function piHarness(pi: ExtensionAPI): void {
 	 * プロセスに設定されたモデル・思考レベルを現在のセッションに適用する。
 	 * 設定が無ければ何もしない（Pi の既定モデルのまま）。失敗しても処理は続け、警告だけ出す。
 	 */
-	async function applyProcessModel(ctx: ExtensionContext, proc: ProcessKind): Promise<string | undefined> {
+	async function applyProcessModel(ctx: ExtensionContext, proc: ProcessKind): Promise<{ text?: string; model?: string; limited: string[] }> {
 		const variant = proc === "review" ? (reviewMode(state) === "full" ? "review_full" : "review_light") : undefined;
 		const setting = resolveProcessModel(cfgOf(ctx).models, proc, variant);
 		const applied: string[] = [];
+		let chosen: string | undefined;
+		/** 利用上限で避けたプロバイダー */
+		const limited: string[] = [];
 		if (setting.model) {
-			// 候補を先頭から試し、見つかって認証が設定されている最初のモデルを使う（フォールバック）
+			// 候補を先頭から試し、見つかって認証が設定されていて、利用上限中でない最初のモデルを使う（フォールバック）
 			const problems: string[] = [];
+			const status = loadProviderStatus(ctx);
+			const now = new Date();
 			for (const ref of setting.model) {
 				// getAvailable() は起動直後に認証状態の反映が遅れることがあるため、全カタログから探して認証は setModel に判定させる
 				const { model, error } = findModel(ref, ctx.modelRegistry.getAll());
@@ -777,11 +794,18 @@ export default function piHarness(pi: ExtensionAPI): void {
 					problems.push(error ?? ref);
 					continue;
 				}
+				const until = limitedUntil(status, model.provider, now);
+				if (until) {
+					limited.push(model.provider);
+					problems.push(`${ref} は ${model.provider} の利用上限のため避けます（${formatUntil(until, now)} まで）。`);
+					continue;
+				}
 				if (!(await setModelWhenReady(ctx, model))) {
 					problems.push(`${ref} の認証が設定されていません。`);
 					continue;
 				}
-				applied.push(`${model.provider}/${model.id}${problems.length ? `（フォールバック: ${problems.length} 件スキップ）` : ""}`);
+				chosen = `${model.provider}/${model.id}`;
+				applied.push(`${chosen}${problems.length ? `（フォールバック: ${problems.length} 件スキップ）` : ""}`);
 				break;
 			}
 			if (applied.length === 0) {
@@ -794,7 +818,77 @@ export default function piHarness(pi: ExtensionAPI): void {
 			pi.setThinkingLevel(setting.thinking);
 			applied.push(`thinking: ${pi.getThinkingLevel()}`);
 		}
-		return applied.length ? applied.join(", ") : undefined;
+		return { text: applied.length ? applied.join(", ") : undefined, model: chosen, limited };
+	}
+
+	// -----------------------------------------------------------------------
+	// 利用上限でのモデルの切り替え
+	// -----------------------------------------------------------------------
+
+	const providerStatusFile = (ctx: { cwd: string }) => join(ctx.cwd, cfgOf(ctx).workDir, PROVIDER_STATUS_FILE);
+
+	function loadProviderStatus(ctx: { cwd: string }): ProviderStatus {
+		const file = providerStatusFile(ctx);
+		if (!existsSync(file)) return emptyStatus();
+		try {
+			const s = JSON.parse(readFileSync(file, "utf8")) as ProviderStatus;
+			return s.version === 1 && s.providers ? s : emptyStatus();
+		} catch {
+			return emptyStatus();
+		}
+	}
+
+	function saveProviderStatus(ctx: { cwd: string }, status: ProviderStatus): void {
+		writeItemFile(ctx, relative(ctx.cwd, providerStatusFile(ctx)), `${JSON.stringify(pruneStatus(status, new Date()), null, 2)}\n`);
+	}
+
+	/** このセッションで処理済みのエラー（同じエラーで二度切り替えない） */
+	const handledErrors = new Set<string>();
+
+	/**
+	 * プロセスがプロバイダーの利用上限のエラーで止まっていれば、そのプロバイダーを上限として記録し、
+	 * models の次の候補に切り替えて同じセッションで再開する。処理した（再開した・止めた）ら true。
+	 */
+	async function handleProviderLimit(ctx: ExtensionContext): Promise<boolean> {
+		const cfg = cfgOf(ctx);
+		if (!cfg.fallback.enabled || !isActive(state) || state.pendingHandoff || !sessionProcess) return false;
+		const entries = ctx.sessionManager.getEntries() as { id?: string; type: string; message?: unknown }[];
+		const entry = [...entries].reverse().find((e) => e.type === "message" && (e.message as { role?: string } | undefined)?.role === "assistant");
+		const msg = entry?.message as { stopReason?: string; errorMessage?: string; provider?: string; model?: string } | undefined;
+		if (!entry || !msg || msg.stopReason !== "error") return false;
+		const key = entry.id ?? `${msg.provider}:${msg.errorMessage}`;
+		if (handledErrors.has(key)) return false;
+		handledErrors.add(key);
+		const kind = classifyProviderError(msg.errorMessage);
+		const provider = msg.provider ?? ctx.model?.provider;
+		if (!kind || !provider) return false;
+
+		const now = new Date();
+		const status = recordLimit(loadProviderStatus(ctx), provider, kind, msg.errorMessage ?? "", now, cfg.fallback, msg.model);
+		saveProviderStatus(ctx, status);
+		const until = limitedUntil(status, provider, now);
+		const failed = `${provider}/${msg.model ?? "?"}`;
+		const why = kind === "quota" ? "利用上限" : "混雑・レート制限";
+		const result = await applyProcessModel(ctx, sessionProcess);
+		if (!result.model) {
+			const reset = earliestReset(status, [provider, ...result.limited], now);
+			const note = result.limited.length > 1 ? "models の候補がすべて利用上限中です。" : "models に切り替え先の候補がありません。";
+			setState({ ...state, log: [...state.log, { at: now.toISOString(), event: `${failed} が${why}で停止（切り替え先なし）` }].slice(-50) }, ctx);
+			ctx.ui.notify(
+				`[piHarness] ${failed} が${why}に達して止まりました。${note}` +
+					`${reset ? `${formatUntil(reset, now)} ごろに解除される見込みです。` : ""}` +
+					"解除後に「続けて」と伝えてください（.pi/harness.json の models に別のプロバイダーの候補を足すと、次からは自動で切り替えます）。",
+				"error",
+			);
+			return true;
+		}
+		setState({ ...state, log: [...state.log, { at: now.toISOString(), event: `${failed} が${why}のため ${result.model} に切り替え` }].slice(-50) }, ctx);
+		ctx.ui.notify(`piHarness: ${failed} が${why}に達したため ${result.model} に切り替えて再開します（${until ? `${formatUntil(until, now)} まで避けます` : ""}）。`, "warning");
+		pi.sendUserMessage(
+			`[piHarness] 前のモデル（${failed}）が${why}に達して応答が止まったため、${result.model} に切り替えました。会話はそのまま引き継がれています。` +
+				"成果物と git status で作業の状態を確かめ、中断したところから続けてください（最初からやり直さない）。",
+		);
+		return true;
 	}
 
 	/**
@@ -831,7 +925,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			sessionItemDir = state.itemDir;
 			setState({ ...state, kickoff: undefined }, ctx);
 			const applied = await applyProcessModel(ctx, proc);
-			if (applied) ctx.ui.notify(`piHarness: ${PROCESS_LABELS[proc]} のモデル → ${applied}`, "info");
+			if (applied.text) ctx.ui.notify(`piHarness: ${PROCESS_LABELS[proc]} のモデル → ${applied.text}`, "info");
 		}
 		applyProcessTools();
 		activity = undefined;
@@ -960,6 +1054,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	// プロセスが終わったら、エージェントが止まった時点で次のプロセスを新しいセッションで開始する
 	pi.on("agent_settled", async (_e, ctx) => {
+		// 利用上限のエラーで止まっていれば、別のモデルに切り替えて再開する
+		if (await handleProviderLimit(ctx)) return;
 		if (compactRequested) {
 			compactRequested = false;
 			if (!state.pendingHandoff && !compacting) startCompaction(ctx, requestedPercent);
@@ -2121,7 +2217,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 								rows.push(`  ${label.padEnd(12, "　")} ${describe(setting.model)}${setting.thinking ? `  thinking: ${setting.thinking}` : ""}`);
 							}
 						}
-						ctx.ui.notify(`プロセスごとのモデル（.pi/harness.json の models。→ はフォールバック順）:\n${rows.join("\n")}`, "info");
+						const now = new Date();
+						const limits = Object.entries(pruneStatus(loadProviderStatus(ctx), now).providers).map(
+							([p, l]) => `  ⛔ ${p}: ${l.kind === "quota" ? "利用上限" : "混雑・レート制限"}（${formatUntil(new Date(l.until), now)} まで避けます）`,
+						);
+						ctx.ui.notify(
+							`プロセスごとのモデル（.pi/harness.json の models。→ はフォールバック順）:\n${rows.join("\n")}` +
+								(limits.length ? `\n\n利用上限で避けているプロバイダー:\n${limits.join("\n")}` : ""),
+							"info",
+						);
 						return;
 					}
 					case "config": {

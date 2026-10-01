@@ -13,7 +13,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.ts",
-    "test:e2e": "node test/e2e/smoke.ts && node test/e2e/compaction.ts && node test/e2e/natural.ts",
+    "test:e2e": "node test/e2e/smoke.ts && node test/e2e/compaction.ts && node test/e2e/natural.ts && node test/e2e/fallback.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run test:e2e"
   },
@@ -24,9 +24,9 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "^0.99.1",
-    "@earendil-works/pi-ai": "^0.99.1",
-    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@earendil-works/pi-agent-core": "^1.0.0",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.0"
   }
