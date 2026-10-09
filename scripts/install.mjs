@@ -1,34 +1,39 @@
 #!/usr/bin/env node
 /**
- * piHarness をプロジェクトに組み込むセットアップスクリプト（何度実行しても同じ結果になる）。
+ * piHarness を全プロジェクト共通で使えるように登録し、プロジェクトの設定を用意するスクリプト（何度実行しても同じ結果になる）。
  *
- * 使い方（プロジェクトのルートで）:
- *   git clone https://github.com/is-9108/piHarness.git .pi/piHarness
- *   node .pi/piHarness/scripts/install.mjs
+ * 使い方:
+ *   git clone https://github.com/is-9108/piHarness.git ~/piHarness   # 1 か所にだけ clone する
+ *   cd ~/projects/my-app
+ *   node ~/piHarness/scripts/install.mjs
  *
  * オプション:
- *   --project <dir>   組み込み先のプロジェクト（既定: clone 先が <dir>/.pi/piHarness なら <dir>、それ以外はカレントディレクトリ）
- *   --uninstall       .pi/settings.json から piHarness の登録を外す（成果物・設定ファイルは残す）
+ *   --project <dir>   設定を用意するプロジェクト（既定: カレントディレクトリ。ホームと piHarness 自身では用意しない）
+ *   --global-only     全プロジェクト共通の登録だけを行う
+ *   --uninstall       全プロジェクト共通の登録を外す（各プロジェクトの設定・成果物は残す）
  *   --dry-run         変更内容を表示するだけで書き込まない
  *
  * やること:
- *   1. <project>/.pi/settings.json の packages に clone 先への相対パスを追加（既存の設定は保持）
- *   2. <project>/.pi/harness.json が無ければ雛形を作成（テストコマンドは自動検出）
- *   3. <project>/.gitignore に状態ファイル・テストログ・（サブモジュールでなければ）clone 先を追加
- *   4. Node.js / pi / gh の有無を確認して表示
+ *   1. pi install <piHarness> で、ユーザー設定（~/.pi/agent/settings.json）に登録する（全プロジェクト・全 worktree で読み込まれる）
+ *   2. プロジェクトの .pi/settings.json に以前の方式（プロジェクトごとの clone）の登録が残っていれば外す（二重に読み込むとツールが衝突するため）
+ *   3. <project>/.pi/harness.json が無ければ雛形を作成（テストコマンドは自動検出）
+ *   4. <project>/.gitignore に状態ファイル・テストログなどを追加
+ *   5. Node.js / pi / gh の有無を確認して表示
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const harnessRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function parseArgs(argv) {
-	const opts = { project: undefined, uninstall: false, dryRun: false };
+	const opts = { project: undefined, globalOnly: false, uninstall: false, dryRun: false };
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		if (a === "--project") opts.project = argv[++i];
+		else if (a === "--global-only") opts.globalOnly = true;
 		else if (a === "--uninstall") opts.uninstall = true;
 		else if (a === "--dry-run") opts.dryRun = true;
 		else if (a === "-h" || a === "--help") opts.help = true;
@@ -37,40 +42,43 @@ function parseArgs(argv) {
 	return opts;
 }
 
-/** clone 先が <project>/.pi/<name> ならその <project>、そうでなければカレントディレクトリ */
-export function defaultProject(root = harnessRoot, cwd = process.cwd()) {
-	const parent = dirname(root);
-	if (basename(parent) === ".pi") return dirname(parent);
-	return cwd;
-}
-
-/** .pi/settings.json から見た piHarness への相対パス（Pi は settings ファイルの場所を基準に解決する） */
-export function packageRef(project, root = harnessRoot) {
-	const rel = relative(join(project, ".pi"), root).split(sep).join("/");
-	if (!rel) return ".";
-	return rel.startsWith(".") ? rel : `./${rel}`;
-}
-
-function samePackage(entry, ref, project) {
-	const source = typeof entry === "string" ? entry : entry?.source;
-	if (typeof source !== "string") return false;
-	if (/^(npm|git|https?):/.test(source)) return false;
-	const abs = isAbsolute(source) ? source : resolve(project, ".pi", source);
-	return abs === resolve(project, ".pi", ref);
-}
-
-/** settings.json に piHarness を登録（または削除）した結果を返す */
-export function updateSettings(settings, ref, project, uninstall = false) {
-	const next = { ...settings };
-	const packages = Array.isArray(next.packages) ? [...next.packages] : [];
-	const exists = packages.some((p) => samePackage(p, ref, project));
-	if (uninstall) {
-		next.packages = packages.filter((p) => !samePackage(p, ref, project));
-		return { settings: next, changed: exists };
+/** pi CLI を実行する（テストでは差し替える） */
+export function runPi(args) {
+	try {
+		const out = execFileSync("pi", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		return { code: 0, out };
+	} catch (e) {
+		return { code: e.status ?? 1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` || e.message };
 	}
-	if (exists) return { settings: next, changed: false };
-	next.packages = [...packages, ref];
-	return { settings: next, changed: true };
+}
+
+/** ディレクトリが piHarness のパッケージか（package.json の name で判定） */
+export function isPiHarnessPackage(dir) {
+	const file = join(dir, "package.json");
+	if (!existsSync(file)) return false;
+	try {
+		return JSON.parse(readFileSync(file, "utf8")).name === "pi-harness";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * プロジェクトの .pi/settings.json から、piHarness を指すローカルパスの登録を外す。
+ * 全プロジェクト共通の登録と別の場所の piHarness を二重に読み込むと、ツール名が衝突して動かなくなるため。
+ */
+export function removeLocalRegistrations(settings, project, isHarness = isPiHarnessPackage) {
+	const packages = Array.isArray(settings.packages) ? settings.packages : [];
+	const removed = [];
+	const kept = packages.filter((p) => {
+		const source = typeof p === "string" ? p : p?.source;
+		if (typeof source !== "string" || /^(npm|git|https?|ssh):/.test(source)) return true;
+		const abs = isAbsolute(source) ? source : resolve(project, ".pi", source);
+		if (!isHarness(abs)) return true;
+		removed.push(source);
+		return false;
+	});
+	return { settings: removed.length ? { ...settings, packages: kept } : settings, removed };
 }
 
 /** .gitignore に足りない行だけを追記した内容を返す */
@@ -81,16 +89,6 @@ export function updateGitignore(current, lines) {
 	const prefix = current && !current.endsWith("\n") ? "\n" : "";
 	const block = `${prefix}${current ? "\n" : ""}# piHarness\n${missing.join("\n")}\n`;
 	return { content: current + block, added: missing };
-}
-
-/** clone 先が .gitmodules に登録されたサブモジュールか */
-export function isSubmodule(project, root = harnessRoot) {
-	const file = join(project, ".gitmodules");
-	if (!existsSync(file)) return false;
-	const rel = relative(project, root).split(sep).join("/");
-	return readFileSync(file, "utf8")
-		.split(/\r?\n/)
-		.some((l) => l.trim().replace(/^path\s*=\s*/, "") === rel && /^\s*path\s*=/.test(l));
 }
 
 /** package.json の lint・型チェック系スクリプトを checkCommands の候補にする */
@@ -129,8 +127,6 @@ function checkEnvironment() {
 	const [major, minor] = process.versions.node.split(".").map(Number);
 	const nodeOk = major > 22 || (major === 22 && minor >= 19);
 	lines.push(`${nodeOk ? "✓" : "✗"} Node.js ${process.versions.node}${nodeOk ? "" : "（22.19 以上が必要です）"}`);
-	const pi = versionOf("pi");
-	lines.push(pi ? `✓ pi ${pi}` : "✗ pi が見つかりません: npm install -g @earendil-works/pi-coding-agent");
 	const gh = versionOf("gh");
 	const ghAuth = gh ? versionOf("gh", ["auth", "status"]) !== undefined : false;
 	lines.push(
@@ -143,11 +139,37 @@ function checkEnvironment() {
 	return lines;
 }
 
-export function install({ project, uninstall = false, dryRun = false, root = harnessRoot, log = console.log }) {
-	project = resolve(project ?? defaultProject(root));
-	if (resolve(project) === resolve(root)) {
-		log("piHarness 自身のリポジトリです（.pi/settings.json で既に読み込まれます）。組み込み先のプロジェクトで実行してください。");
-		return { changed: false };
+/** 全プロジェクト共通の登録（pi install / pi remove）。pi が無ければ例外 */
+function registerGlobal(root, { uninstall, dryRun, pi, log }) {
+	const version = pi(["--version"]);
+	if (version.code !== 0) {
+		throw new Error("pi が見つかりません。先に pi-coding-agent をインストールしてください: npm install -g @earendil-works/pi-coding-agent");
+	}
+	if (dryRun) {
+		log(`- （--dry-run）pi ${uninstall ? "remove" : "install"} ${root} を実行します`);
+		return;
+	}
+	const r = pi([uninstall ? "remove" : "install", root]);
+	if (r.code !== 0) throw new Error(`pi ${uninstall ? "remove" : "install"} に失敗しました: ${r.out.trim()}`);
+	log(uninstall ? `✓ 全プロジェクト共通の登録を外しました（pi remove ${root}）` : `✓ 全プロジェクト共通で登録しました（pi install ${root}。登録済みなら変わりません）`);
+}
+
+/** 設定を用意しないディレクトリ（ホーム・piHarness 自身） */
+function isProjectDir(project, root) {
+	const p = resolve(project);
+	return p !== resolve(root) && p !== resolve(homedir()) && p !== "/";
+}
+
+export function install({ project, globalOnly = false, uninstall = false, dryRun = false, root = harnessRoot, log = console.log, pi = runPi }) {
+	registerGlobal(root, { uninstall, dryRun, pi, log });
+	if (uninstall) {
+		log("\n各プロジェクトの .pi/harness.json・成果物（.pi/harness/）は残しています。不要なら手動で削除してください。");
+		return { project: undefined };
+	}
+	project = resolve(project ?? process.cwd());
+	if (globalOnly || !isProjectDir(project, root)) {
+		log(`\nプロジェクトの設定は用意していません。プロジェクトのルートで node ${join(root, "scripts/install.mjs")} を実行すると用意します。`);
+		return { project: undefined };
 	}
 	if (!existsSync(project)) throw new Error(`プロジェクトが見つかりません: ${project}`);
 	const write = (file, content) => {
@@ -155,26 +177,20 @@ export function install({ project, uninstall = false, dryRun = false, root = har
 		mkdirSync(dirname(file), { recursive: true });
 		writeFileSync(file, content);
 	};
-	const ref = packageRef(project, root);
 	const results = [];
 
-	// 1. .pi/settings.json
+	// 1. 以前の方式（プロジェクトごとの登録）を外す
 	const settingsFile = join(project, ".pi", "settings.json");
-	const { settings, changed } = updateSettings(readJson(settingsFile, {}), ref, project, uninstall);
-	if (changed) write(settingsFile, `${JSON.stringify(settings, null, 2)}\n`);
-	results.push(
-		uninstall
-			? changed
-				? `✓ .pi/settings.json から "${ref}" を削除しました`
-				: `- .pi/settings.json に "${ref}" は登録されていません`
-			: changed
-				? `✓ .pi/settings.json の packages に "${ref}" を追加しました`
-				: `- .pi/settings.json には登録済みです（"${ref}"）`,
-	);
-	if (uninstall) {
-		results.forEach((r) => log(r));
-		log("\n.pi/harness.json・成果物（.pi/harness/）・clone 先は残しています。不要なら手動で削除してください。");
-		return { changed };
+	if (existsSync(settingsFile)) {
+		const { settings, removed } = removeLocalRegistrations(readJson(settingsFile, {}), project);
+		if (removed.length) {
+			write(settingsFile, `${JSON.stringify(settings, null, 2)}\n`);
+			results.push(`✓ .pi/settings.json からプロジェクトごとの登録を外しました: ${removed.join(", ")}（全プロジェクト共通の登録と衝突するため）`);
+		}
+	}
+	const oldClone = join(project, ".pi", "piHarness");
+	if (existsSync(oldClone) && resolve(oldClone) !== resolve(root) && isPiHarnessPackage(oldClone)) {
+		results.push(`△ 以前の方式の clone が残っています。もう使わないので削除できます: rm -rf ${relative(process.cwd(), oldClone) || oldClone}`);
 	}
 
 	// 2. .pi/harness.json
@@ -194,9 +210,6 @@ export function install({ project, uninstall = false, dryRun = false, root = har
 	// 3. .gitignore
 	const ignoreFile = join(project, ".gitignore");
 	const lines = [".pi/harness/state.json", ".pi/harness/provider-status.json", ".pi/harness/**/logs/", ".pi/harness/**/test-lock/"];
-	const cloneRel = relative(project, root).split(sep).join("/");
-	const inside = !cloneRel.startsWith("..") && !isAbsolute(cloneRel);
-	if (inside && !isSubmodule(project, root)) lines.push(`${cloneRel}/`);
 	const current = existsSync(ignoreFile) ? readFileSync(ignoreFile, "utf8") : "";
 	const { content, added } = updateGitignore(current, lines);
 	if (added.length) write(ignoreFile, content);
@@ -207,13 +220,13 @@ export function install({ project, uninstall = false, dryRun = false, root = har
 	for (const r of checkEnvironment()) log(r);
 	log(`
 次のステップ:
-  1. プロジェクトのルートで pi を起動し、プロジェクトを信頼（trust）してください（.pi/settings.json の読み込みに必要）
+  1. プロジェクトのルートで pi を起動してください（worktree でも同じ piHarness が読み込まれます）
   2. /harness config で設定、/harness models でプロセスごとのモデルを確認
-  3. /req <テーマ> で要件定義、/impl <Issue番号> で実装を開始
+  3. やりたいことを話しかけて開始（/req・/impl・/bugfix・/doc でも可）
 
-piHarness の更新: git -C ${inside ? cloneRel : root} pull`);
+piHarness の更新（全プロジェクトに反映）: git -C ${root.split(sep).join("/")} pull`);
 	if (dryRun) log("\n（--dry-run のため何も書き込んでいません）");
-	return { changed: true };
+	return { project };
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

@@ -40,57 +40,45 @@ node -v   # v22.19 以上であること
 
 ## インストール
 
-### A. プロジェクトごとに clone して使う（推奨）
-
-各プロジェクトの `.pi/piHarness/` に clone し、セットアップスクリプトを 1 回実行します。
+piHarness は **1 か所に clone して、全プロジェクト共通で使います**（Pi のユーザー設定に登録）。
+どのプロジェクトでも、そのプロジェクトの git worktree でも、同じ piHarness が読み込まれます。
 
 ```bash
+# 1. 1 か所にだけ clone する（初回のみ）
+git clone https://github.com/is-9108/piHarness.git ~/piHarness
+
+# 2. 使うプロジェクトのルートで実行する（プロジェクトごとに 1 回）
 cd ~/projects/my-app
-git clone https://github.com/is-9108/piHarness.git .pi/piHarness
-node .pi/piHarness/scripts/install.mjs
-pi        # 起動してプロジェクトを信頼（trust）する
+node ~/piHarness/scripts/install.mjs
+pi
 ```
 
 セットアップスクリプトは次のことを行います。何度実行しても結果は同じです。
 
 | 対象 | 内容 |
 |------|------|
-| `.pi/settings.json` | `packages` に `"./piHarness"` を追加（既存の設定・パッケージは保持） |
+| Pi のユーザー設定 | `pi install ~/piHarness` で登録（`~/.pi/agent/settings.json`。登録済みなら変わらない） |
+| `.pi/settings.json` | 以前の方式（プロジェクトごとの clone）の登録が残っていれば外す（別の場所の piHarness を二重に読み込むとツールが衝突するため）。それ以外の設定は保持 |
 | `.pi/harness.json` | 無ければ雛形を作成（あれば変更しない）。プロジェクトごとのテストコマンド・モデルはここで設定 |
-| `.gitignore` | `.pi/harness/state.json`, `.pi/harness/provider-status.json`, `.pi/harness/**/logs/`, `.pi/harness/**/test-lock/`, `.pi/piHarness/` を追加 |
-| 環境チェック | Node.js 22.19 以上・pi・gh（ログイン状態）を確認して表示 |
+| `.gitignore` | `.pi/harness/state.json`, `.pi/harness/provider-status.json`, `.pi/harness/**/logs/`, `.pi/harness/**/test-lock/` を追加 |
+| 環境チェック | Node.js 22.19 以上・gh（ログイン状態）を確認して表示（pi が無ければ止まる） |
 
-- **更新:** `git -C .pi/piHarness pull`（pi 起動中なら `/reload`）
-- **取り外し:** `node .pi/piHarness/scripts/install.mjs --uninstall` で登録だけを外します（成果物と設定は残ります）
-- **確認のみ:** `--dry-run` で変更内容だけを表示します
-- **別の場所に clone した場合:** `node <clone先>/scripts/install.mjs --project <プロジェクト>` で相対パスを自動計算します
-
-チームで同じバージョンを使いたい場合は、clone の代わりに git サブモジュールにできます。
-この場合、スクリプトは `.pi/piHarness/` を `.gitignore` に入れません。
-
-```bash
-git submodule add https://github.com/is-9108/piHarness.git .pi/piHarness
-node .pi/piHarness/scripts/install.mjs
-```
+- **更新:** `git -C ~/piHarness pull` で全プロジェクトに反映されます（pi 起動中なら `/reload`）。
+- **登録だけ行う:** `node ~/piHarness/scripts/install.mjs --global-only`（ホームや piHarness 自身で実行した場合もプロジェクトの設定は作りません）。
+- **取り外し:** `node ~/piHarness/scripts/install.mjs --uninstall` で全プロジェクト共通の登録を外します（各プロジェクトの設定・成果物は残ります）。
+- **確認のみ:** `--dry-run` で変更内容だけを表示します。
+- **以前の方式から移行する:** プロジェクトのルートで上のスクリプトを実行すると、`.pi/settings.json` の古い登録を外します。`.pi/piHarness/` の clone と `.gitignore` の `.pi/piHarness/` の行は不要になるので削除してかまいません。
 
 補足:
 
-- **プロジェクトごとに独立:** ワークフローの状態（`.pi/harness/state.json`）・成果物・設定（`.pi/harness.json`）はプロジェクトごとに独立しています。
-  プロジェクトごとに別のバージョンの piHarness を使うこともできます。
-- **本体は編集できない:** エージェントはプロジェクト内の piHarness 本体（`.pi/piHarness/`）を編集できません（拡張がブロックします）。
+- **プロジェクトごとに独立:** ワークフローの状態（`.pi/harness/state.json`）・成果物・設定（`.pi/harness.json`）はプロジェクトごと、worktree ごとに独立しています。
+  別の worktree で別の Issue を同時に進められます（`issues.json` も worktree ごとなので、新しい worktree では `/impl 12` のように番号を指定してください）。
+- **worktree と `main` の pull:** `main` が別の worktree（元の作業ツリーなど）で使われているとローカルの `main` は進められないため、`origin/main` を取得してそこから作業ブランチを作ります（PR のマージ先は `main` のまま）。
+- **本体は編集できない:** エージェントは piHarness 本体（`~/piHarness/`）を編集できません（拡張がブロックします）。
 - **MCP ツール:** プラン承認前やレビュー中など書き込みを制限している間は、読み取り専用（`readOnlyHint`）と宣言された MCP ツールだけが使えます。
 - **依存パッケージは不要:** clone 先で `npm install` は不要です。必要なパッケージは Pi 本体が提供します。
 
-### B. 全プロジェクト共通で使う
-
-1 か所に clone して、ユーザー設定に登録します。全プロジェクトで同じ piHarness が有効になります。
-
-```bash
-git clone https://github.com/is-9108/piHarness.git ~/piHarness
-pi install ~/piHarness
-```
-
-### C. 一時的に読み込む
+### 一時的に読み込む
 
 ```bash
 pi -e ~/piHarness/extensions/harness/index.ts
@@ -99,6 +87,7 @@ pi -e ~/piHarness/extensions/harness/index.ts
 ### piHarness 自体の開発
 
 このリポジトリの `.pi/settings.json` が自分自身を読み込むよう設定されています。リポジトリ直下で `pi` を起動し、プロジェクトを信頼してください。
+全プロジェクト共通で登録している clone と**別の場所**で開発すると、2 つの piHarness が読み込まれてツールが衝突します。登録している clone（`~/piHarness`）で開発するか、開発中は `node scripts/install.mjs --uninstall` で登録を外してください。
 
 ## 使い方
 
@@ -393,7 +382,7 @@ Issue 本文・PR 本文・レビュー記録（`review-N.md`）は、エージ�
 
 - PR 本文の概要・受け入れ条件の充足・変更内容などは、実装レポート（`implementation.md`）の同じ見出しから取ります。テスト結果とレビュー履歴は拡張が記録したものを使います。
 - 空の項目は「なし」と表示し、見出しは省きません。
-- **プロジェクトごとに変える:** 同梱の `.pi/piHarness/templates/<名前>.md` を `.pi/harness/templates/<名前>.md`（`workDir` 配下）にコピーして編集します。
+- **プロジェクトごとに変える:** 同梱の `~/piHarness/templates/<名前>.md` を `.pi/harness/templates/<名前>.md`（`workDir` 配下）にコピーして編集します。
   `{{名前}}` が値に置き換わります（使える名前は各テンプレート先頭のコメントに記載）。`{{名前?}}` は空なら何も出しません。
 
 ### 設計判断の記録（ADR）

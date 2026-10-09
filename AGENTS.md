@@ -13,7 +13,7 @@ pi-coding-agent の拡張 + Skill。要件定義 → TDD 実装 → レビュー
 | `extensions/harness/*.ts` | guard（書き込み制限）/ git / integrity（テスト保護）/ testlock（テストのロック）/ failures（失敗の指紋・ベースライン）/ progress（Issue 進捗）/ usage / tools / compaction / dashboard（TUI 表示）/ templates（Issue・PR・レビュー記録の組み立て）/ adr（設計判断の記録と一覧）/ config |
 | `templates/{issue,pr,review,adr}.md` | 外に出す文書のテンプレート（プロジェクトの `<workDir>/templates/` で上書き可） |
 | `skills/harness-*/SKILL.md` | プロセスごとの手順（1 プロセス = 1 スキル、各 2〜3KB に保つ） |
-| `scripts/install.mjs` | 他プロジェクトへの組み込み（`.pi/piHarness` に clone して実行） |
+| `scripts/install.mjs` | 全プロジェクト共通の登録（`pi install`）と、プロジェクトの設定（`.pi/harness.json`・`.gitignore`）の用意 |
 | `test/*.test.ts` / `test/e2e/*.ts` | ユニットテスト / 偽モデルで実際の Pi を動かす E2E（natural.ts は確認ダイアログをスクリプトで応答） |
 
 ## コマンド
@@ -53,4 +53,6 @@ Node 22.19+。TypeScript は型除去で直接実行（ビルドなし）。impo
 - `ctx.compact()` はターンの区切りで呼んでも実行が止まらない → `turn_end` で予約し、次のツール呼び出しを止めて `agent_settled` で圧縮。
 - 新セッション直後の `pi.setModel()` は認証スナップショットの遅れで失敗することがある → 非同期で認証を確認して再試行（`setModelWhenReady`）。
 - `git diff` は未追跡ファイルを含まない → 指紋・テスト保護・スナップショットでは未追跡ファイルも扱う。
+- 同じ piHarness を 2 か所から読み込むとツール名が衝突して動かない（同じパスなら Pi が 1 つにまとめる）→ インストーラーはプロジェクトの古い登録を外す。
+- 開始元ブランチが別の worktree で使われていると `git fetch origin main:main` は拒否される → `origin/main` を取得してそこから作る。
 - E2E の偽モデルは応答を順番に消費する。ツール呼び出しを足したら応答列と期待値を合わせて直す。

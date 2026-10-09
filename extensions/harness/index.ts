@@ -2136,6 +2136,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 				if (choice === options[1]) startFrom = cur;
 			}
 			// 開始元ブランチを必ず origin から最新化してから始める（git.pullBase）
+			/** origin/main から作るときに、PR のマージ先として記録する名前（main） */
+			let recordAs: string | undefined;
 			if (cfg.git.pullBase && baseBranch) {
 				const pulled = await pullBaseBranch(run, baseBranch);
 				if (pulled.status === "failed") {
@@ -2148,10 +2150,17 @@ export default function piHarness(pi: ExtensionAPI): void {
 					pullNote = `${baseBranch} を origin から pull しました（${pulled.from?.slice(0, 7) ?? "新規"} → ${pulled.to.slice(0, 7)}）。`;
 				} else if (pulled.status === "up-to-date") {
 					pullNote = `${baseBranch} は最新です。`;
+				} else if (pulled.status === "fetched-remote") {
+					// 別の worktree で使われている main は進められないので、origin/main から作る（PR のマージ先は main のまま）
+					if (startFrom === baseBranch) {
+						startFrom = pulled.ref;
+						recordAs = baseBranch;
+					}
+					pullNote = `${baseBranch} は別の worktree（${pulled.worktree}）で使われているため、${pulled.ref}（${pulled.to.slice(0, 7)}）を取得して作業ブランチを作ります。`;
 				}
 			}
 			try {
-				git = await prepareBranch(run, target, startFrom);
+				git = await prepareBranch(run, target, startFrom, recordAs);
 			} catch (e) {
 				return { error: `[piHarness] ${(e as Error).message}` };
 			}

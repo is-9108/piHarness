@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { branchName, diffTrees, snapshotTree, commitAll, currentBranch, diffSince, dirtyFiles, fingerprint, isGitRepo, prepareBranch, pullBaseBranch, type Run } from "../extensions/harness/git.ts";
 
@@ -134,6 +134,29 @@ describe("git", () => {
 		const r = await pullBaseBranch(run, "main");
 		assert.equal(r.status, "failed");
 		assert.match(r.status === "failed" ? r.error : "", /origin と揃えて/);
+	});
+
+	it("main が別の worktree で使われていれば、そこには触らず origin/main から作業ブランチを作る（PR のマージ先は main）", async () => {
+		const { git, dir, pushFromOther } = withOrigin();
+		const wt = join(mkdtempSync(join(tmpdir(), "pih-wt-")), "feature");
+		git("worktree", "add", "-q", wt, "-b", "feature");
+		const runWt: Run = async (cmd, args) => {
+			const r = spawnSync(cmd, args, { cwd: wt, encoding: "utf8" });
+			return { code: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
+		};
+		const oldMain = git("rev-parse", "main");
+		const remote = pushFromOther("b.js");
+		const r = await pullBaseBranch(runWt, "main");
+		assert.equal(r.status, "fetched-remote");
+		assert.equal(r.status === "fetched-remote" ? r.ref : "", "origin/main");
+		assert.equal(r.status === "fetched-remote" ? r.to : "", remote);
+		assert.equal(r.status === "fetched-remote" ? resolve(r.worktree) : "", resolve(dir));
+		assert.equal(git("rev-parse", "main"), oldMain, "別の worktree の main は動かさない");
+		const info = await prepareBranch(runWt, "issue-3", "origin/main", "main");
+		assert.equal(info.base, remote, "最新の origin/main から作る");
+		assert.equal(info.baseBranch, "main", "PR のマージ先は main");
+		const upstream = spawnSync("git", ["rev-parse", "--abbrev-ref", "issue-3@{upstream}"], { cwd: wt, encoding: "utf8" });
+		assert.notEqual(upstream.status, 0, "origin/main を上流にしない");
 	});
 
 	it("ブランチ名は英数字のタイトルだけを使う", () => {

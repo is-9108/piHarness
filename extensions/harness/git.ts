@@ -109,12 +109,16 @@ export async function defaultBranch(run: Run): Promise<string | undefined> {
 export type PullResult =
 	| { status: "updated"; from?: string; to: string }
 	| { status: "up-to-date"; to: string }
+	/** 開始元ブランチが別の worktree で使われていてローカルのブランチを進められないため、origin のブランチを取得した（作業ブランチはそこから作る） */
+	| { status: "fetched-remote"; ref: string; to: string; worktree: string }
 	| { status: "no-remote" }
 	| { status: "failed"; error: string };
 
 /**
  * 開始元ブランチ（main など）を origin から最新化する（git pull 相当。早送りだけで、マージコミットは作らない）。
  * そのブランチにいれば `git pull --ff-only`、いなければ `git fetch origin <b>:<b>` でローカルのブランチを進める。
+ * 開始元ブランチが別の worktree で使われている場合（git がローカルのブランチの更新を拒否する）は、その worktree には触らず
+ * `git fetch origin <b>` で origin/<b> を最新にして返す（作業ブランチは origin/<b> から作る）。
  * origin が無いリポジトリでは何もしない。
  */
 export async function pullBaseBranch(run: Run, branch: string): Promise<PullResult> {
@@ -128,6 +132,13 @@ export async function pullBaseBranch(run: Run, branch: string): Promise<PullResu
 			: await run("git", ["fetch", "origin", `${branch}:${branch}`]);
 	if (r.code !== 0) {
 		const out = (r.stderr || r.stdout).trim();
+		const elsewhere = out.match(/refusing to fetch into branch '[^']+' checked out at '([^']+)'/);
+		if (elsewhere) {
+			const f = await run("git", ["fetch", "origin", branch]);
+			const to = (await run("git", ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`])).stdout.trim();
+			if (f.code === 0 && to) return { status: "fetched-remote", ref: `origin/${branch}`, to, worktree: elsewhere[1] };
+			return { status: "failed", error: (f.stderr || f.stdout).trim() || out };
+		}
 		const hint = /non-fast-forward|rejected|diverg|Not possible to fast-forward/i.test(out)
 			? `
 ローカルの ${branch} に origin に無いコミットがあります。${branch} を origin と揃えてから開始してください。`
@@ -142,10 +153,12 @@ export async function pullBaseBranch(run: Run, branch: string): Promise<PullResu
  * 作業ブランチを用意する。既存なら切り替え、無ければ startFrom（省略時は現在のブランチ）から作成する。
  * 差分の基準 (base) は開始元ブランチの先端。既存ブランチの再開時は開始元との merge-base を使う。
  */
-export async function prepareBranch(run: Run, branch: string, startFrom?: string): Promise<GitInfo> {
+export async function prepareBranch(run: Run, branch: string, startFrom?: string, baseName?: string): Promise<GitInfo> {
 	const current = await currentBranch(run);
-	const baseBranch = startFrom ?? current;
-	const startHead = (await run("git", ["rev-parse", baseBranch ?? "HEAD"])).stdout.trim() || (await headSha(run));
+	// 作成元（origin/main のこともある）と、PR のマージ先として記録する名前（origin/main から作る場合も main）
+	const from = startFrom ?? current;
+	const baseBranch = baseName ?? from;
+	const startHead = (await run("git", ["rev-parse", from ?? "HEAD"])).stdout.trim() || (await headSha(run));
 	if (!startHead) throw new Error("コミットが 1 つもないリポジトリです。最初のコミットを作成してから /impl を実行してください。");
 	if (current === branch && !startFrom) {
 		// 作業ブランチ上で再開: 既定ブランチとの merge-base を基準にする（PR のマージ先も既定ブランチ）
@@ -157,14 +170,15 @@ export async function prepareBranch(run: Run, branch: string, startFrom?: string
 		return { base: startHead, branch };
 	}
 	const exists = await branchExists(run, branch);
-	const args = exists ? ["switch", branch] : ["switch", "-c", branch, ...(baseBranch ? [baseBranch] : [])];
+	// --no-track: origin/main から作っても上流を origin/main にしない（push で main を書き換えないため）
+	const args = exists ? ["switch", branch] : ["switch", "--no-track", "-c", branch, ...(from ? [from] : [])];
 	if (current !== branch || !exists) {
 		const r = await run("git", args);
 		if (r.code !== 0) throw new Error(`ブランチ ${branch} に切り替えられません: ${(r.stderr || r.stdout).trim()}`);
 	}
 	let base = startHead;
 	if (exists) {
-		const mb = await run("git", ["merge-base", baseBranch ?? startHead, "HEAD"]);
+		const mb = await run("git", ["merge-base", from ?? startHead, "HEAD"]);
 		if (mb.code === 0 && mb.stdout.trim()) base = mb.stdout.trim();
 	}
 	return { base, baseBranch, branch };

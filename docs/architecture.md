@@ -110,10 +110,12 @@ MCP ツールは既定で `codemode` exposure になり、**有効なツール�
   `session_start` でそれを読み取って `pi.setModel` / `pi.setThinkingLevel` を適用します（そのセッションにだけ効き、Pi の既定値は変えない）。
 - **開始メッセージは参照のみ**: 新しいセッションには成果物の「パス」と役割だけを渡し、内容はエージェントに読ませます（前の会話の要約も渡さない）。
 
-### プロジェクトごとに clone して使う
+### 全プロジェクト共通で 1 か所に入れる
 
-各プロジェクトの `.pi/piHarness/` に clone し、`.pi/settings.json` の `packages` にローカルパスとして登録します（Pi のローカルパッケージ機能）。
-Pi は settings ファイルの場所を基準に相対パスを解決するため、プロジェクトを移動しても動きます。
+1 か所（`~/piHarness`）に clone し、`pi install` で Pi のユーザー設定に登録します（Pi のローカルパッケージ機能）。
+以前はプロジェクトごとに `.pi/piHarness/` へ clone していましたが、clone 先は `.gitignore` に入るため git worktree には存在せず、
+worktree ではハーネスが動きませんでした。ユーザー設定に入れれば、どのプロジェクト・どの worktree でも同じ piHarness が読み込まれ、更新も 1 回で済みます。
+別の場所の piHarness を同時に読み込むとツール名が衝突するため、インストーラーはプロジェクトに残った古い登録を外します。
 拡張が使う `typebox` と `@earendil-works/*` は Pi 本体が提供するため、clone 先で `npm install` は不要です。
 
 - **状態・成果物・設定の置き場所:** すべてプロジェクト側にあり（`.pi/harness/`, `.pi/harness.json`）、piHarness 本体の clone には書き込みません。
