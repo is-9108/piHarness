@@ -60,6 +60,7 @@ describe("install スクリプト", () => {
 		const ignore = readFileSync(join(project, ".gitignore"), "utf8");
 		assert.match(ignore, /^\.pi\/harness\/state\.json$/m);
 		assert.match(ignore, /^\.pi\/harness\/\*\*\/test-lock\/$/m);
+		assert.match(ignore, /^\.pi\/harness\/provider-status\.json$/m);
 		assert.match(ignore, /^\.pi\/piHarness\/$/m);
 
 		const snapshot = [readFileSync(join(project, ".pi/settings.json"), "utf8"), ignore];

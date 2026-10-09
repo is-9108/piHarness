@@ -46,6 +46,18 @@ describe("config", () => {
 		assert.equal(w.length, 3);
 	});
 
+	it("利用上限でのモデルの切り替えの設定", () => {
+		assert.deepEqual(mergeConfig({}).fallback, { enabled: true, quotaCooldownMinutes: 60, transientCooldownMinutes: 10 });
+		assert.deepEqual(mergeConfig({ fallback: { enabled: false, quotaCooldownMinutes: 180 } as never }).fallback, {
+			enabled: false,
+			quotaCooldownMinutes: 180,
+			transientCooldownMinutes: 10,
+		});
+		const w: string[] = [];
+		assert.equal(mergeConfig({ fallback: { quotaCooldownMinutes: 0 } as never }, w).fallback.quotaCooldownMinutes, 60);
+		assert.equal(w.length, 1);
+	});
+
 	it("不正な値は既定値に戻して警告する", () => {
 		const w: string[] = [];
 		const c = mergeConfig({ maxTestLoops: 0, blockingSeverities: ["fatal" as never] }, w);

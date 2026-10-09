@@ -17,6 +17,11 @@
   "baseline": true,
   "flakyRetries": 1,
   "sameFailureLimit": 2,
+  "fallback": {
+    "enabled": true,
+    "quotaCooldownMinutes": 60,
+    "transientCooldownMinutes": 10
+  },
   "git": {
     "enabled": true,
     "branchPrefix": "issue-",
