@@ -1,116 +1,143 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 // @ts-expect-error プレーンな .mjs（型定義なし）
-import { defaultProject, detectCheckCommands, install, packageRef, updateGitignore, updateSettings } from "../scripts/install.mjs";
+import { detectCheckCommands, install, isPiHarnessPackage, removeLocalRegistrations, updateGitignore } from "../scripts/install.mjs";
 
 const repo = resolve(import.meta.dirname, "..");
 
-/** プロジェクト内に piHarness を clone した状態を作る（node_modules・.git は含めない＝実際の clone と同じ） */
-function projectWithClone(at = ".pi/piHarness"): { project: string; clone: string } {
-	const project = mkdtempSync(join(tmpdir(), "pih-proj-"));
-	const clone = join(project, at);
-	cpSync(repo, clone, {
+/** 1 か所に clone した piHarness（node_modules・.git は含めない＝実際の clone と同じ） */
+function cloneHarness(at = join(mkdtempSync(join(tmpdir(), "pih-home-")), "piHarness")): string {
+	cpSync(repo, at, {
 		recursive: true,
 		filter: (src) => !/[/\\](node_modules|\.git)([/\\]|$)/.test(src.slice(repo.length)),
 	});
-	return { project, clone };
+	return at;
+}
+
+const project = () => mkdtempSync(join(tmpdir(), "pih-proj-"));
+
+/** pi CLI の代わり。呼ばれた引数を記録する */
+function fakePi(available = true) {
+	const calls: string[][] = [];
+	const pi = (args: string[]) => {
+		calls.push(args);
+		return available ? { code: 0, out: "" } : { code: 127, out: "not found" };
+	};
+	return { pi, calls };
 }
 
 const quiet = () => {};
 
-describe("install スクリプト", () => {
-	it("clone 先の位置からプロジェクトと相対パスを決める", () => {
-		assert.equal(defaultProject("/p/app/.pi/piHarness", "/elsewhere"), "/p/app");
-		assert.equal(defaultProject("/opt/piHarness", "/p/app"), "/p/app");
-		assert.equal(packageRef("/p/app", "/p/app/.pi/piHarness"), "./piHarness");
-		assert.equal(packageRef("/p/app", "/p/app/tools/piHarness"), "../tools/piHarness");
-		assert.equal(packageRef("/p/app", "/home/pi/piHarness"), "../../../home/pi/piHarness");
+describe("install スクリプト（全プロジェクト共通）", () => {
+	it("pi install で全プロジェクト共通に登録し、プロジェクトの設定と .gitignore を用意する", () => {
+		const root = cloneHarness();
+		const dir = project();
+		writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+		const { pi, calls } = fakePi();
+		install({ project: dir, root, pi, log: quiet });
+		assert.deepEqual(calls, [["--version"], ["install", root]]);
+		assert.ok(!existsSync(join(dir, ".pi/settings.json")), "プロジェクトには登録しない");
+		assert.ok(existsSync(join(dir, ".pi/harness.json")));
+		const ignore = readFileSync(join(dir, ".gitignore"), "utf8");
+		assert.match(ignore, /^\.pi\/harness\/state\.json$/m);
+		assert.match(ignore, /^\.pi\/harness\/\*\*\/test-lock\/$/m);
+		assert.doesNotMatch(ignore, /piHarness\//, "clone 先はプロジェクトの外なので .gitignore に入れない");
+
+		const snapshot = [readFileSync(join(dir, ".pi/harness.json"), "utf8"), ignore];
+		install({ project: dir, root, pi, log: quiet });
+		assert.deepEqual([readFileSync(join(dir, ".pi/harness.json"), "utf8"), readFileSync(join(dir, ".gitignore"), "utf8")], snapshot, "再実行しても変わらない");
 	});
 
-	it("settings.json の既存設定を保ち、重複登録しない", () => {
-		const base = { theme: "dark", packages: ["npm:@x/tools", { source: "./piHarness", skills: [] }] };
-		assert.equal(updateSettings(base, "./piHarness", "/p").changed, false, "オブジェクト形式の同じ登録も検出");
-		const r = updateSettings({ theme: "dark", packages: ["npm:@x/tools"] }, "./piHarness", "/p");
-		assert.deepEqual(r.settings, { theme: "dark", packages: ["npm:@x/tools", "./piHarness"] });
-		const u = updateSettings(r.settings, "./piHarness", "/p", true);
-		assert.deepEqual(u.settings.packages, ["npm:@x/tools"]);
+	it("以前の方式（プロジェクトごとの clone の登録）を外す。他のパッケージ・設定は残す", () => {
+		const root = cloneHarness();
+		const dir = project();
+		cloneHarness(join(dir, ".pi/piHarness"));
+		writeFileSync(join(dir, ".pi/settings.json"), JSON.stringify({ theme: "dark", packages: ["npm:@x/tools", { source: "./piHarness", skills: [] }] }));
+		const logs: string[] = [];
+		install({ project: dir, root, pi: fakePi().pi, log: (l: string) => logs.push(l) });
+		assert.deepEqual(JSON.parse(readFileSync(join(dir, ".pi/settings.json"), "utf8")), { theme: "dark", packages: ["npm:@x/tools"] });
+		assert.ok(logs.some((l) => /プロジェクトごとの登録を外しました: \.\/piHarness/.test(l)));
+		assert.ok(logs.some((l) => /以前の方式の clone が残っています/.test(l)));
+	});
+
+	it("piHarness 以外のローカルパッケージは外さない", () => {
+		const other = mkdtempSync(join(tmpdir(), "pih-other-"));
+		writeFileSync(join(other, "package.json"), JSON.stringify({ name: "my-tools" }));
+		const { settings, removed } = removeLocalRegistrations({ packages: [other, "./missing"] }, "/p");
+		assert.deepEqual(removed, []);
+		assert.deepEqual(settings.packages, [other, "./missing"]);
+		assert.equal(isPiHarnessPackage(repo), true);
+	});
+
+	it("ホーム・piHarness 自身・--global-only ではプロジェクトの設定を作らない", () => {
+		const root = cloneHarness();
+		const self: string[] = [];
+		install({ project: root, root, pi: fakePi().pi, log: (l: string) => self.push(l) });
+		assert.ok(self.some((l) => /プロジェクトの設定は用意していません/.test(l)), "piHarness 自身には用意しない");
+		const dir = project();
+		install({ project: dir, root, globalOnly: true, pi: fakePi().pi, log: quiet });
+		assert.ok(!existsSync(join(dir, ".pi")));
+		const logs: string[] = [];
+		install({ project: homedir(), root, dryRun: true, pi: fakePi().pi, log: (l: string) => logs.push(l) });
+		assert.ok(logs.some((l) => /プロジェクトの設定は用意していません/.test(l)));
+	});
+
+	it("--uninstall は全プロジェクト共通の登録だけを外す", () => {
+		const root = cloneHarness();
+		const dir = project();
+		install({ project: dir, root, pi: fakePi().pi, log: quiet });
+		const { pi, calls } = fakePi();
+		install({ project: dir, root, uninstall: true, pi, log: quiet });
+		assert.deepEqual(calls.at(-1), ["remove", root]);
+		assert.ok(existsSync(join(dir, ".pi/harness.json")), "プロジェクトの設定は残す");
+	});
+
+	it("pi が無ければ何もせずに止める", () => {
+		const dir = project();
+		assert.throws(() => install({ project: dir, root: repo, pi: fakePi(false).pi, log: quiet }), /pi が見つかりません/);
+		assert.ok(!existsSync(join(dir, ".pi")));
+	});
+
+	it("--dry-run では pi も実行せず、何も書き込まない", () => {
+		const dir = project();
+		const { pi, calls } = fakePi();
+		install({ project: dir, root: cloneHarness(), dryRun: true, pi, log: quiet });
+		assert.deepEqual(calls, [["--version"]]);
+		assert.ok(!existsSync(join(dir, ".pi")));
+		assert.ok(!existsSync(join(dir, ".gitignore")));
 	});
 
 	it(".gitignore は足りない行だけ追記する", () => {
-		const r = updateGitignore("node_modules/\n.pi/harness/state.json\n", [".pi/harness/state.json", ".pi/piHarness/"]);
-		assert.deepEqual(r.added, [".pi/piHarness/"]);
-		assert.equal(r.content, "node_modules/\n.pi/harness/state.json\n\n# piHarness\n.pi/piHarness/\n");
-		assert.deepEqual(updateGitignore(r.content, [".pi/piHarness/"]).added, []);
-	});
-
-	it("CLI: .pi/piHarness に clone したプロジェクトを設定し、再実行しても変わらない", () => {
-		const { project, clone } = projectWithClone();
-		mkdirSync(join(project, ".pi"), { recursive: true });
-		writeFileSync(join(project, ".pi/settings.json"), JSON.stringify({ packages: ["npm:@x/tools"] }));
-		writeFileSync(join(project, ".gitignore"), "node_modules/\n");
-		execFileSync("node", [join(clone, "scripts/install.mjs")], { cwd: "/", stdio: "pipe" });
-
-		const settings = JSON.parse(readFileSync(join(project, ".pi/settings.json"), "utf8"));
-		assert.deepEqual(settings.packages, ["npm:@x/tools", "./piHarness"]);
-		assert.ok(existsSync(join(project, ".pi/harness.json")));
-		const ignore = readFileSync(join(project, ".gitignore"), "utf8");
-		assert.match(ignore, /^\.pi\/harness\/state\.json$/m);
-		assert.match(ignore, /^\.pi\/harness\/\*\*\/test-lock\/$/m);
-		assert.match(ignore, /^\.pi\/harness\/provider-status\.json$/m);
-		assert.match(ignore, /^\.pi\/piHarness\/$/m);
-
-		const snapshot = [readFileSync(join(project, ".pi/settings.json"), "utf8"), ignore];
-		execFileSync("node", [join(clone, "scripts/install.mjs")], { stdio: "pipe" });
-		assert.deepEqual([readFileSync(join(project, ".pi/settings.json"), "utf8"), readFileSync(join(project, ".gitignore"), "utf8")], snapshot);
-	});
-
-	it("既存の harness.json は上書きしない。サブモジュールなら clone 先を .gitignore に入れない", () => {
-		const { project, clone } = projectWithClone();
-		writeFileSync(join(project, ".pi/harness.json"), '{"testCommand":"make check"}');
-		writeFileSync(join(project, ".gitmodules"), '[submodule ".pi/piHarness"]\n\tpath = .pi/piHarness\n\turl = https://github.com/is-9108/piHarness.git\n');
-		install({ project, root: clone, log: quiet });
-		assert.equal(readFileSync(join(project, ".pi/harness.json"), "utf8"), '{"testCommand":"make check"}');
-		assert.doesNotMatch(readFileSync(join(project, ".gitignore"), "utf8"), /piHarness\//);
-	});
-
-	it("--uninstall で登録だけを外す", () => {
-		const { project, clone } = projectWithClone();
-		install({ project, root: clone, log: quiet });
-		install({ project, root: clone, uninstall: true, log: quiet });
-		assert.deepEqual(JSON.parse(readFileSync(join(project, ".pi/settings.json"), "utf8")).packages, []);
-		assert.ok(existsSync(join(project, ".pi/harness.json")));
+		const r = updateGitignore("node_modules/\n.pi/harness/state.json\n", [".pi/harness/state.json", ".pi/harness/**/logs/"]);
+		assert.deepEqual(r.added, [".pi/harness/**/logs/"]);
+		assert.equal(r.content, "node_modules/\n.pi/harness/state.json\n\n# piHarness\n.pi/harness/**/logs/\n");
 	});
 
 	it("package.json の lint・型チェックを checkCommands に入れる", () => {
-		const { project, clone } = projectWithClone();
-		writeFileSync(join(project, "package.json"), JSON.stringify({ scripts: { test: "vitest", lint: "eslint .", typecheck: "tsc --noEmit", build: "tsc" } }));
-		assert.deepEqual(detectCheckCommands(project), ["npm run lint", "npm run typecheck"]);
-		install({ project, root: clone, log: quiet });
-		const cfg = JSON.parse(readFileSync(join(project, ".pi/harness.json"), "utf8"));
+		const dir = project();
+		writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { test: "vitest", lint: "eslint .", typecheck: "tsc --noEmit", build: "tsc" } }));
+		assert.deepEqual(detectCheckCommands(dir), ["npm run lint", "npm run typecheck"]);
+		install({ project: dir, root: cloneHarness(), pi: fakePi().pi, log: quiet });
+		const cfg = JSON.parse(readFileSync(join(dir, ".pi/harness.json"), "utf8"));
 		assert.deepEqual(cfg.checkCommands, ["npm run lint", "npm run typecheck"]);
 		assert.equal(cfg.git.pr, "ask");
 	});
 
-	it("--dry-run では何も書き込まない", () => {
-		const { project, clone } = projectWithClone();
-		install({ project, root: clone, dryRun: true, log: quiet });
-		assert.ok(!existsSync(join(project, ".pi/settings.json")));
-		assert.ok(!existsSync(join(project, ".gitignore")));
-	});
-
-	it("組み込んだプロジェクトで Pi が拡張とスキルを読み込める（clone 側に node_modules が無くても動く）", async () => {
-		const { project, clone } = projectWithClone();
-		install({ project, root: clone, log: quiet });
+	it("ユーザー設定に登録すれば、どのプロジェクト（worktree）でも Pi が拡張とスキルを読み込める（clone 側に node_modules が無くても動く）", async () => {
+		const root = cloneHarness();
+		const dir = project();
+		mkdirSync(join(dir, ".pi"));
 		const { DefaultResourceLoader, SettingsManager } = await import("@earendil-works/pi-coding-agent");
 		const agentDir = mkdtempSync(join(tmpdir(), "pih-agent-"));
+		// pi install <root> が書き込むのと同じユーザー設定
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [root] }));
 		const loader = new DefaultResourceLoader({
-			cwd: project,
+			cwd: dir,
 			agentDir,
-			settingsManager: SettingsManager.create(project, agentDir),
+			settingsManager: SettingsManager.create(dir, agentDir),
 			projectTrusted: true,
 		} as never);
 		await loader.reload();
@@ -122,7 +149,7 @@ describe("install スクリプト", () => {
 		assert.deepEqual(ext.errors, []);
 		assert.deepEqual(
 			ext.extensions.map((e: { path?: string; resolvedPath?: string }) => e.resolvedPath ?? e.path),
-			[join(clone, "extensions/harness/index.ts")],
+			[join(root, "extensions/harness/index.ts")],
 		);
 	});
 });
