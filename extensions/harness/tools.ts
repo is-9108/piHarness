@@ -32,6 +32,11 @@ const PROCESS_TOOLS: Record<ProcessKind, { harness: string[]; readOnly?: boolean
 	review: { harness: ["harness_status", "harness_record_review", "harness_control"], readOnly: true },
 	fix: { harness: ["harness_status", "harness_phase", "harness_run_tests", "harness_request_test_change", "harness_record_decision", "harness_control"] },
 	bugfix: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_run_tests", "harness_request_test_change", "harness_record_decision", "harness_control"] },
+	// ドキュメント作成フロー: テストのツールは使わない
+	doc_plan: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_request_approval", "harness_control"] },
+	doc_write: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_control"] },
+	doc_review: { harness: ["harness_status", "harness_record_review", "harness_control"], readOnly: true },
+	doc_fix: { harness: ["harness_status", "harness_phase", "harness_control"] },
 };
 
 /**

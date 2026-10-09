@@ -31,7 +31,15 @@ function writableRoots(phase: Phase, p: GuardPaths): string[] | undefined {
 		case "escalated":
 		case "bug_analyze":
 		case "bug_done":
+		case "doc_outline":
+		case "doc_outline_approval":
+		case "doc_review":
+		case "doc_done":
 			return [p.workDir];
+		// ドキュメント作成フローの執筆・修正: このほかに、どこにあってもドキュメントのファイル（isDocFile）は書ける
+		case "doc_write":
+		case "doc_fix":
+			return [p.workDir, p.docsDir];
 		default:
 			return undefined;
 	}
@@ -62,7 +70,22 @@ const WHY: Partial<Record<Phase, string>> = {
 	escalated: "ユーザーへエスカレーション中です。ユーザーの判断を待ってください。",
 	bug_analyze: "原因分析中はコードを変更できません。分析後 harness_phase で bug_fix へ進んでください。",
 	bug_done: "バグ修正フローは完了しています。",
+	doc_outline: "構成案が承認されるまでドキュメントは書けません。",
+	doc_outline_approval: "構成案の承認待ちです。",
+	doc_review: "レビュー中はファイルを変更できません。harness_record_review で指摘を記録してから修正してください。",
+	doc_done: "ドキュメント作成フローは完了しています。",
+	doc_write: "ドキュメント作成フローでは、ドキュメント（.md などのファイルと docs/ 配下）以外は変更できません。コードの変更が必要なら、実装フロー（Issue）で行ってください。",
+	doc_fix: "ドキュメント作成フローでは、ドキュメント（.md などのファイルと docs/ 配下）以外は変更できません。コードの変更が必要なら、実装フロー（Issue）で行ってください。",
 };
+
+/** ドキュメントとして扱うファイルの拡張子 */
+export const DOC_EXTENSIONS = [".md", ".mdx", ".markdown", ".rst", ".adoc", ".txt"];
+
+/** ドキュメント作成フローで書き換えてよいファイル（ドキュメントの拡張子、または docsDir 配下） */
+export function isDocFile(path: string, p: Pick<GuardPaths, "cwd" | "docsDir">): boolean {
+	const lower = path.toLowerCase();
+	return isInside(path, p.docsDir, p.cwd) || DOC_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
 
 export const STATE_FILE = "state.json";
 
@@ -77,9 +100,11 @@ export function checkWrite(state: HarnessState, path: string | undefined, p: Gua
 	const roots = writableRoots(state.phase, p);
 	if (!roots) return { block: false };
 	if (roots.some((r) => isInside(path, r, p.cwd))) return { block: false };
+	const docsOnly = state.phase === "doc_write" || state.phase === "doc_fix";
+	if (docsOnly && isDocFile(path, p)) return { block: false };
 	return {
 		block: true,
-		reason: `[piHarness] ${WHY[state.phase] ?? ""} 現在のフェーズ: ${state.phase}。書き込み可能: ${roots.join(", ")}/ 配下のみ。(対象: ${path})`,
+		reason: `[piHarness] ${WHY[state.phase] ?? ""} 現在のフェーズ: ${state.phase}。書き込み可能: ${roots.join(", ")}/ 配下${docsOnly ? `と ${DOC_EXTENSIONS.join(" ")} のファイル` : ""}のみ。(対象: ${path})`,
 	};
 }
 

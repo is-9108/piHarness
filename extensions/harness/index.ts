@@ -28,7 +28,7 @@ import {
 	pruneStatus,
 	recordLimit,
 } from "./quota.ts";
-import { checkBash, checkOtherTool, checkWrite, type GuardPaths, isHarnessFile, isInside, mayModify, STATE_FILE, type ToolMeta } from "./guard.ts";
+import { checkBash, checkOtherTool, checkWrite, type GuardPaths, isDocFile, isHarnessFile, isInside, mayModify, STATE_FILE, type ToolMeta } from "./guard.ts";
 import { buildContext } from "./guidance.ts";
 import { emptyRegistry, type IssueRegistry, nextIssue, progressTable, registerIssues, setStatus } from "./progress.ts";
 import { analyzeTestDiff, findingsMarkdown, signature as integritySignature } from "./integrity.ts";
@@ -85,6 +85,8 @@ import {
 	isTestGatedTransition,
 	appendIssues,
 	applyApproval,
+	approvalKindFor,
+	approvalLabel,
 	beginApproval,
 	canCreateIssues,
 	clearHandoff,
@@ -109,6 +111,7 @@ import {
 	type ReviewFinding,
 	reviewMode,
 	startBugfix,
+	startDocs,
 	startImplement,
 	startRequirements,
 	statusLine,
@@ -121,7 +124,7 @@ import { slugify, tailLines, timestamp } from "./text.ts";
 import { toolsForProcess } from "./tools.ts";
 import { describeActivity, renderDashboard } from "./dashboard.ts";
 import { compactionInstructions, shouldCompact } from "./compaction.ts";
-import { issueVars, loadTemplate, prVars, renderTemplate, reviewVars, type TemplateName } from "./templates.ts";
+import { DOC_REVIEW_PERSPECTIVES, docPrVars, issueVars, loadTemplate, prVars, renderTemplate, reviewVars, type TemplateName } from "./templates.ts";
 
 const CONTEXT_MESSAGE = "harness-context";
 /** プロバイダーの利用上限の記録（作業項目をまたいで使う。workDir 直下） */
@@ -200,7 +203,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (!cfg.dashboard) {
 			const line = statusLine(state);
 			// フロー外では、話しかけて開始できることを示す
-			ctx.ui.setStatus("harness", line ? `🧭 ${line}` : "🧭 piHarness: 作りたいもの・実装したい Issue・直したい不具合を話しかけてください");
+			ctx.ui.setStatus("harness", line ? `🧭 ${line}` : "🧭 piHarness: 作りたいもの・実装したい Issue・直したい不具合・書きたいドキュメントを話しかけてください");
 			ctx.ui.setWidget("harness", undefined);
 			return;
 		}
@@ -336,7 +339,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	/** 軽量レビューの開始前に、前回レビュー時点からの差分を delta-N.diff として書き出す */
 	async function writeReviewDelta(ctx: ExtensionContext): Promise<void> {
-		if (processOf(state) !== "review" || reviewMode(state) !== "light" || !state.review.snapshot || !state.itemDir) return;
+		const proc = processOf(state);
+		if ((proc !== "review" && proc !== "doc_review") || reviewMode(state) !== "light" || !state.review.snapshot || !state.itemDir) return;
 		const run = gitRun(ctx);
 		const current = await snapshotTree(run, tempIndexFile(), gitExcludes(ctx, cfgOf(ctx)));
 		if (!current) return;
@@ -344,7 +348,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		writeItemFile(
 			ctx,
 			pathsOf(state).delta(state.review.round + 1),
-			diff || `# 前回レビュー（${state.review.round} 周目）以降、コードの変更はありません\n`,
+			diff || `# 前回レビュー（${state.review.round} 周目）以降、変更はありません\n`,
 		);
 	}
 
@@ -379,8 +383,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** コミットと PR のタイトル（ドキュメント作成フローは「ドキュメント: 」を付ける） */
+	function workTitle(): string {
+		const issue = state.issue;
+		const base = state.flow === "docs" ? `ドキュメント: ${issue?.title ?? state.topic ?? "piHarness"}` : (issue?.title ?? "piHarness 実装");
+		return `${base}${issue?.number ? ` (#${issue.number})` : ""}`;
+	}
+
 	/**
-	 * 実装フロー完了時の後処理: Issue を完了にし、変更をコミットし、設定に応じて PR を作成する。
+	 * 実装フロー（とドキュメント作成フロー）完了時の後処理: Issue を完了にし、変更をコミットし、設定に応じて PR を作成する。
 	 * PR（外部への公開）は git.pr が "ask" ならユーザーの確認を必須にする。戻り値はユーザー向けの報告文。
 	 */
 	async function finalizeImplementation(ctx: ExtensionContext, cfg: HarnessConfig, opts: { forcePr?: boolean } = {}): Promise<string> {
@@ -399,12 +410,12 @@ export default function piHarness(pi: ExtensionAPI): void {
 		const excludes = cfg.git.commitArtifacts
 			? [...gitExcludes(ctx, cfg).filter((e) => e !== cfg.workDir), `${cfg.workDir}/*/test-lock/*`, `${cfg.workDir}/${PROVIDER_STATUS_FILE}`]
 			: gitExcludes(ctx, cfg);
-		const title = `${issue?.title ?? "piHarness 実装"}${issue?.number ? ` (#${issue.number})` : ""}`;
+		const title = workTitle();
 		let next: GitInfo = { ...git };
 		if (cfg.git.commit && !git.commit) {
 			try {
 				const body = [
-					"piHarness TDD 実装フローで作成",
+					state.flow === "docs" ? "piHarness ドキュメント作成フローで作成（ドキュメントのみ）" : "piHarness TDD 実装フローで作成",
 					`レビュー: ${state.review.history.length} 周（${state.review.history.map((h) => `${h.round}:${h.blocking}件`).join(", ")}）`,
 					issue?.number ? `\nCloses #${issue.number}` : "",
 				].join("\n");
@@ -460,11 +471,22 @@ export default function piHarness(pi: ExtensionAPI): void {
 		const push = await pi.exec("git", ["push", "-u", "origin", git.branch], { cwd: ctx.cwd, timeout: 180_000 }).catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message, killed: false }));
 		if (push.code !== 0) return fail(`git push: ${(push.stderr || push.stdout).trim()}`);
 		const p = pathsOf(state);
-		const impl = existsSync(join(ctx.cwd, p.implementation)) ? readFileSync(join(ctx.cwd, p.implementation), "utf8") : "";
-		const body = renderNamed(ctx.cwd, cfg, "pr", {
+		const read = (rel: string) => (existsSync(join(ctx.cwd, rel)) ? readFileSync(join(ctx.cwd, rel), "utf8") : "");
+		const body = state.flow === "docs" ? renderNamed(ctx.cwd, cfg, "pr-docs", {
+			title,
+			...docPrVars({
+				report: read(p.docReport),
+				issue: state.issue,
+				topic: state.topic,
+				changedFiles: await changedFiles(ctx, cfg),
+				history: state.review.history,
+				remaining: state.review.lastFindings,
+				usage: usageSummaryLine(ctx),
+			}),
+		}) : renderNamed(ctx.cwd, cfg, "pr", {
 			title,
 			...prVars({
-				implementation: impl,
+				implementation: read(p.implementation),
 				issue: state.issue,
 				test: state.test,
 				testCommand: cfg.testCommand,
@@ -488,6 +510,13 @@ export default function piHarness(pi: ExtensionAPI): void {
 		setState({ ...state, git: { ...git, pr: { status: "created", url } } }, ctx);
 		if (state.issue) saveRegistry(ctx, setStatus(loadRegistry(ctx), state.issue, "done", { pr: url }));
 		return `PR を作成しました: ${url}`;
+	}
+
+	/** 作業開始時点からの変更ファイル（成果物ディレクトリ等は除く。未追跡を含む） */
+	async function changedFiles(ctx: ExtensionContext, cfg: HarnessConfig): Promise<string[]> {
+		if (!state.git?.base) return [];
+		const { nameStatus } = await diffSince(gitRun(ctx), state.git.base, gitExcludes(ctx, cfg), ctx.cwd);
+		return [...new Set(nameStatus.split("\n").filter(Boolean).map((l) => l.split("\t").pop()!))];
 	}
 
 	// -----------------------------------------------------------------------
@@ -745,27 +774,27 @@ export default function piHarness(pi: ExtensionAPI): void {
 				true,
 			);
 		}
-		const options = [
-			"ループを継続する（カウンタをリセットしてもう一度）",
-			"独立したバグ修正フローで対応する（新しいセッション）",
-			"手動で対応する（フローを一時停止）",
-			"フローを中止する",
-		];
+		const CONTINUE = "ループを継続する（カウンタをリセットしてもう一度）";
+		const BUGFIX = "独立したバグ修正フローで対応する（新しいセッション）";
+		const MANUAL = "手動で対応する（フローを一時停止）";
+		const ABORT = "フローを中止する";
+		// ドキュメント作成フローにはテストが無いので、バグ修正フローは選べない
+		const options = esc?.flow === "docs" ? [CONTINUE, MANUAL, ABORT] : [CONTINUE, BUGFIX, MANUAL, ABORT];
 		const choice = await ctx.ui.select(`⚠ エスカレーション: ${headline}\n${esc?.detail ?? ""}`, options);
-		if (choice === options[0]) {
+		if (choice === CONTINUE) {
 			setState(resumeAfterEscalation(state, limitsOf(cfg)), ctx);
 			return reply(
 				`${detail}\n\nユーザー判断: ループを継続。カウンタをリセットしました（現在のフェーズ: ${state.phase}）。` +
 					"これまでと異なるアプローチで原因を再分析してから修正してください。",
 			);
 		}
-		if (choice === options[1]) {
+		if (choice === BUGFIX) {
 			const description =
 				(await ctx.ui.input("バグの内容（空欄ならエスカレーション理由を使用）", esc?.detail ?? "")) || esc?.detail || headline;
 			setState(startBugfix(state, description, limitsOf(cfg), newItemDir(ctx, `bug-${timestamp()}`)), ctx);
 			return reply(`${detail}\n\nユーザー判断: 独立したバグ修正フローで対応します（バグ: ${description}）。`);
 		}
-		if (choice === options[3]) {
+		if (choice === ABORT) {
 			setState(finishFlow(state, "エスカレーション後にユーザーが中止"), ctx);
 			return reply(`${detail}\n\nユーザー判断: フローを中止しました。作業を止めてください。`, true);
 		}
@@ -1183,24 +1212,24 @@ export default function piHarness(pi: ExtensionAPI): void {
 		description:
 			"ユーザーの自然言語の依頼から piHarness のフローを開始・操作する。実行前に必ずユーザーへ確認ダイアログを出し、承認された場合だけ実行する。" +
 			"action: start_requirements（新しい機能・アプリを作りたい、要件を固めたい）/ start_implement（Issue を実装したい。issue に番号・URL・docs/issues/*.md、指定が無ければ next = 次に着手できる Issue）/ " +
-			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ continue_loop（エスカレーション後にループを続けたい）/ rejoin（バグ修正を実装フローへ合流させたい）/ " +
+			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ start_docs（ドキュメントだけを書きたい・直したい。README・手順書・設計書など。テストは無い。topic にテーマ、ドキュメントの Issue があれば issue）/ continue_loop（エスカレーション後にループを続けたい）/ rejoin（バグ修正を実装フローへ合流させたい）/ " +
 			"answer_spec_gap（仕様の確認に回答したい。回答ダイアログを出す）/ abort（フローをやめたい）。",
 		promptSnippet: "Start or control a piHarness flow from the user's natural-language request (always confirmed by the user)",
 		promptGuidelines: [
-			"ユーザーが作りたいもの・実装したい Issue・直したい不具合を話したら、自分で作業を始めず harness_control で対応するフローの開始を提案する（ツールがユーザーに確認する）。",
+			"ユーザーが作りたいもの・実装したい Issue・直したい不具合・書きたいドキュメントを話したら、自分で作業を始めず harness_control で対応するフローの開始を提案する（ツールがユーザーに確認する）。",
 			"依頼の意図がどのフローか曖昧なときは、harness_control を呼ぶ前にユーザーに聞く。ユーザーが取り消したら、無理に進めず意図を確認する。",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "continue_loop", "rejoin", "answer_spec_gap", "abort"] as const),
+			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "start_docs", "continue_loop", "rejoin", "answer_spec_gap", "abort"] as const),
 			request: Type.String({ description: "ユーザーの依頼の要約（確認ダイアログに表示する）" }),
-			topic: Type.Optional(Type.String({ description: "start_requirements: 作りたいもののテーマ" })),
-			issue: Type.Optional(Type.String({ description: "start_implement: Issue 番号・URL・docs/issues/*.md・next" })),
+			topic: Type.Optional(Type.String({ description: "start_requirements: 作りたいもののテーマ / start_docs: 書きたいドキュメントのテーマ" })),
+			issue: Type.Optional(Type.String({ description: "start_implement: Issue 番号・URL・docs/issues/*.md・next / start_docs: ドキュメントの Issue（任意）" })),
 			description: Type.Optional(Type.String({ description: "start_bugfix: バグの症状・再現手順" })),
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!ctx.hasUI) {
-				throw new Error("ユーザーの確認が必要なため、確認ダイアログを出せない環境では実行できません。/req・/impl・/bugfix・/harness コマンドを案内してください。");
+				throw new Error("ユーザーの確認が必要なため、確認ダイアログを出せない環境では実行できません。/req・/impl・/bugfix・/doc・/harness コマンドを案内してください。");
 			}
 			const cfg = cfgOf(ctx);
 			if (params.action === "answer_spec_gap") {
@@ -1210,7 +1239,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				if (state.pendingHandoff) forceHandoff = true;
 				return result;
 			}
-			const inProgress = isActive(state) && !["impl_done", "req_done", "bug_done"].includes(state.phase);
+			const inProgress = isActive(state) && !["impl_done", "req_done", "bug_done", "doc_done"].includes(state.phase);
 			const current = inProgress ? `${state.flow} / ${PHASE_LABELS[state.phase]}${state.issue ? `（${describeIssue(state.issue)}）` : ""}` : "";
 			let title: string;
 			const lines: string[] = [];
@@ -1232,6 +1261,20 @@ export default function piHarness(pi: ExtensionAPI): void {
 					title = "Issue の実装を開始しますか？";
 					lines.push(`Issue: ${describeIssue(target.issue)}${target.issue.url ? ` ${target.issue.url}` : ""}`, "新しいセッションで Issue とコードの読み込み → テスト/実装プランの作成から始めます。");
 					run = async () => prepareImplement(ctx, cfg, target.issue, target.body);
+					replaces = inProgress;
+					break;
+				}
+				case "start_docs": {
+					const topic = params.topic?.trim() || params.request;
+					const issueArg = params.issue?.trim();
+					const target = issueArg ? await resolveIssue(ctx, cfg, issueArg) : undefined;
+					if (issueArg && !target) return reply(`Issue を特定できませんでした: ${issueArg}（番号・URL・docs/issues/*.md で指定してください）`);
+					title = "ドキュメント作成を開始しますか？";
+					lines.push(
+						target ? `Issue: ${describeIssue(target.issue)}` : `テーマ: ${topic}`,
+						"新しいセッションで構成案の作成から始めます（承認後に執筆 → レビュー）。ドキュメント以外は変更せず、テストは実行しません。",
+					);
+					run = async () => prepareDocs(ctx, cfg, topic, target);
 					replaces = inProgress;
 					break;
 				}
@@ -1327,6 +1370,23 @@ export default function piHarness(pi: ExtensionAPI): void {
 		},
 	});
 
+	/**
+	 * ドキュメント作成フローでレビューへ進む前に、開始時点から変わったファイルがドキュメントだけかを git で確かめる。
+	 * bash などでコードを変更していれば遷移を拒否する（エージェントの申告ではなく差分で判定する）。
+	 */
+	async function checkDocsOnly(ctx: ExtensionContext, cfg: HarnessConfig): Promise<void> {
+		const files = await changedFiles(ctx, cfg);
+		const paths = guardPaths(ctx, cfg);
+		const others = files.filter((f) => !isDocFile(f, paths));
+		if (others.length) {
+			throw new Error(
+				`ドキュメント作成フローでは、ドキュメント以外のファイルは変更できません: ${others.slice(0, 10).join(", ")}${others.length > 10 ? ` ほか ${others.length - 10} 件` : ""}\n` +
+					"変更を元に戻してから、もう一度 harness_phase で doc_review へ進んでください。コードの変更が必要なら、作業を止めてユーザーに伝えてください（実装フローで行う）。",
+			);
+		}
+		if (state.git && files.length === 0) throw new Error("ドキュメントがまだ変更されていません。構成案どおりに書いてから doc_review へ進んでください。");
+	}
+
 	pi.registerTool({
 		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_phase",
@@ -1365,6 +1425,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				);
 			}
 			if (gated) await checkTestIntegrity(ctx, cfg, params.testChangeReason);
+			if (params.to === "doc_review") await checkDocsOnly(ctx, cfg);
 			const from = state.phase;
 			setState(next, ctx);
 
@@ -1402,13 +1463,13 @@ export default function piHarness(pi: ExtensionAPI): void {
 		name: "harness_request_approval",
 		label: "Request Approval",
 		description:
-			"人間の承認ゲート。要件定義書（kind: requirements）またはテスト/実装プラン（kind: plan）の承認をユーザーに依頼し、結果を返す。承認されるまで次のプロセスへは進めない。",
-		promptSnippet: "Ask the human to approve requirements or the test/implementation plan (hard gate)",
+			"人間の承認ゲート。要件定義書（kind: requirements）・テスト/実装プラン（kind: plan）・ドキュメントの構成案（kind: outline）の承認をユーザーに依頼し、結果を返す。承認されるまで次のプロセスへは進めない。",
+		promptSnippet: "Ask the human to approve requirements, the test/implementation plan, or a documentation outline (hard gate)",
 		promptGuidelines: [
 			"承認待ちの間にユーザーがチャットで承認・修正を伝えたら、発言だけで承認扱いにせず harness_request_approval をもう一度呼んで確認ダイアログで確定する。",
 		],
 		parameters: Type.Object({
-			kind: StringEnum(["requirements", "plan"] as const),
+			kind: StringEnum(["requirements", "plan", "outline"] as const),
 			summary: Type.String({ description: "承認者向けの要約（目的・スコープ・主要な決定事項・リスク）" }),
 			documents: Type.Array(Type.String(), { description: "レビュー対象ドキュメントのパス（cwd からの相対パス）", minItems: 1 }),
 		}),
@@ -1416,16 +1477,16 @@ export default function piHarness(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const kind = params.kind as ApprovalKind;
 			let documents = params.documents;
-			if (kind === "plan") {
-				const plan = pathsOf(state).plan;
-				if (!existsSync(join(ctx.cwd, plan))) throw new Error(`プランは ${plan} に作成してください（次のプロセスへはこのファイルが引き継がれます）。`);
-				documents = [plan, ...documents.filter((d) => d !== plan)];
+			if (kind === "plan" || kind === "outline") {
+				const main = kind === "plan" ? pathsOf(state).plan : pathsOf(state).outline;
+				if (!existsSync(join(ctx.cwd, main))) throw new Error(`${approvalLabel(kind)}は ${main} に作成してください（次のプロセスへはこのファイルが引き継がれます）。`);
+				documents = [main, ...documents.filter((d) => d !== main)];
 			}
 			const missing = documents.filter((d) => !existsSync(join(ctx.cwd, d)));
 			if (missing.length) throw new Error(`ドキュメントが見つかりません: ${missing.join(", ")}`);
 			setState(beginApproval(state, kind, documents), ctx);
 
-			const label = kind === "requirements" ? "要件定義" : "テスト/実装プラン";
+			const label = approvalLabel(kind);
 			const warning = kind === "plan" ? planSizeWarning(ctx, cfgOf(ctx)) : undefined;
 			if (!ctx.hasUI) {
 				return reply(
@@ -1466,9 +1527,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	function approvalMessage(kind: ApprovalKind, decision: ApprovalDecision, comment?: string): string {
 		const c = comment ? `\nユーザーのコメント: ${comment}` : "";
-		if (decision === "approved") return `${kind === "requirements" ? "要件定義" : "テスト/実装プラン"}が承認されました。${c}`;
+		if (decision === "approved") return `${approvalLabel(kind)}が承認されました。${c}`;
 		if (decision === "revise") {
-			return `修正を依頼されました。${c}\n指摘を反映して${kind === "requirements" ? "要件定義書" : "プラン"}を更新し、再度 harness_request_approval してください。不明点は harness_ask で確認すること。`;
+			return `修正を依頼されました。${c}\n指摘を反映して${kind === "requirements" ? "要件定義書" : kind === "plan" ? "プラン" : "構成案"}を更新し、再度 harness_request_approval してください。不明点は harness_ask で確認すること。`;
 		}
 		return `却下されました。フローを中止しました。${c}\n作業を止めてください。`;
 	}
@@ -1740,8 +1801,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 		name: "harness_record_review",
 		label: "Record Review",
 		description:
-			"コードレビュー結果を記録（review-<周回>.md に書き出し）し、レビューループを進める。ブロッキング指摘 (blocker/major) が無ければ実装完了、あれば指摘修正プロセスへ。上限周回でも残る場合はユーザーへエスカレーションする。" +
-			"受け入れ条件の解釈が分かれる点（仕様の曖昧さ）は指摘ではなく specGaps に書く。ユーザーにすぐ確認し、修正ループの回数には数えない。",
+			"コード（またはドキュメント）のレビュー結果を記録（review-<周回>.md に書き出し）し、レビューループを進める。ブロッキング指摘 (blocker/major) が無ければ完了、あれば指摘修正プロセスへ。上限周回でも残る場合はユーザーへエスカレーションする。" +
+			"コードレビューでは、受け入れ条件の解釈が分かれる点（仕様の曖昧さ）は指摘ではなく specGaps に書く。ユーザーにすぐ確認し、修正ループの回数には数えない（ドキュメントのレビューでは使わない）。",
 		promptSnippet: "Record code review findings (and spec ambiguities to ask the user) and advance the review loop",
 		parameters: Type.Object({
 			summary: Type.String({ description: "レビュー全体の所見（日本語、2〜5 文）" }),
@@ -1785,12 +1846,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 				case "rereview":
 					return reply(`レビュー ${outcome.round} 周目の記録: ${report}`);
 				case "clean": {
+					const docs = state.flow === "docs";
 					const finalized = await finalizeImplementation(ctx, cfg);
 					return reply(
-						`レビュー ${outcome.round} 周目（${mode === "full" ? "フル" : "軽量"}）: ブロッキング指摘なし。実装フロー完了です。記録: ${report}\n` +
+						`レビュー ${outcome.round} 周目（${mode === "full" ? "フル" : "軽量"}）: ブロッキング指摘なし。${docs ? "ドキュメント作成" : "実装"}フロー完了です。記録: ${report}\n` +
 							`${finalized}\n` +
 							(outcome.nonBlocking ? `軽微な指摘 ${outcome.nonBlocking} 件はユーザーへの報告に含めてください（必要なら別 Issue 化を提案）。` : "") +
-							"変更内容・テスト結果・レビュー結果・コミット/PR・利用量をユーザーに報告してください。",
+							(docs
+								? "作成・更新したドキュメント・レビュー結果・コミット/PR・利用量をユーザーに報告してください。"
+								: "変更内容・テスト結果・レビュー結果・コミット/PR・利用量をユーザーに報告してください。"),
 					);
 				}
 				case "fix":
@@ -1817,7 +1881,17 @@ export default function piHarness(pi: ExtensionAPI): void {
 			cwd,
 			cfg,
 			"review",
-			reviewVars({ round, mode, target: describeIssue(state.issue), at: new Date().toISOString(), summary, findings, blocking: cfg.blockingSeverities, specGaps }),
+			reviewVars({
+				round,
+				mode,
+				target: state.flow === "docs" ? `ドキュメント: ${state.issue ? describeIssue(state.issue) : (state.topic ?? "")}` : describeIssue(state.issue),
+				at: new Date().toISOString(),
+				summary,
+				findings,
+				blocking: cfg.blockingSeverities,
+				specGaps,
+				...(state.flow === "docs" ? { perspectives: DOC_REVIEW_PERSPECTIVES } : {}),
+			}),
 		);
 	}
 
@@ -1932,7 +2006,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	async function confirmReplace(ctx: ExtensionContext, next: string): Promise<boolean> {
 		if (!isActive(state) || !ctx.hasUI) return true;
-		if (["impl_done", "req_done", "bug_done"].includes(state.phase) && !state.suspended) return true;
+		if (["impl_done", "req_done", "bug_done", "doc_done"].includes(state.phase) && !state.suspended) return true;
 		return ctx.ui.confirm("進行中のフローがあります", `現在: ${state.flow} / ${PHASE_LABELS[state.phase]}\n破棄して ${next} を開始しますか？`);
 	}
 
@@ -2030,8 +2104,15 @@ export default function piHarness(pi: ExtensionAPI): void {
 		return resolved ?? { error: "Issue 番号・URL・docs/issues/*.md のいずれか、または next を指定してください。" };
 	}
 
-	/** 実装フローの状態を用意する: 作業ブランチ・差分の基準・Issue 本文（セッションはまだ開始しない） */
-	async function prepareImplement(ctx: ExtensionContext, cfg: HarnessConfig, issue: IssueRef, body: string | undefined): Promise<Prepared> {
+	/**
+	 * 作業ブランチを用意する（実装フロー・ドキュメント作成フロー共通）: 未コミットの変更の確認 → 開始元ブランチの pull → ブランチ作成。
+	 * git リポジトリでなければ何もしない。
+	 */
+	async function prepareWorkBranch(
+		ctx: ExtensionContext,
+		cfg: HarnessConfig,
+		target: string,
+	): Promise<{ git?: GitInfo; pullNote: string } | { error: string }> {
 		let git: GitInfo | undefined;
 		let pullNote = "";
 		const run = gitRun(ctx);
@@ -2039,20 +2120,19 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const dirty = await dirtyFiles(run, gitExcludes(ctx, cfg));
 			if (dirty.length && cfg.git.dirtyStart !== "allow") {
 				const list = dirty.slice(0, 10).join("\n") + (dirty.length > 10 ? `\n…ほか ${dirty.length - 10} 件` : "");
-				if (cfg.git.dirtyStart === "refuse") return { ok: false, message: `未コミットの変更があるため開始できません（git.dirtyStart: refuse）:\n${list}` };
+				if (cfg.git.dirtyStart === "refuse") return { error: `未コミットの変更があるため開始できません（git.dirtyStart: refuse）:\n${list}` };
 				if (ctx.hasUI && !(await ctx.ui.confirm("未コミットの変更があります", `${list}\n\nこの変更は作業ブランチに持ち込まれ、レビューの差分にも含まれます。続けますか？`))) {
-					return { ok: false, message: "未コミットの変更があるため、ユーザーが開始を取り消しました。" };
+					return { error: "未コミットの変更があるため、ユーザーが開始を取り消しました。" };
 				}
 			}
 			// 作成元: 設定の baseBranch → 既定ブランチ（main など）。別の作業ブランチ（前の Issue）上にいる場合だけ積み上げも選べる
-			const target = branchName(cfg.git.branchPrefix, issue);
 			const baseBranch = cfg.git.baseBranch ?? (await defaultBranch(run));
 			let startFrom = baseBranch;
 			const cur = await currentBranch(run);
 			if (baseBranch && ctx.hasUI && cur && cur !== target && cur !== baseBranch && cfg.git.branchPrefix && cur.startsWith(cfg.git.branchPrefix)) {
 				const options = [`${baseBranch} から作成する（推奨）`, `現在の作業ブランチ ${cur} から作成する（積み上げ）`];
 				const choice = await ctx.ui.select(`別の作業ブランチ ${cur} 上にいます。${target} をどこから作成しますか？`, options);
-				if (choice === undefined) return { ok: false, message: "ブランチの作成元が選ばれなかったため、開始を取り消しました。" };
+				if (choice === undefined) return { error: "ブランチの作成元が選ばれなかったため、開始を取り消しました。" };
 				if (choice === options[1]) startFrom = cur;
 			}
 			// 開始元ブランチを必ず origin から最新化してから始める（git.pullBase）
@@ -2061,7 +2141,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				if (pulled.status === "failed") {
 					const msg = `${baseBranch} を origin から pull できませんでした:\n${pulled.error}`;
 					if (!ctx.hasUI || !(await ctx.ui.confirm(`${baseBranch} を最新化できませんでした`, `${msg}\n\n最新化せずに開始しますか？`))) {
-						return { ok: false, message: `[piHarness] ${msg}\n原因を解消してから開始してください（最新化しない場合は git.pullBase: false）。` };
+						return { error: `[piHarness] ${msg}\n原因を解消してから開始してください（最新化しない場合は git.pullBase: false）。` };
 					}
 					pullNote = `⚠ ${baseBranch} を最新化せずに開始しました。`;
 				} else if (pulled.status === "updated") {
@@ -2073,13 +2153,34 @@ export default function piHarness(pi: ExtensionAPI): void {
 			try {
 				git = await prepareBranch(run, target, startFrom);
 			} catch (e) {
-				return { ok: false, message: `[piHarness] ${(e as Error).message}` };
+				return { error: `[piHarness] ${(e as Error).message}` };
 			}
 		}
+		return { git, pullNote };
+	}
+
+	/** 実装フローの状態を用意する: 作業ブランチ・差分の基準・Issue 本文（セッションはまだ開始しない） */
+	async function prepareImplement(ctx: ExtensionContext, cfg: HarnessConfig, issue: IssueRef, body: string | undefined): Promise<Prepared> {
+		const branch = await prepareWorkBranch(ctx, cfg, branchName(cfg.git.branchPrefix, issue));
+		if ("error" in branch) return { ok: false, message: branch.error };
+		const { git, pullNote } = branch;
 
 		const base = issue.number ? `issue-${issue.number}` : `issue-${slugify((issue.file ?? issue.title).replace(/\.md$/, "").split("/").pop() ?? "local", 40)}`;
 		setState({ ...startImplement(state, issue, limitsOf(cfg), newItemDir(ctx, base)), git }, ctx);
 		saveRegistry(ctx, setStatus(loadRegistry(ctx), issue, "in_progress"));
+		writeIssueFile(ctx, issue, body);
+		// 開始時点でテストとチェックを実行し、もともと失敗しているものを記録する
+		const baselineNote = await runBaseline(ctx, cfg).catch((e: Error) => `⚠ ベースラインを確認できませんでした: ${e.message}`);
+		return {
+			ok: true,
+			message:
+				`${describeIssue(issue)} の実装フローを開始します。${pullNote}${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}` +
+				(baselineNote ? `\n${baselineNote}` : ""),
+		};
+	}
+
+	/** Issue 本文を作業ディレクトリの issue.md に保存する（後のプロセスはこれだけを読む） */
+	function writeIssueFile(ctx: ExtensionContext, issue: IssueRef, body: string | undefined): void {
 		writeItemFile(
 			ctx,
 			pathsOf(state).issue,
@@ -2089,13 +2190,29 @@ export default function piHarness(pi: ExtensionAPI): void {
 					? `# #${issue.number} ${issue.title}\n\nURL: ${issue.url}\n\n${body}\n`
 					: `# Issue #${issue.number}\n\n（本文を自動取得できませんでした。\`gh issue view ${issue.number}\` や docs/issues/ から内容を確認し、このファイルに本文を保存してください）\n`,
 		);
-		// 開始時点でテストとチェックを実行し、もともと失敗しているものを記録する
-		const baselineNote = await runBaseline(ctx, cfg).catch((e: Error) => `⚠ ベースラインを確認できませんでした: ${e.message}`);
+	}
+
+	/**
+	 * ドキュメント作成フローの状態を用意する。テーマだけ、または Issue（ドキュメントの Issue）を対象にできる。
+	 * テストは無いのでベースラインは取らない。作業ブランチは docs-<テーマ or Issue> で作る。
+	 */
+	async function prepareDocs(ctx: ExtensionContext, cfg: HarnessConfig, topic: string, target?: { issue: IssueRef; body?: string }): Promise<Prepared> {
+		const issue = target?.issue;
+		const slug = slugify(topic || "docs", 30);
+		const branch = await prepareWorkBranch(ctx, cfg, issue ? branchName("docs-", issue) : `docs-${/^[a-z0-9-]+$/.test(slug) ? slug : timestamp().slice(0, 16)}`);
+		if ("error" in branch) return { ok: false, message: branch.error };
+		const { git, pullNote } = branch;
+		const base = issue?.number ? `docs-${issue.number}` : `docs-${timestamp().slice(0, 10)}-${slug}`;
+		setState({ ...startDocs(state, topic, issue, limitsOf(cfg), newItemDir(ctx, base)), git }, ctx);
+		if (issue) {
+			saveRegistry(ctx, setStatus(loadRegistry(ctx), issue, "in_progress"));
+			writeIssueFile(ctx, issue, target?.body);
+		}
 		return {
 			ok: true,
 			message:
-				`${describeIssue(issue)} の実装フローを開始します。${pullNote}${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}` +
-				(baselineNote ? `\n${baselineNote}` : ""),
+				`ドキュメント作成フローを開始します（${issue ? describeIssue(issue) : `テーマ: ${topic || "未指定"}`}）。テストは実行しません。` +
+				`${pullNote}${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}`,
 		};
 	}
 
@@ -2114,6 +2231,22 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			if (!(await confirmReplace(ctx, `${describeIssue(target.issue)} の実装フロー`))) return;
 			const prepared = await prepareImplement(ctx, cfg, target.issue, target.body);
+			ctx.ui.notify(prepared.message, prepared.ok ? "info" : "error");
+			if (prepared.ok) await startProcessSession(ctx);
+		},
+	});
+
+	pi.registerCommand("doc", {
+		description: "ドキュメント作成フローを新しいセッションで開始する（構成案 → 承認 → 執筆 → レビュー。テストは無い）: /doc <テーマ | Issue番号 | Issue URL | docs/issues/*.md>",
+		handler: async (args, ctx) => {
+			state = loadState(ctx);
+			const cfg = cfgOf(ctx);
+			let arg = args.trim();
+			if (!arg && ctx.hasUI) arg = (await ctx.ui.input("書きたいドキュメント（テーマ、または Issue 番号）"))?.trim() ?? "";
+			// Issue として解釈できればその Issue を対象にし、できなければテーマとして扱う
+			const target = arg && (parseIssueArg(arg) || /\.md$/i.test(arg)) ? await resolveIssue(ctx, cfg, arg) : undefined;
+			if (!(await confirmReplace(ctx, "ドキュメント作成フロー"))) return;
+			const prepared = await prepareDocs(ctx, cfg, target ? "" : arg, target);
 			ctx.ui.notify(prepared.message, prepared.ok ? "info" : "error");
 			if (prepared.ok) await startProcessSession(ctx);
 		},
@@ -2189,8 +2322,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 					case "approve":
 					case "revise":
 					case "reject": {
-						const kind: ApprovalKind | undefined =
-							state.phase === "req_approval" ? "requirements" : state.phase === "impl_plan_approval" ? "plan" : undefined;
+						const waitingKind = approvalKindFor(state.phase);
+						const kind: ApprovalKind | undefined = waitingKind && state.phase.endsWith("approval") ? waitingKind : undefined;
 						if (!kind) {
 							ctx.ui.notify(`承認待ちではありません（現在: ${state.phase}）`, "warning");
 							return;
@@ -2254,8 +2387,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 						return;
 					}
 					case "pr": {
-						if (state.phase !== "impl_done") {
-							ctx.ui.notify(`PR は実装フロー完了後に作成できます（現在: ${state.phase}）`, "warning");
+						if (state.phase !== "impl_done" && state.phase !== "doc_done") {
+							ctx.ui.notify(`PR は実装フロー・ドキュメント作成フローの完了後に作成できます（現在: ${state.phase}）`, "warning");
 							return;
 						}
 						if (ctx.hasUI && cfg.git.pr !== "auto" && !(await ctx.ui.confirm("PR を作成しますか？", `ブランチ ${state.git?.branch ?? "-"} → ${state.git?.baseBranch ?? "-"}`))) return;

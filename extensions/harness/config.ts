@@ -8,7 +8,7 @@ import type { ProcessKind, Severity } from "./state.ts";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevelName = (typeof THINKING_LEVELS)[number];
 
-export const PROCESS_KINDS: ProcessKind[] = ["hearing", "requirements", "issues", "plan", "implement", "review", "fix", "bugfix"];
+export const PROCESS_KINDS: ProcessKind[] = ["hearing", "requirements", "issues", "plan", "implement", "review", "fix", "bugfix", "doc_plan", "doc_write", "doc_review", "doc_fix"];
 
 /** レビューのフル（1 周目）/ 軽量（2 周目以降）だけ別に指定するためのキー */
 export const REVIEW_VARIANTS = ["review_full", "review_light"] as const;

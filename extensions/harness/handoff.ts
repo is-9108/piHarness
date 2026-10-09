@@ -42,6 +42,10 @@ export interface ArtifactPaths {
 	baseline: string;
 	/** ロックしたテストファイルの内容（テストのロックの照合と復元に使う） */
 	testLock: string;
+	/** ドキュメントの構成案（ドキュメント作成フローの承認対象） */
+	outline: string;
+	/** ドキュメントの執筆レポート（レビュー担当への引き継ぎ） */
+	docReport: string;
 }
 
 export function artifactPaths(itemDir: string): ArtifactPaths {
@@ -66,6 +70,8 @@ export function artifactPaths(itemDir: string): ArtifactPaths {
 		issueCommentDraft: join(itemDir, "issue-comment-draft.md"),
 		baseline: join(itemDir, "baseline.md"),
 		testLock: join(itemDir, "test-lock"),
+		outline: join(itemDir, "outline.md"),
+		docReport: join(itemDir, "doc-report.md"),
 	};
 }
 
@@ -92,6 +98,12 @@ export function requiredArtifact(s: HarnessState, to: Phase): { path: string; te
 	if (s.phase === "impl_fix_review" && to === "impl_review") {
 		return { path: p.fix(s.review.round), template: "skill harness-fix の templates/fix-report.md" };
 	}
+	if (s.phase === "doc_write" && to === "doc_review") {
+		return { path: p.docReport, template: "skill harness-doc-write の templates/doc-report.md" };
+	}
+	if (s.phase === "doc_fix" && to === "doc_review") {
+		return { path: p.fix(s.review.round), template: "skill harness-doc-fix の templates/fix-report.md" };
+	}
 	if (s.phase === "bug_fix" && to === "bug_done") {
 		return { path: p.bug(s.counters.bugs), template: "skill harness-bugfix の templates/bug-report.md" };
 	}
@@ -107,6 +119,10 @@ export const PROCESS_LABELS: Record<ProcessKind, string> = {
 	review: "コードレビュー",
 	fix: "レビュー指摘修正",
 	bugfix: "バグ修正",
+	doc_plan: "ドキュメントの構成案作成",
+	doc_write: "ドキュメント執筆",
+	doc_review: "ドキュメントレビュー",
+	doc_fix: "ドキュメントのレビュー指摘修正",
 };
 
 const SKILL_OF: Record<ProcessKind, string> = {
@@ -118,6 +134,10 @@ const SKILL_OF: Record<ProcessKind, string> = {
 	review: "harness-review",
 	fix: "harness-fix",
 	bugfix: "harness-bugfix",
+	doc_plan: "harness-doc-plan",
+	doc_write: "harness-doc-write",
+	doc_review: "harness-doc-review",
+	doc_fix: "harness-doc-fix",
 };
 
 /** プロセスに対応するスキル。レビューは 1 周目（フル）と 2 周目以降（軽量）で別のスキルにして読み込み量を減らす */
@@ -239,6 +259,43 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean, op
 			adrs(ref, "この作業で記録した ADR");
 			outputs.push({ path: p.fix(s.review.round), why: "指摘ごとの対応記録（レビューへ戻る前に必須）" });
 			break;
+		case "doc_plan":
+			add(p.issue, "対象 Issue の本文");
+			adrIndex("既存の設計判断（ADR）の一覧（ドキュメントの情報源として使える）");
+			outputs.push({ path: p.outline, why: "ドキュメントの構成案（承認対象）" });
+			break;
+		case "doc_write":
+			add(p.outline, "承認済みの構成案（この範囲だけを書く）");
+			add(p.issue, "対象 Issue の本文");
+			adrIndex("既存の設計判断（ADR）の一覧（ドキュメントの情報源として使える）");
+			outputs.push({ path: "構成案に書いたドキュメント", why: "作成・更新するドキュメント" });
+			outputs.push({ path: p.docReport, why: "執筆レポート（レビュー担当への引き継ぎ。レビューへ進む前に必須）" });
+			break;
+		case "doc_review":
+			if (reviewMode(s) === "light" && exists(p.review(s.review.round))) {
+				add(p.review(s.review.round), `前回（${s.review.round} 周目）のレビュー記録`);
+				add(p.fix(s.review.round), "前回の指摘への対応記録");
+				add(p.delta(s.review.round + 1), "前回レビュー以降の差分（これを中心に確認する）");
+				ref(p.docReport, "執筆レポート");
+				ref(p.outline, "承認済みの構成案");
+			} else {
+				add(p.outline, "承認済みの構成案（レビューの基準）");
+				add(p.docReport, "執筆レポート（書いたファイルと確認した情報源）");
+				ref(p.issue, "対象 Issue の本文");
+				for (let r = 1; r <= s.review.round; r++) {
+					ref(p.review(r), `レビュー ${r} 周目の記録`);
+					ref(p.fix(r), `レビュー ${r} 周目の指摘への対応記録`);
+				}
+			}
+			outputs.push({ path: p.review(s.review.round + 1), why: "レビュー記録（harness_record_review が書き出す）" });
+			break;
+		case "doc_fix":
+			add(p.review(s.review.round), "修正対象のレビュー記録");
+			ref(p.docReport, "執筆レポート");
+			ref(p.outline, "承認済みの構成案");
+			for (let r = 1; r < s.review.round; r++) ref(p.fix(r), `レビュー ${r} 周目の対応記録`);
+			outputs.push({ path: p.fix(s.review.round), why: "指摘ごとの対応記録（レビューへ戻る前に必須）" });
+			break;
 		case "bugfix":
 			add(p.escalation(s.counters.escalations), `エスカレーション記録 #${s.counters.escalations}`);
 			add(s.test.lastLog, "直近のテストログ");
@@ -286,7 +343,8 @@ export function kickoffMessage(s: HarnessState, exists: (path: string) => boolea
 	lines.push("");
 	lines.push("## このプロセスの成果物");
 	lines.push(...io.outputs.map((o) => `- ${o.path} — ${o.why}`));
-	const approval = io.process === "implement" ? s.approvals.plan : io.process === "issues" ? s.approvals.requirements : undefined;
+	const approval =
+		io.process === "implement" ? s.approvals.plan : io.process === "issues" ? s.approvals.requirements : io.process === "doc_write" ? s.approvals.outline : undefined;
 	if (approval?.comment) {
 		lines.push("");
 		lines.push(`承認時のユーザーコメント: ${approval.comment}`);
@@ -301,7 +359,7 @@ export function kickoffMessage(s: HarnessState, exists: (path: string) => boolea
 /** コードを扱うプロセスで、どこからの差分を見るべきかの案内 */
 export function diffInstruction(s: HarnessState): string | undefined {
 	const proc = processOf(s);
-	if (!s.git?.base || !proc || !["implement", "review", "fix", "bugfix"].includes(proc)) return undefined;
+	if (!s.git?.base || !proc || !["implement", "review", "fix", "bugfix", "doc_write", "doc_review", "doc_fix"].includes(proc)) return undefined;
 	const short = s.git.base.slice(0, 12);
 	return `変更の差分: \`git diff ${short}\`（実装開始時点 ${short} からの変更。未コミット分を含む）と \`git status\`（新規ファイル）${s.git.branch ? `／作業ブランチ: ${s.git.branch}` : ""}`;
 }
