@@ -1,6 +1,6 @@
 # ワークフロー仕様
 
-piHarness が制御する 3 つのフローの仕様です。フェーズ遷移はすべて `extensions/harness/state.ts` の状態機械で検証され、
+piHarness が制御する 4 つのフローの仕様です。フェーズ遷移はすべて `extensions/harness/state.ts` の状態機械で検証され、
 エージェントは `harness_*` ツール経由でしか進められません。
 
 ## セッションと成果物
@@ -17,6 +17,10 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
 | コードレビュー（周回ごと） | impl_review → impl_spec_gap | `issue.md`, `plan.md`, `implementation.md`, `decisions.md`, 過去の `review-*.md` / `fix-*.md` / `bug-*.md` | `review-N.md`（仕様の確認に回答すると `decisions.md`, `issue-comment-draft.md`） |
 | レビュー指摘修正（周回ごと） | impl_fix_review | `review-N.md`, `decisions.md`, `plan.md`, `implementation.md` | コード, `fix-N.md` |
 | バグ修正 | bug_reproduce → bug_analyze → bug_fix | `escalation-N.md`, 直近のテストログ, `issue.md`, `plan.md`, `implementation.md`, 直近の `review-N.md` | コード, `bug-N.md` |
+| ドキュメントの構成案作成 | doc_outline → doc_outline_approval | 依頼のテーマ, `issue.md`（Issue のとき） | `outline.md`（承認対象） |
+| ドキュメント執筆 | doc_write | `outline.md`, `issue.md` | ドキュメント, `doc-report.md` |
+| ドキュメントレビュー（周回ごと） | doc_review | `outline.md`, `doc-report.md`（2 周目以降は `review-N.md`, `fix-N.md`, `delta-N.diff`） | `review-N.md` |
+| ドキュメントの指摘修正（周回ごと） | doc_fix | `review-N.md`, `doc-report.md`, `outline.md` | ドキュメント, `fix-N.md` |
 
 成果物は作業項目ごとのディレクトリに置かれます（Issue 登録先の要件定義書は `docs/`）。
 
@@ -51,8 +55,8 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
 
 5. 新しいセッションの開始時に、`.pi/harness.json` の `models` からそのプロセス用のモデル・思考レベルを適用します（例: レビューだけ高性能モデル）。
 
-次のプロセスへ進む前に出力成果物が必須です（`implementation.md` / `fix-N.md` / `bug-N.md` / `plan.md` が無いと遷移を拒否）。
-`/req`, `/impl`, `/bugfix` もそれぞれ新しいセッションで開始します。pi を再起動した場合は `/harness next` で現在のプロセスを新しいセッションとして再開できます。
+次のプロセスへ進む前に出力成果物が必須です（`implementation.md` / `fix-N.md` / `bug-N.md` / `plan.md` / `outline.md` / `doc-report.md` が無いと遷移を拒否）。
+`/req`, `/impl`, `/bugfix`, `/doc` もそれぞれ新しいセッションで開始します。pi を再起動した場合は `/harness next` で現在のプロセスを新しいセッションとして再開できます。
 
 エスカレーション中の判断（ループ継続を選んだ場合）は同じセッションで続けます。後から `/harness continue` で継続した場合は、
 `escalation-N.md` を入力とする新しいセッションで再開します。
@@ -170,6 +174,24 @@ UI がない場合（RPC/print モード）は停止してユーザーに報告�
   バグ修正でコードが変わっているため、レビューカウンタをリセットしてフルレビューから行います（テストは bug_fix の最後で合格済み）。
 - バグ修正フロー内の修正ループも `maxTestLoops` で再エスカレーションします。そこから再度 `/bugfix` を選んでも合流先は保持されます。
 - 単独で起動した場合（実装フローなし）は、完了で終了します。
+
+## 4. ドキュメント作成フロー
+
+ドキュメント（README・手順書・設計書など）だけを書く・直すフローです。テストが無いので実装フローとは分けています。
+
+| フェーズ | 内容 | 書き込み可能 | 次へ進む方法 |
+|---------|------|-------------|-------------|
+| `doc_outline` | 情報源を読み、構成案 `outline.md` を作成 | `.pi/harness/` のみ | `harness_request_approval (outline)` |
+| `doc_outline_approval` | **人間の承認ゲート** | `.pi/harness/` のみ | 承認ダイアログ または `/harness approve` |
+| `doc_write` | 構成案どおりに執筆、`doc-report.md` を作成 | ドキュメントのみ（`.md` 等と `docsDir` 配下） | `doc-report.md` があり、開始時点からの変更がドキュメントだけで `harness_phase → doc_review` |
+| `doc_review` | ドキュメントの観点でレビュー（1 周目フル / 2 周目以降は差分だけ） | `.pi/harness/` のみ | `harness_record_review` |
+| `doc_fix` | ブロッキング指摘の修正、`fix-N.md` を作成 | ドキュメントのみ | `fix-N.md` があり、変更がドキュメントだけで `harness_phase → doc_review` |
+| `doc_done` | 完了（ドキュメントをコミット、設定に応じて PR） | `.pi/harness/` のみ | — |
+
+- 「変更がドキュメントだけ」は、エージェントの申告ではなく `git diff <基準>`（未追跡ファイルを含む）で判定します。bash でコードを変えていれば遷移を拒否します。
+- テストのツールは有効にしません。`harness_record_review` は使えますが、仕様の確認（specGaps）は使いません。
+- レビューループの上限でエスカレーションした場合の選択肢は、継続 / 手動対応 / 中止です（バグ修正フローは選べません）。継続すると `doc_fix` から再開します。
+- 完了時のコミットの件名は `ドキュメント: <テーマ>`（Issue なら `(#N)` と `Closes #N`）。PR の本文は `templates/pr-docs.md` で組み立てます。
 
 ## 状態の永続化
 

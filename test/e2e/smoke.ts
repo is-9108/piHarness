@@ -162,7 +162,7 @@ const item = ".pi/harness/issue-1";
 const p = (f: string) => `${item}/${f}`;
 
 const skills = runtime.services.resourceLoader.getSkills().skills.map((s) => s.name).sort();
-assert.deepEqual(skills, ["harness-bugfix", "harness-fix", "harness-hearing", "harness-issues", "harness-plan", "harness-requirements", "harness-review", "harness-review-light", "harness-tdd"]);
+assert.deepEqual(skills, ["harness-bugfix", "harness-doc-fix", "harness-doc-plan", "harness-doc-review", "harness-doc-write", "harness-fix", "harness-hearing", "harness-issues", "harness-plan", "harness-requirements", "harness-review", "harness-review-light", "harness-tdd"]);
 
 // ---------------------------------------------------------------------------
 // 実装フロー: 各プロセスが新しいセッションで実行される

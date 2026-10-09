@@ -6,7 +6,7 @@
 import type { HarnessState, Phase } from "./state.ts";
 
 /** 人間の判断待ちなど、圧縮しても意味がない（作業していない）フェーズ */
-const IDLE_PHASES: Phase[] = ["req_approval", "impl_plan_approval", "escalated", "impl_done", "req_done", "bug_done", "idle"];
+const IDLE_PHASES: Phase[] = ["req_approval", "impl_plan_approval", "escalated", "impl_done", "req_done", "bug_done", "doc_outline_approval", "doc_done", "idle"];
 
 export interface CompactionSettings {
 	enabled: boolean;

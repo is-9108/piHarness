@@ -36,6 +36,15 @@ const NEXT: Record<Phase, string> = {
 	bug_fix:
 		"根本原因に対する最小限の修正を行い harness_run_tests (expect: green) で全テストを合格させる。バグレポート bug-<番号>.md を完成させて harness_phase で bug_done へ。",
 	bug_done: "バグ修正フロー完了。合流先の実装フローがあればそこへ戻る。",
+	doc_outline:
+		"skill harness-doc-plan に従い、情報源（コード・既存ドキュメント・Issue）を読んで構成案 outline.md を作り、harness_request_approval (kind: outline) で承認を得る。まだドキュメントは書かない。",
+	doc_outline_approval: "構成案の承認待ち。承認されるまでドキュメントを書かない。",
+	doc_write:
+		"承認済みの構成案どおりにドキュメントを書く（ドキュメント以外のファイルは変更できない。テストは無い）。書き終えたら執筆レポート doc-report.md を書いて harness_phase で doc_review へ。",
+	doc_review:
+		"開始時のスキルに従ってドキュメントをレビューし（正確さはコードや情報源で確かめる）、harness_record_review で結果を記録する。レビュー中はファイルを変更しない。",
+	doc_fix: "ブロッキング指摘を修正し、指摘ごとの対応を fix-<周回>.md に書いてから harness_phase で doc_review へ戻る。",
+	doc_done: "ドキュメント作成フロー完了。作成・更新したドキュメント・レビュー結果・コミット/PR をユーザーに報告する。",
 	escalated: "ユーザーへエスカレーション中。自分で作業を続けず、状況と選択肢を報告してユーザーの判断を待つ。",
 };
 
@@ -79,7 +88,8 @@ export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO
 			if (s.testLock.allowed.length) lines.push(`変更を承認されたテスト: ${s.testLock.allowed.join(", ")}`);
 		}
 	}
-	if (s.flow === "implement") {
+	if (s.flow === "docs") lines.push("ドキュメント作成フロー: 変更できるのはドキュメント（.md など）だけ。テストは実行しない。");
+	if (s.flow === "implement" || s.flow === "docs") {
 		lines.push(`レビューループ: ${s.review.round}/${s.review.max} 周実施済み（次回: ${reviewMode(s) === "full" ? "フルレビュー" : "軽量レビュー"}）`);
 	}
 	if (s.bug) lines.push(`バグ: ${s.bug.description}`);
@@ -90,7 +100,7 @@ export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO
 		lines.push("ユーザーの回答待ちの仕様の確認:");
 		for (const g of pending) lines.push(`- ${g.id} [${g.criterion}] ${g.question}（解釈: ${g.interpretations.join(" / ")}）`);
 	}
-	if (s.phase === "impl_fix_review" && s.review.lastFindings.length) {
+	if ((s.phase === "impl_fix_review" || s.phase === "doc_fix") && s.review.lastFindings.length) {
 		lines.push("修正すべき前回のレビュー指摘:");
 		for (const f of s.review.lastFindings.filter((f) => cfg.blockingSeverities.includes(f.severity))) {
 			lines.push(`- [${f.severity}/${f.perspective}] ${f.title}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ""})` : ""}`);

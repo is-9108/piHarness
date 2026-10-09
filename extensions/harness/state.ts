@@ -5,9 +5,10 @@
  *   1. requirements: 要件定義 → 人間の承認ゲート → Issue 登録
  *   2. implement   : Issue/コード読込 → テスト・実装プラン → 承認 → TDD → テストループ → レビューループ
  *   3. bugfix      : エスカレーション時にユーザー判断で起動する独立したバグ修正フロー（完了後 implement へ合流）
+ *   4. docs        : ドキュメントだけを作る・直すフロー（構成案 → 承認 → 執筆 → レビューループ。テストは無い）
  */
 
-export type FlowKind = "requirements" | "implement" | "bugfix";
+export type FlowKind = "requirements" | "implement" | "bugfix" | "docs";
 
 export type Phase =
 	| "idle"
@@ -31,10 +32,17 @@ export type Phase =
 	| "bug_analyze"
 	| "bug_fix"
 	| "bug_done"
+	// docs（ドキュメント作成。テストは無い）
+	| "doc_outline"
+	| "doc_outline_approval"
+	| "doc_write"
+	| "doc_review"
+	| "doc_fix"
+	| "doc_done"
 	// 共通
 	| "escalated";
 
-export type ApprovalKind = "requirements" | "plan";
+export type ApprovalKind = "requirements" | "plan" | "outline";
 export type ApprovalDecision = "approved" | "revise" | "rejected";
 
 export interface ApprovalRecord {
@@ -142,7 +150,19 @@ import type { TestLock } from "./testlock.ts";
  * セッションを分ける単位。プロセスが変わるときは新しいセッションを開始し、
  * 前のプロセスとの連携は成果物（md ファイル）だけで行う。
  */
-export type ProcessKind = "hearing" | "requirements" | "issues" | "plan" | "implement" | "review" | "fix" | "bugfix";
+export type ProcessKind =
+	| "hearing"
+	| "requirements"
+	| "issues"
+	| "plan"
+	| "implement"
+	| "review"
+	| "fix"
+	| "bugfix"
+	| "doc_plan"
+	| "doc_write"
+	| "doc_review"
+	| "doc_fix";
 
 export interface PendingHandoff {
 	from: ProcessKind | null;
@@ -260,6 +280,7 @@ export function flowOf(phase: Phase): FlowKind | null {
 	if (phase.startsWith("req_")) return "requirements";
 	if (phase.startsWith("impl_")) return "implement";
 	if (phase.startsWith("bug_")) return "bugfix";
+	if (phase.startsWith("doc_")) return "docs";
 	return null;
 }
 
@@ -289,6 +310,18 @@ export function startImplement(prev: HarnessState, issue: IssueRef, limits: Limi
 	s.issue = issue;
 	s.log = prev.log.slice();
 	return withLog(s, `実装フロー開始: ${describeIssue(issue)}`);
+}
+
+/** ドキュメント作成フローを開始する。Issue が対象なら issue に、テーマだけなら topic に入れる */
+export function startDocs(prev: HarnessState, topic: string, issue: IssueRef | undefined, limits: Limits, itemDir: string): HarnessState {
+	const s = initialState(limits);
+	s.itemDir = itemDir;
+	s.flow = "docs";
+	s.phase = "doc_outline";
+	s.topic = topic || issue?.title;
+	s.issue = issue;
+	s.log = prev.log.slice();
+	return withLog(s, `ドキュメント作成フロー開始: ${issue ? describeIssue(issue) : topic || "(テーマ未指定)"}`);
 }
 
 /**
@@ -338,6 +371,9 @@ const FREE_TRANSITIONS: Partial<Record<Phase, Phase[]>> = {
 	bug_reproduce: ["bug_analyze"],
 	bug_analyze: ["bug_fix", "bug_reproduce"],
 	bug_fix: ["bug_analyze"],
+	// ドキュメントにはテストが無いので、執筆・修正からレビューへは成果物（doc-report.md / fix-N.md）だけを条件に進める
+	doc_write: ["doc_review"],
+	doc_fix: ["doc_review"],
 };
 
 /** テスト合格（かつ未変更）を条件に許可される遷移 */
@@ -380,7 +416,7 @@ export function transition(prev: HarnessState, to: Phase, note?: string): Harnes
 	}
 	const s = clone(prev);
 	s.phase = to;
-	if (to === "impl_review") s.review.lastFindings = [];
+	if (to === "impl_review" || to === "doc_review") s.review.lastFindings = [];
 	// 再現テストを書き直すため、Red 確認時のロックを外す
 	if (to === "bug_reproduce") s.testLock = undefined;
 	return withLog(s, `${prev.phase} → ${to}${note ? `: ${note}` : ""}`);
@@ -390,18 +426,32 @@ export function transition(prev: HarnessState, to: Phase, note?: string): Harnes
 // 承認ゲート
 // ---------------------------------------------------------------------------
 
+/** 承認ゲートごとのフェーズ: 作成中 → 承認待ち → 承認 / 修正依頼 */
+const APPROVAL_GATES: Record<ApprovalKind, { label: string; draft: Phase; waiting: Phase; approved: Phase }> = {
+	requirements: { label: "要件定義", draft: "req_document", waiting: "req_approval", approved: "req_issues" },
+	plan: { label: "テスト/実装プラン", draft: "impl_plan", waiting: "impl_plan_approval", approved: "impl_tdd" },
+	outline: { label: "ドキュメントの構成案", draft: "doc_outline", waiting: "doc_outline_approval", approved: "doc_write" },
+};
+
+export function approvalLabel(kind: ApprovalKind): string {
+	return APPROVAL_GATES[kind].label;
+}
+
+/** 現在のフェーズで依頼できる承認の種類 */
+export function approvalKindFor(phase: Phase): ApprovalKind | undefined {
+	return (Object.keys(APPROVAL_GATES) as ApprovalKind[]).find((k) => [APPROVAL_GATES[k].draft, APPROVAL_GATES[k].waiting].includes(phase));
+}
+
 export function beginApproval(prev: HarnessState, kind: ApprovalKind, documents: string[]): HarnessState {
-	const expected: Phase[] = kind === "requirements" ? ["req_document", "req_approval"] : ["impl_plan", "impl_plan_approval"];
-	if (!expected.includes(prev.phase)) {
-		throw new TransitionError(
-			`${kind === "requirements" ? "要件定義" : "テスト/実装プラン"}の承認は ${expected[0]} フェーズでのみ依頼できます（現在: ${prev.phase}）。`,
-		);
+	const gate = APPROVAL_GATES[kind];
+	if (![gate.draft, gate.waiting].includes(prev.phase)) {
+		throw new TransitionError(`${gate.label}の承認は ${gate.draft} フェーズでのみ依頼できます（現在: ${prev.phase}）。`);
 	}
 	const s = clone(prev);
-	s.phase = kind === "requirements" ? "req_approval" : "impl_plan_approval";
+	s.phase = gate.waiting;
 	if (kind === "requirements") s.artifacts.docs = unique([...s.artifacts.docs, ...documents]);
 	else if (documents[0]) s.artifacts.plan = documents[0];
-	return withLog(s, `${kind === "requirements" ? "要件定義" : "プラン"}の承認待ち`);
+	return withLog(s, `${gate.label}の承認待ち`);
 }
 
 export function applyApproval(
@@ -411,22 +461,22 @@ export function applyApproval(
 	comment: string | undefined,
 	documents: string[],
 ): HarnessState {
-	const waiting: Phase = kind === "requirements" ? "req_approval" : "impl_plan_approval";
-	if (prev.phase !== waiting) {
+	const gate = APPROVAL_GATES[kind];
+	if (prev.phase !== gate.waiting) {
 		throw new TransitionError(`承認待ちの状態ではありません（現在: ${prev.phase}）。`);
 	}
 	const s = clone(prev);
 	s.approvals[kind] = { decision, comment, documents, at: now() };
 	if (decision === "approved") {
-		s.phase = kind === "requirements" ? "req_issues" : "impl_tdd";
+		s.phase = gate.approved;
 	} else if (decision === "revise") {
-		s.phase = kind === "requirements" ? "req_document" : "impl_plan";
+		s.phase = gate.draft;
 	} else {
 		s.flow = null;
 		s.phase = "idle";
 	}
 	const label = { approved: "承認", revise: "修正依頼", rejected: "却下" }[decision];
-	return withLog(s, `${kind === "requirements" ? "要件定義" : "プラン"}: ${label}${comment ? ` (${comment})` : ""}`);
+	return withLog(s, `${gate.label}: ${label}${comment ? ` (${comment})` : ""}`);
 }
 
 export function isApproved(s: HarnessState, kind: ApprovalKind): boolean {
@@ -647,9 +697,11 @@ export function recordReview(
 	blockingSeverities: Severity[] = BLOCKING,
 	specGaps: Omit<SpecGap, "id" | "round">[] = [],
 ): { state: HarnessState; outcome: ReviewOutcome } {
-	if (prev.phase !== "impl_review") {
-		throw new TransitionError(`レビュー結果は impl_review フェーズでのみ記録できます（現在: ${prev.phase}）。`);
+	if (prev.phase !== "impl_review" && prev.phase !== "doc_review") {
+		throw new TransitionError(`レビュー結果はレビューのフェーズ（impl_review / doc_review）でのみ記録できます（現在: ${prev.phase}）。`);
 	}
+	// ドキュメントには受け入れ条件のテストが無いので、仕様の確認（spec_gap）は使わない
+	if (prev.flow === "docs") specGaps = [];
 	const s = clone(prev);
 	const mode = reviewMode(prev);
 	const blocking = findings.filter((f) => blockingSeverities.includes(f.severity)).length;
@@ -710,8 +762,9 @@ export function answerSpecGap(prev: HarnessState, id: string, answer: string): {
 
 /** レビュー 1 周分の結果に従って、完了・修正・エスカレーションのいずれかへ進める */
 function settleReview(s: HarnessState, blocking: number, total: number): { state: HarnessState; outcome: ReviewOutcome } {
+	const docs = s.flow === "docs";
 	if (blocking === 0) {
-		s.phase = "impl_done";
+		s.phase = docs ? "doc_done" : "impl_done";
 		return {
 			state: withLog(s, `レビュー ${s.review.round} 周目: 指摘なし（ブロッキング 0 件）→ 完了`),
 			outcome: { kind: "clean", round: s.review.round, nonBlocking: total },
@@ -725,7 +778,7 @@ function settleReview(s: HarnessState, blocking: number, total: number): { state
 		);
 		return { state: escalated, outcome: { kind: "escalate", round: s.review.round, blocking } };
 	}
-	s.phase = "impl_fix_review";
+	s.phase = docs ? "doc_fix" : "impl_fix_review";
 	s.test.failures = 0;
 	s.test.failureHistory = [];
 	return {
@@ -762,7 +815,7 @@ export function resumeAfterEscalation(prev: HarnessState, limits: Limits): Harne
 	if (esc.reason === "review_loop") {
 		// 追加でレビューループを max 周分許可する（ブロッキング指摘の修正から再開）
 		s.review.max = s.review.round + limits.maxReviewLoops;
-		s.phase = "impl_fix_review";
+		s.phase = esc.flow === "docs" ? "doc_fix" : "impl_fix_review";
 	} else {
 		s.phase = esc.phase;
 	}
@@ -825,6 +878,12 @@ const PROCESS_OF: Record<Exclude<Phase, "idle" | "escalated">, ProcessKind> = {
 	bug_analyze: "bugfix",
 	bug_fix: "bugfix",
 	bug_done: "bugfix",
+	doc_outline: "doc_plan",
+	doc_outline_approval: "doc_plan",
+	doc_write: "doc_write",
+	doc_review: "doc_review",
+	doc_fix: "doc_fix",
+	doc_done: "doc_review",
 };
 
 /** フェーズが属するプロセス。エスカレーション中はエスカレーション元のプロセスに留まる */
@@ -842,7 +901,7 @@ export function withHandoff(prev: HarnessState, next: HarnessState): HarnessStat
 	const from = processOf(prev);
 	const to = processOf(next);
 	if (!to || !next.flow || from === to) return next;
-	if (next.phase === "impl_done" || next.phase === "req_done") return next;
+	if (next.phase === "impl_done" || next.phase === "req_done" || next.phase === "doc_done") return next;
 	const s = clone(next);
 	s.pendingHandoff = { from, to, at: now() };
 	return withLog(s, `プロセス切替待ち: ${from ?? "-"} → ${to}（新しいセッションで開始）`);
@@ -883,14 +942,20 @@ export const PHASE_LABELS: Record<Phase, string> = {
 	bug_analyze: "原因分析",
 	bug_fix: "バグ修正",
 	bug_done: "バグ修正完了",
+	doc_outline: "構成案作成",
+	doc_outline_approval: "構成案承認待ち",
+	doc_write: "ドキュメント執筆",
+	doc_review: "ドキュメントレビュー",
+	doc_fix: "レビュー指摘修正（ドキュメント）",
+	doc_done: "ドキュメント作成完了",
 	escalated: "エスカレーション中",
 };
 
 export function statusLine(s: HarnessState): string {
 	if (!isActive(s)) return "";
 	const parts = [`${s.flow}:${PHASE_LABELS[s.phase]}`];
-	if (s.flow !== "requirements") parts.push(`test ${s.test.failures}/${s.test.max}`);
-	if (s.flow === "implement") parts.push(`review ${s.review.round}/${s.review.max}`);
+	if (s.flow === "implement" || s.flow === "bugfix") parts.push(`test ${s.test.failures}/${s.test.max}`);
+	if (s.flow === "implement" || s.flow === "docs") parts.push(`review ${s.review.round}/${s.review.max}`);
 	if (s.test.dirty) parts.push("未テスト変更あり");
 	if (s.pendingHandoff) parts.push(`次セッション待ち→${s.pendingHandoff.to}`);
 	return parts.join(" | ");

@@ -1,6 +1,6 @@
 # AGENTS.md — piHarness の開発ガイド
 
-pi-coding-agent の拡張 + Skill。要件定義 → TDD 実装 → レビュー（＋バグ修正）を**状態機械とゲートで強制**する。
+pi-coding-agent の拡張 + Skill。要件定義 → TDD 実装 → レビュー（＋バグ修正、ドキュメントだけの作成）を**状態機械とゲートで強制**する。
 利用者向けの説明は README.md、仕様は docs/workflows.md、設計の理由は docs/architecture.md。
 
 ## 構成

@@ -2,7 +2,7 @@
  * TUI のダッシュボード（入力欄の上に常時表示するウィジェット）の内容を組み立てる（純粋関数）。
  * 作業全体のどこにいるか・いま何をしているか・次に何をするか・ブランチ・トークン/費用・コンテキスト使用率を一目で分かるようにする。
  */
-import { describeIssue, type HarnessState, type Phase, reviewMode } from "./state.ts";
+import { describeIssue, type FlowKind, type HarnessState, type Phase, reviewMode } from "./state.ts";
 
 export type Color = "accent" | "success" | "warning" | "error" | "muted" | "dim" | "text";
 export type Paint = (color: Color, text: string) => string;
@@ -29,7 +29,7 @@ interface Step {
 	phases: Phase[];
 }
 
-const STEPS: Record<"requirements" | "implement" | "bugfix", Step[]> = {
+const STEPS: Record<FlowKind, Step[]> = {
 	requirements: [
 		{ label: "ヒアリング", phases: ["req_clarify"] },
 		{ label: "要件定義書", phases: ["req_document"] },
@@ -50,6 +50,13 @@ const STEPS: Record<"requirements" | "implement" | "bugfix", Step[]> = {
 		{ label: "分析", phases: ["bug_analyze"] },
 		{ label: "修正", phases: ["bug_fix"] },
 		{ label: "完了", phases: ["bug_done"] },
+	],
+	docs: [
+		{ label: "構成案", phases: ["doc_outline"] },
+		{ label: "承認", phases: ["doc_outline_approval"] },
+		{ label: "執筆", phases: ["doc_write"] },
+		{ label: "レビュー", phases: ["doc_review", "doc_fix"] },
+		{ label: "完了", phases: ["doc_done"] },
 	],
 };
 
@@ -72,9 +79,15 @@ const NEXT: Partial<Record<Phase, string>> = {
 	bug_analyze: "根本原因を分析（コード変更なし）",
 	bug_fix: "最小限の修正 → 全テスト green",
 	bug_done: "完了（実装フローへ合流）",
+	doc_outline: "情報源を読み、構成案を作成 → 承認依頼",
+	doc_outline_approval: "あなたの承認待ち",
+	doc_write: "構成案どおりに執筆 → 執筆レポート",
+	doc_review: "ドキュメントをレビューして結果を記録",
+	doc_fix: "指摘を修正 → fix レポート",
+	doc_done: "完了（コミット・PR を確認）",
 };
 
-const FLOW_LABEL = { requirements: "要件定義", implement: "TDD 実装", bugfix: "バグ修正" } as const;
+const FLOW_LABEL: Record<FlowKind, string> = { requirements: "要件定義", implement: "TDD 実装", bugfix: "バグ修正", docs: "ドキュメント作成" };
 
 export function formatTokens(n: number): string {
 	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -94,9 +107,10 @@ export function stepsLine(s: HarnessState, paint: Paint = plain): string {
 	const current = steps.findIndex((st) => st.phases.includes(phase));
 	const parts = steps.map((st, i) => {
 		let label = st.label;
-		if (st.label === "レビュー" && (s.review.round > 0 || phase === "impl_review" || phase === "impl_fix_review")) {
+		const fixing = phase === "impl_fix_review" || phase === "doc_fix";
+		if (st.label === "レビュー" && (s.review.round > 0 || phase === "impl_review" || phase === "doc_review" || fixing)) {
 			label =
-				phase === "impl_fix_review"
+				fixing
 					? `レビュー ${s.review.round}/${s.review.max}（修正中）`
 					: phase === "impl_spec_gap"
 						? `レビュー ${s.review.round}/${s.review.max}（仕様の確認中）`
@@ -118,7 +132,7 @@ export function renderDashboard(d: DashboardInput, paint: Paint = plain): string
 
 	if (!s.flow || s.phase === "idle") {
 		lines.push(
-			[paint("accent", "🧭 piHarness"), "待機中", branch, paint("muted", "話しかけて開始: 作りたいもの / 実装したい Issue / 直したい不具合")]
+			[paint("accent", "🧭 piHarness"), "待機中", branch, paint("muted", "話しかけて開始: 作りたいもの / 実装したい Issue / 直したい不具合 / 書きたいドキュメント")]
 				.filter(Boolean)
 				.join(sep),
 		);
@@ -138,11 +152,11 @@ export function renderDashboard(d: DashboardInput, paint: Paint = plain): string
 		}
 
 		const loops: string[] = [];
-		if (s.flow !== "requirements") {
+		if (s.flow === "implement" || s.flow === "bugfix") {
 			const f = s.test.failures;
 			loops.push(paint(f === 0 ? "muted" : f >= s.test.max - 1 ? "error" : "warning", `テスト修正 ${f}/${s.test.max}`));
 		}
-		if (s.flow === "implement") loops.push(paint("muted", `レビュー ${s.review.round}/${s.review.max}（次: ${reviewMode(s) === "full" ? "フル" : "軽量"}）`));
+		if (s.flow === "implement" || s.flow === "docs") loops.push(paint("muted", `レビュー ${s.review.round}/${s.review.max}（次: ${reviewMode(s) === "full" ? "フル" : "軽量"}）`));
 		if (s.test.lastResult) loops.push(paint(s.test.lastResult === "pass" ? "success" : "error", `直近のテスト ${s.test.lastResult === "pass" ? "PASS" : "FAIL"}`));
 		if (s.test.dirty) loops.push(paint("warning", "未テストの変更あり"));
 		if (loops.length) lines.push(loops.join(sep));

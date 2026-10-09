@@ -9,8 +9,8 @@ import { join } from "node:path";
 import type { IssueDraft } from "./issues.ts";
 import type { Baseline, FlakyRecord, ReviewFinding, ReviewRound, SpecGap } from "./state.ts";
 
-export type TemplateName = "issue" | "pr" | "review" | "adr";
-export const TEMPLATE_NAMES: TemplateName[] = ["issue", "pr", "review", "adr"];
+export type TemplateName = "issue" | "pr" | "review" | "adr" | "pr-docs";
+export const TEMPLATE_NAMES: TemplateName[] = ["issue", "pr", "review", "adr", "pr-docs"];
 
 const NONE = "なし";
 
@@ -83,10 +83,23 @@ export const REVIEW_PERSPECTIVES: [string, string][] = [
 	["operability", "運用性"],
 ];
 
+/** ドキュメントのフルレビューで必ず確認する観点（skills/harness-doc-review と同じ並び） */
+export const DOC_REVIEW_PERSPECTIVES: [string, string][] = [
+	["accuracy", "正確さ"],
+	["completeness", "網羅性"],
+	["clarity", "分かりやすさ"],
+	["structure", "構成"],
+	["consistency", "一貫性"],
+	["examples", "手順・例"],
+	["links", "リンク・参照"],
+];
+
+type Perspectives = [string, string][];
+
 const SEVERITIES = ["blocker", "major", "minor", "nit"] as const;
 
-function perspectiveLabel(p: string): string {
-	const hit = REVIEW_PERSPECTIVES.find(([k]) => k === p);
+function perspectiveLabel(p: string, list: Perspectives = REVIEW_PERSPECTIVES): string {
+	const hit = list.find(([k]) => k === p);
 	return hit ? `${hit[1]}（${hit[0]}）` : p;
 }
 
@@ -96,22 +109,22 @@ export function severityCounts(findings: ReviewFinding[], blocking: string[]): s
 	return `${counts}（修正必須 ${must} 件）`;
 }
 
-function perspectiveTable(findings: ReviewFinding[], mode: "full" | "light"): string {
+function perspectiveTable(findings: ReviewFinding[], mode: "full" | "light", list: Perspectives): string {
 	if (mode === "light") {
 		const touched = [...new Set(findings.map((f) => f.perspective))];
 		const note = "軽量レビューのため、前回の指摘の解消と前回レビュー以降の差分だけを確認しました。";
 		if (touched.length === 0) return note;
-		return `${note}\n\n| 観点 | 指摘 |\n|---|---|\n${touched.map((p) => `| ${perspectiveLabel(p)} | ${findings.filter((f) => f.perspective === p).length} 件 |`).join("\n")}`;
+		return `${note}\n\n| 観点 | 指摘 |\n|---|---|\n${touched.map((p) => `| ${perspectiveLabel(p, list)} | ${findings.filter((f) => f.perspective === p).length} 件 |`).join("\n")}`;
 	}
-	const keys = [...REVIEW_PERSPECTIVES.map(([k]) => k), ...new Set(findings.map((f) => f.perspective).filter((p) => !REVIEW_PERSPECTIVES.some(([k]) => k === p)))];
+	const keys = [...list.map(([k]) => k), ...new Set(findings.map((f) => f.perspective).filter((p) => !list.some(([k]) => k === p)))];
 	const rows = keys.map((k) => {
 		const n = findings.filter((f) => f.perspective === k).length;
-		return `| ${perspectiveLabel(k)} | ${n ? `${n} 件` : "指摘なし"} |`;
+		return `| ${perspectiveLabel(k, list)} | ${n ? `${n} 件` : "指摘なし"} |`;
 	});
 	return `| 観点 | 結果 |\n|---|---|\n${rows.join("\n")}`;
 }
 
-export function findingsMarkdown(findings: ReviewFinding[], blocking: string[]): string {
+export function findingsMarkdown(findings: ReviewFinding[], blocking: string[], list: Perspectives = REVIEW_PERSPECTIVES): string {
 	if (findings.length === 0) return NONE;
 	return findings
 		.map((f, i) => {
@@ -120,7 +133,7 @@ export function findingsMarkdown(findings: ReviewFinding[], blocking: string[]):
 			return [
 				`### ${i + 1}. [${f.severity}${must ? " 🔴" : ""}] ${f.title}`,
 				"",
-				`- 観点: ${perspectiveLabel(f.perspective)}`,
+				`- 観点: ${perspectiveLabel(f.perspective, list)}`,
 				`- 場所: ${where}`,
 				`- 修正必須: ${must ? "はい" : "いいえ"}`,
 				"",
@@ -157,7 +170,10 @@ export function reviewVars(args: {
 	findings: ReviewFinding[];
 	blocking: string[];
 	specGaps?: SpecGap[];
+	/** フルレビューで必ず確認する観点（既定はコードの観点） */
+	perspectives?: Perspectives;
 }): Record<string, string> {
+	const list = args.perspectives ?? REVIEW_PERSPECTIVES;
 	const must = args.findings.filter((f) => args.blocking.includes(f.severity)).length;
 	return {
 		round: String(args.round),
@@ -171,8 +187,8 @@ export function reviewVars(args: {
 				: "✅ 修正必須の指摘なし",
 		counts: severityCounts(args.findings, args.blocking),
 		summary: args.summary,
-		perspectives: perspectiveTable(args.findings, args.mode),
-		findings: findingsMarkdown(args.findings, args.blocking),
+		perspectives: perspectiveTable(args.findings, args.mode, list),
+		findings: findingsMarkdown(args.findings, args.blocking, list),
 		specGaps: specGapsMarkdown(args.specGaps ?? []),
 	};
 }
@@ -226,9 +242,7 @@ export function prVars(args: {
 }): Record<string, string> {
 	const impl = args.implementation;
 	const section = (h: string) => extractSection(impl, h) ?? "（実装レポートに記載なし）";
-	const issue = args.issue
-		? `${args.issue.number ? `#${args.issue.number} ` : ""}${args.issue.title}${args.issue.url && !args.issue.number ? `（${args.issue.url}）` : ""}`
-		: NONE;
+	const issue = issueLine(args.issue);
 	const head = [
 		`- 最終結果: ${args.test.lastResult === "pass" ? "✅ 合格" : args.test.lastResult === "fail" ? "❌ 不合格" : "未実行"}（piHarness が実行。テスト実行 ${args.test.runs} 回）`,
 		args.testCommand ? `- テストコマンド: \`${args.testCommand}\`` : "",
@@ -242,14 +256,6 @@ export function prVars(args: {
 	const detail = extractSection(impl, "テスト結果");
 	const tests = detail ? `${head.join("\n")}\n\n${detail}` : head.join("\n");
 	const answered = (args.specGaps ?? []).filter((g) => g.answer);
-	const rounds = args.history.length
-		? `| 周回 | 種別 | 修正必須 | 全指摘 |\n|---|---|---|---|\n${args.history
-				.map((h) => `| ${h.round} | ${h.mode === "full" ? "フル" : "軽量"} | ${h.blocking} 件 | ${h.total} 件 |`)
-				.join("\n")}`
-		: NONE;
-	const remaining = args.remaining.length
-		? `\n\n**残した軽微な指摘**\n\n${args.remaining.map((f) => `- [${f.severity}] ${f.title}${f.file ? `（\`${f.file}${f.line ? `:${f.line}` : ""}\`）` : ""}`).join("\n")}`
-		: "";
 	return {
 		summary: section("概要"),
 		issue,
@@ -257,17 +263,66 @@ export function prVars(args: {
 		changes: section("変更ファイル"),
 		tests,
 		testChanges: bullets(args.testChangeReasons),
-		reviews: rounds + remaining,
+		reviews: reviewHistoryMarkdown(args.history, args.remaining),
 		deviations: extractSection(impl, "プランからの逸脱") ?? NONE,
 		reviewFocus: extractSection(impl, "レビューで特に見てほしい点") ?? NONE,
 		limitations: extractSection(impl, "既知の制約") ?? NONE,
 		specDecisions: answered.length ? answered.map((g) => `- [${g.criterion}] ${g.question} → **${g.answer}**`).join("\n") : NONE,
-		adrs: bullets(
-			(args.adrs ?? []).map((path) => {
-				const n = path.split("/").pop()?.match(/^(\d{4})-/)?.[1];
-				return n ? `ADR-${n}（\`${path}\`）` : `\`${path}\``;
-			}),
-		),
+		adrs: adrList(args.adrs),
+		usage: args.usage ?? "",
+		closes: args.issue?.number ? `Closes #${args.issue.number}` : "",
+	};
+}
+
+function issueLine(issue?: { number?: number; title: string; url?: string }): string {
+	return issue ? `${issue.number ? `#${issue.number} ` : ""}${issue.title}${issue.url && !issue.number ? `（${issue.url}）` : ""}` : NONE;
+}
+
+/** レビューの周回の表と、残した軽微な指摘 */
+function reviewHistoryMarkdown(history: ReviewRound[], remaining: ReviewFinding[]): string {
+	const rounds = history.length
+		? `| 周回 | 種別 | 修正必須 | 全指摘 |\n|---|---|---|---|\n${history
+				.map((h) => `| ${h.round} | ${h.mode === "full" ? "フル" : "軽量"} | ${h.blocking} 件 | ${h.total} 件 |`)
+				.join("\n")}`
+		: NONE;
+	const rest = remaining.length
+		? `\n\n**残した軽微な指摘**\n\n${remaining.map((f) => `- [${f.severity}] ${f.title}${f.file ? `（\`${f.file}${f.line ? `:${f.line}` : ""}\`）` : ""}`).join("\n")}`
+		: "";
+	return rounds + rest;
+}
+
+function adrList(adrs: string[] | undefined): string {
+	return bullets(
+		(adrs ?? []).map((path) => {
+			const n = path.split("/").pop()?.match(/^(\d{4})-/)?.[1];
+			return n ? `ADR-${n}（\`${path}\`）` : `\`${path}\``;
+		}),
+	);
+}
+
+/**
+ * ドキュメント作成フローの PR 本文（templates/pr-docs.md）の値。
+ * 概要・ファイル・情報源などは執筆レポート（doc-report.md）の同名の見出しから取る。
+ */
+export function docPrVars(args: {
+	report: string;
+	issue?: { number?: number; title: string; url?: string };
+	topic?: string;
+	changedFiles: string[];
+	history: ReviewRound[];
+	remaining: ReviewFinding[];
+	usage?: string;
+}): Record<string, string> {
+	const section = (h: string) => extractSection(args.report, h) ?? "（執筆レポートに記載なし）";
+	return {
+		summary: section("概要"),
+		issue: args.issue ? issueLine(args.issue) : (args.topic ?? NONE),
+		files: section("作成・更新したファイル"),
+		changedFiles: bullets(args.changedFiles.map((f) => `\`${f}\``)),
+		sources: section("確認した情報源"),
+		reviews: reviewHistoryMarkdown(args.history, args.remaining),
+		reviewFocus: extractSection(args.report, "レビューで特に見てほしい点") ?? NONE,
+		limitations: extractSection(args.report, "未確定") ?? NONE,
 		usage: args.usage ?? "",
 		closes: args.issue?.number ? `Closes #${args.issue.number}` : "",
 	};
