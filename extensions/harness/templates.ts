@@ -9,8 +9,8 @@ import { join } from "node:path";
 import type { IssueDraft } from "./issues.ts";
 import type { Baseline, FlakyRecord, ReviewFinding, ReviewRound, SpecGap } from "./state.ts";
 
-export type TemplateName = "issue" | "pr" | "review";
-export const TEMPLATE_NAMES: TemplateName[] = ["issue", "pr", "review"];
+export type TemplateName = "issue" | "pr" | "review" | "adr";
+export const TEMPLATE_NAMES: TemplateName[] = ["issue", "pr", "review", "adr"];
 
 const NONE = "なし";
 
@@ -221,6 +221,8 @@ export function prVars(args: {
 	baseline?: Baseline;
 	flaky?: FlakyRecord[];
 	specGaps?: SpecGap[];
+	/** この作業で記録した ADR（cwd からの相対パス） */
+	adrs?: string[];
 }): Record<string, string> {
 	const impl = args.implementation;
 	const section = (h: string) => extractSection(impl, h) ?? "（実装レポートに記載なし）";
@@ -260,6 +262,12 @@ export function prVars(args: {
 		reviewFocus: extractSection(impl, "レビューで特に見てほしい点") ?? NONE,
 		limitations: extractSection(impl, "既知の制約") ?? NONE,
 		specDecisions: answered.length ? answered.map((g) => `- [${g.criterion}] ${g.question} → **${g.answer}**`).join("\n") : NONE,
+		adrs: bullets(
+			(args.adrs ?? []).map((path) => {
+				const n = path.split("/").pop()?.match(/^(\d{4})-/)?.[1];
+				return n ? `ADR-${n}（\`${path}\`）` : `\`${path}\``;
+			}),
+		),
 		usage: args.usage ?? "",
 		closes: args.issue?.number ? `Closes #${args.issue.number}` : "",
 	};

@@ -12,8 +12,8 @@ piHarness が制御する 3 つのフローの仕様です。フェーズ遷移�
 | 要件ヒアリング | req_clarify | `open-questions.md`（差し戻し時）, `hearing.md`, `qa.md` | `hearing.md`（`qa.md` は自動記録） |
 | 要件定義書作成 | req_document → req_approval | `hearing.md`, `qa.md` | `docs/requirements/*.md`, `docs/design/*.md`, Issue 分割案（差し戻す場合は `open-questions.md`） |
 | Issue 登録 | req_issues → req_done | 承認済みドキュメント, `hearing.md`, `qa.md` | GitHub Issue（または `docs/issues/*.md`）, `issues.md` |
-| プラン作成 | impl_context → impl_plan → impl_plan_approval | `issue.md` | `plan.md` |
-| TDD 実装 | impl_tdd | `issue.md`, `plan.md` | コード, `implementation.md` |
+| プラン作成 | impl_context → impl_plan → impl_plan_approval | `issue.md` | `plan.md`（重要な判断は ADR） |
+| TDD 実装 | impl_tdd | `issue.md`, `plan.md` | コード, `implementation.md`（重要な判断は ADR） |
 | コードレビュー（周回ごと） | impl_review → impl_spec_gap | `issue.md`, `plan.md`, `implementation.md`, `decisions.md`, 過去の `review-*.md` / `fix-*.md` / `bug-*.md` | `review-N.md`（仕様の確認に回答すると `decisions.md`, `issue-comment-draft.md`） |
 | レビュー指摘修正（周回ごと） | impl_fix_review | `review-N.md`, `decisions.md`, `plan.md`, `implementation.md` | コード, `fix-N.md` |
 | バグ修正 | bug_reproduce → bug_analyze → bug_fix | `escalation-N.md`, 直近のテストログ, `issue.md`, `plan.md`, `implementation.md`, 直近の `review-N.md` | コード, `bug-N.md` |

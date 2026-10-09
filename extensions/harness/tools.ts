@@ -14,6 +14,7 @@ export const HARNESS_TOOLS = [
 	"harness_create_issues",
 	"harness_control",
 	"harness_request_test_change",
+	"harness_record_decision",
 ] as const;
 
 /** フロー外（通常の会話）で有効にする harness ツール: 状態の確認と、自然言語からのフロー開始だけ */
@@ -24,13 +25,13 @@ const WRITE_TOOLS = ["edit", "write"];
 
 const PROCESS_TOOLS: Record<ProcessKind, { harness: string[]; readOnly?: boolean }> = {
 	hearing: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_control"] },
-	requirements: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_request_approval", "harness_control"] },
+	requirements: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_request_approval", "harness_record_decision", "harness_control"] },
 	issues: { harness: ["harness_status", "harness_ask", "harness_create_issues", "harness_control"], readOnly: true },
-	plan: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_request_approval", "harness_control"] },
-	implement: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_run_tests", "harness_request_test_change", "harness_control"] },
+	plan: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_request_approval", "harness_record_decision", "harness_control"] },
+	implement: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_run_tests", "harness_request_test_change", "harness_record_decision", "harness_control"] },
 	review: { harness: ["harness_status", "harness_record_review", "harness_control"], readOnly: true },
-	fix: { harness: ["harness_status", "harness_phase", "harness_run_tests", "harness_request_test_change", "harness_control"] },
-	bugfix: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_run_tests", "harness_request_test_change", "harness_control"] },
+	fix: { harness: ["harness_status", "harness_phase", "harness_run_tests", "harness_request_test_change", "harness_record_decision", "harness_control"] },
+	bugfix: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_run_tests", "harness_request_test_change", "harness_record_decision", "harness_control"] },
 };
 
 /**

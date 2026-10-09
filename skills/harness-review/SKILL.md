@@ -19,6 +19,7 @@ disable-model-invocation: true
 1. 入力成果物を読む。判断基準は `issue.md` の受け入れ条件と `plan.md`。`decisions.md` があれば、その解釈を正とする。
 2. 差分: 開始メッセージの `git diff <基準>`（未コミット含む）と `git status`（新規ファイル）。周辺コード（呼び出し元・先）も読む。必要ならテストを bash で実行。
 3. `test-changes.md` があれば、テストの削除・スキップ等の**理由が妥当か必ず検証**し、妥当でなければ `tests` の blocker/major にする（「一時的に」は原則不可）。
+4. この作業の ADR があれば、根拠と選択肢が妥当か・実装が従っているかを確かめる。ライブラリの採用・保存形式・外部インターフェースの変更など重要な判断に ADR が無ければ `maintainability` の major にする（修正担当が記録する）。
 
 ## 観点（切り替えるたびに差分を読み直す。詳細: `references/perspectives.md`）
 

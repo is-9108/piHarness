@@ -26,10 +26,11 @@ piHarness/
 │   ├── compaction.ts             # しきい値による自動圧縮の判断と要約の指示
 │   ├── dashboard.ts              # TUI のダッシュボード（工程・いまの作業・ブランチ・トークン）
 │   ├── templates.ts              # Issue・PR・レビュー記録をテンプレートから組み立てる
+│   ├── adr.ts                    # ADR（設計判断の記録）の番号・検証・一覧
 │   └── text.ts                   # 整形ヘルパー
 ├── scripts/install.mjs           # プロジェクトへの組み込み（.pi/settings.json・harness.json・.gitignore）
 ├── templates/harness.json        # 組み込み時に作る .pi/harness.json の雛形
-├── templates/{issue,pr,review}.md # Issue 本文・PR 本文・レビュー記録のテンプレート
+├── templates/{issue,pr,review,adr}.md # Issue 本文・PR 本文・レビュー記録・ADR のテンプレート
 ├── skills/
 │   ├── harness-requirements/     # 要件定義の手順・テンプレート・Issue 分割ルール
 │   ├── harness-tdd/              # TDD 実装の手順・プランテンプレート
@@ -142,6 +143,14 @@ Issue 本文・PR 本文・レビュー記録（`review-N.md`）は、エージ�
 見出しの並び・重大度の数・判定・受け入れ条件の番号（AC-1…）が毎回同じになり、モデルやセッションが変わっても形がぶれません。
 PR 本文は実装レポート（`implementation.md`）の決まった見出しと、拡張が記録したテスト結果・レビュー履歴から作ります。
 テンプレートはプロジェクトの `<workDir>/templates/` に置けば上書きできます（無ければ同梱の `templates/`）。
+
+### 設計判断は ADR に残す
+
+プロセスはセッションごとに独立しているため、ある判断の理由は、それを決めたセッションが終わると会話からは失われます。
+重要な判断は ADR（`<adrDir>/NNNN-*.md`）として、成果物（プラン・実装レポート）とは別に、作業をまたいで残します。
+ADR も項目で受け取ってテンプレートで組み立て、一覧（`README.md`）は拡張が更新します（フロー中の直接編集はブロック）。
+後のプロセスには一覧だけを参照として渡し、必要な ADR だけを読ませます（トークンを増やさない）。
+判断の承認はエージェントの自己申告ではなく、既存のゲートで行います: 要件定義・プランの承認ダイアログに ADR を表示し、フルレビューで根拠を検証し、PR に一覧を載せます。
 
 ### コンテキスト注入
 

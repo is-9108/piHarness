@@ -65,6 +65,10 @@ export interface HarnessConfig {
 	docsDir: string;
 	/** ハーネスの作業ファイル（プラン・レビュー記録・テストログ）の出力先 */
 	workDir: string;
+	/** 重要な設計判断を ADR として記録する（harness_record_decision） */
+	adr: boolean;
+	/** ADR の出力先。未指定なら <docsDir>/adr */
+	adrDir: string;
 	/** Issue 登録先 (owner/repo)。未指定なら gh がカレントリポジトリから推定 */
 	issueRepo?: string;
 	/** 登録する全 Issue に付与するラベル */
@@ -130,6 +134,8 @@ export const DEFAULT_CONFIG: HarnessConfig = {
 	blockingSeverities: ["blocker", "major"],
 	docsDir: "docs",
 	workDir: ".pi/harness",
+	adr: true,
+	adrDir: "docs/adr",
 	issueLabels: [],
 	ensureLabels: true,
 	testOutputLines: 120,
@@ -189,6 +195,15 @@ export function mergeConfig(raw: Partial<HarnessConfig>, warnings: string[] = []
 		c.checkCommands = [];
 	}
 	c.git = normalizeGit(raw.git as unknown, warnings);
+	if (typeof c.adr !== "boolean") {
+		if (raw.adr !== undefined) warnings.push("adr は true / false で指定してください。既定値を使用します。");
+		c.adr = DEFAULT_CONFIG.adr;
+	}
+	if (raw.adrDir === undefined) c.adrDir = join(c.docsDir, "adr");
+	else if (typeof c.adrDir !== "string" || !c.adrDir.trim()) {
+		warnings.push("adrDir はディレクトリのパスで指定してください。既定値を使用します。");
+		c.adrDir = join(c.docsDir, "adr");
+	}
 	if (typeof c.testIntegrity !== "boolean") c.testIntegrity = DEFAULT_CONFIG.testIntegrity;
 	for (const key of ["baseline", "testLock"] as const) {
 		if (typeof c[key] !== "boolean") {
