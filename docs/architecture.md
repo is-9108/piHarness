@@ -28,7 +28,7 @@ piHarness/
 │   ├── templates.ts              # Issue・PR・レビュー記録をテンプレートから組み立てる
 │   ├── adr.ts                    # ADR（設計判断の記録）の番号・検証・一覧
 │   └── text.ts                   # 整形ヘルパー
-├── scripts/install.mjs           # プロジェクトへの組み込み（.pi/settings.json・harness.json・.gitignore）
+├── scripts/install.mjs           # 全プロジェクト共通の登録（pi install）とプロジェクトの設定（harness.json・.gitignore）
 ├── templates/harness.json        # 組み込み時に作る .pi/harness.json の雛形
 ├── templates/{issue,pr,review,adr}.md # Issue 本文・PR 本文・レビュー記録・ADR のテンプレート
 ├── skills/
