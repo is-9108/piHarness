@@ -11,12 +11,13 @@ import {
 	renderTemplate,
 	reviewVars,
 	TEMPLATE_NAMES,
+	type TemplateName,
 	templatePath,
 } from "../extensions/harness/templates.ts";
 import type { ReviewFinding } from "../extensions/harness/state.ts";
 
 const builtin = resolve(import.meta.dirname, "../templates");
-const tpl = (name: "issue" | "pr" | "review") => readFileSync(join(builtin, `${name}.md`), "utf8");
+const tpl = (name: TemplateName) => readFileSync(join(builtin, `${name}.md`), "utf8");
 
 describe("テンプレートの展開", () => {
 	it("値を埋め、コメントを除き、空の値は「なし」、{{x?}} は空にする", () => {
@@ -148,6 +149,7 @@ describe("PR 本文", () => {
 			"## テストの変更（削除・スキップなど）",
 			"## レビュー（piHarness）",
 			"## 仕様の確認（レビュー中にユーザーが決めたこと）",
+			"## 設計判断（ADR）",
 			"## プランからの逸脱",
 			"## レビューで特に見てほしい点",
 			"## 既知の制約",

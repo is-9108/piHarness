@@ -209,7 +209,8 @@ export interface HarnessState {
 	escalation?: Escalation;
 	suspended?: SuspendedImplement;
 	bug?: { description: string; startedAt: string };
-	artifacts: { docs: string[]; plan?: string; issues: IssueRef[] };
+	/** adrs: この作業で記録した ADR（cwd からの相対パス） */
+	artifacts: { docs: string[]; plan?: string; issues: IssueRef[]; adrs?: string[] };
 	log: { at: string; event: string }[];
 }
 
@@ -448,6 +449,20 @@ export function appendIssues(prev: HarnessState, issues: IssueRef[]): HarnessSta
 	const s = clone(prev);
 	s.artifacts.issues = [...s.artifacts.issues, ...issues];
 	return withLog(s, `Issue を ${issues.length} 件登録（一部失敗）`);
+}
+
+/** ADR を記録できるプロセス（判断を伴う作業をするプロセス） */
+export const ADR_PROCESSES: ProcessKind[] = ["requirements", "plan", "implement", "fix", "bugfix"];
+
+/** この作業で記録した ADR を追加する */
+export function recordAdr(prev: HarnessState, path: string, title: string): HarnessState {
+	const proc = processOf(prev);
+	if (!proc || !ADR_PROCESSES.includes(proc)) {
+		throw new TransitionError("ADR は要件定義書作成・プラン作成・TDD 実装・指摘修正・バグ修正のプロセスでのみ記録できます。");
+	}
+	const s = clone(prev);
+	s.artifacts.adrs = unique([...(s.artifacts.adrs ?? []), path]);
+	return withLog(s, `ADR を記録: ${title}`);
 }
 
 export function recordIssues(prev: HarnessState, issues: IssueRef[]): HarnessState {

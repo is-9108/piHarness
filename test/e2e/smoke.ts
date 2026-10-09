@@ -176,14 +176,29 @@ let r = await run("/impl 1", [
 	call("write", { path: join(root, "skills/harness-tdd/SKILL.md"), content: "x" }), // piHarness 本体 → ブロック
 	call("mcp__fs__write_file", { path: "src/mcp.js" }), // 書き換えうる MCP ツール → 承認前はブロック
 	call("mcp__fs__read_file", { path: "src/mcp.js" }), // 読み取り専用と宣言された MCP ツール → 使える
+	call("write", { path: "docs/adr/0001-x.md", content: "x" }), // ADR は直接書けない → ブロック
+	call("harness_record_decision", {
+		title: "計測値の保存に SQLite を使う",
+		context: "1 年分の計測値を保存する",
+		decision: "SQLite に保存する",
+		options: [
+			{ name: "SQLite", pros: ["集計が速い"], chosen: true },
+			{ name: "CSV", cons: ["集計が遅い"] },
+		],
+	}),
 	call("harness_request_approval", { kind: "plan", summary: "PLAN-SESSION-MARKER", documents: [p("plan.md")] }),
 ]);
+assert.match(r[6], /^2:write \[ERROR\]: .*harness_record_decision/);
+assert.match(r[7], /^2:harness_record_decision: ADR-0001 を記録しました: docs\/adr\/0001-計測値の保存に-sqlite-を使う\.md/);
+const adrText = readFileSync(join(project, "docs/adr/0001-計測値の保存に-sqlite-を使う.md"), "utf8");
+assert.match(adrText, /^# ADR-0001: 計測値の保存に SQLite を使う[\s\S]*\| 記録したプロセス \| テスト\/実装プラン作成 \|[\s\S]*### 1\. SQLite（採用）/);
+assert.match(readFileSync(join(project, "docs/adr/README.md"), "utf8"), /\| \[ADR-0001\]\(0001-計測値の保存に-sqlite-を使う\.md\) \| 計測値の保存に SQLite を使う \| 採用 \|/);
 assert.match(r[4], /^2:mcp__fs__write_file \[ERROR\]: .*readOnlyHint/);
 assert.ok(!existsSync(join(project, "src/mcp.js")));
 assert.match(r[5], /^2:mcp__fs__read_file: mcp__fs__read_file ok/);
 // harness ツールはモデルだけが呼べる（codemode のスクリプトから呼ばせない）
 const harnessTools = toolInfos().filter((t) => t.name.startsWith("harness_"));
-assert.equal(harnessTools.length, 9);
+assert.equal(harnessTools.length, 10);
 assert.ok(harnessTools.every((t) => t.exposure === "model-only"));
 assert.match(r[3], /^2:write \[ERROR\]: .*piHarness 本体/);
 assert.match(readFileSync(join(root, "skills/harness-tdd/SKILL.md"), "utf8"), /^---\nname: harness-tdd/);
@@ -278,6 +293,8 @@ assert.match(s3, /承認時のユーザーコメント: 境界値も見ておい
 assert.doesNotMatch(s3, /# プラン/, "前セッションの会話・内容は開始メッセージに含まれない（ファイルパスのみ）");
 assert.equal(sessionsSeen[2].messages.filter((m) => m.role === "user").length, 1);
 assert.match(firstUserText(sessionsSeen[3]), /<skill name="harness-review"/);
+assert.match(firstUserText(sessionsSeen[3]), /docs\/adr\/0001-[^ ]+\.md — この作業で記録した ADR（判断の根拠が妥当か/, "フルレビューはこの作業の ADR を検証する");
+assert.match(firstUserText(sessionsSeen[2]), /## 参照（必要なときだけ読む）[\s\S]*docs\/adr\/README\.md — 既存の設計判断（ADR）の一覧/, "実装は ADR 一覧を参照できる");
 assert.match(firstUserText(sessionsSeen[5]), /<skill name="harness-review-light"/, "2 周目は軽量レビュー用のスキル");
 assert.match(firstUserText(sessionsSeen[4]), /<skill name="harness-fix"/);
 // プロセスごとに必要なツールだけが有効

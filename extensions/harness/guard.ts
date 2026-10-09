@@ -9,6 +9,8 @@ export interface GuardPaths {
 	cwd: string;
 	docsDir: string;
 	workDir: string;
+	/** ADR の出力先。フロー中は harness_record_decision だけが書く（ADR を使わない設定なら undefined） */
+	adrDir?: string;
 }
 
 /** フェーズごとに書き込みを許可するディレクトリ。undefined = 制限なし */
@@ -69,6 +71,9 @@ export function checkWrite(state: HarnessState, path: string | undefined, p: Gua
 		return { block: true, reason: "[piHarness] ワークフロー状態ファイルは直接編集できません。harness_* ツールを使用してください。" };
 	}
 	if (!state.flow || state.phase === "idle" || !path) return { block: false };
+	if (p.adrDir && isInside(path, p.adrDir, p.cwd)) {
+		return { block: true, reason: `[piHarness] ADR（${p.adrDir}/）は harness_record_decision で記録してください（テンプレートで形を揃え、一覧も更新するため）。` };
+	}
 	const roots = writableRoots(state.phase, p);
 	if (!roots) return { block: false };
 	if (roots.some((r) => isInside(path, r, p.cwd))) return { block: false };

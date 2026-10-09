@@ -10,7 +10,7 @@
  *
  * 状態遷移は state.ts、引き継ぎは handoff.ts の純粋関数で行い、この拡張はツール/コマンド/イベントとの接続だけを担う。
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -44,9 +44,11 @@ import {
 	kickoffMessage,
 	PROCESS_LABELS,
 	pathsOf,
+	type IOOptions,
 	processIO,
 	requiredArtifact,
 } from "./handoff.ts";
+import { type AdrDraft, adrFileName, adrFileOf, adrId, adrVars, nextAdrNumber, supersededNote, updateAdrIndex, validateAdr } from "./adr.ts";
 import {
 	type IssueDraft,
 	draftFileName,
@@ -88,6 +90,7 @@ import {
 	type Phase,
 	type ProcessKind,
 	processOf,
+	recordAdr,
 	recordIssues,
 	recordReview,
 	recordTestRun,
@@ -144,7 +147,11 @@ export default function piHarness(pi: ExtensionAPI): void {
 		cwd: ctx.cwd,
 		docsDir: cfg.docsDir,
 		workDir: cfg.workDir,
+		...(cfg.adr ? { adrDir: cfg.adrDir } : {}),
 	});
+	/** ADR の一覧ファイル（cwd からの相対パス） */
+	const adrIndexPath = (cfg: HarnessConfig) => join(cfg.adrDir, "README.md");
+	const ioOptions = (cfg: HarnessConfig): IOOptions => (cfg.adr ? { adrIndex: adrIndexPath(cfg) } : {});
 	const stateFile = (ctx: { cwd: string }) => join(ctx.cwd, cfgOf(ctx).workDir, STATE_FILE);
 	const existsIn = (ctx: { cwd: string }) => (path: string) => existsSync(join(ctx.cwd, path));
 
@@ -336,8 +343,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 	async function startProcessSession(ctx: ExtensionCommandContext, note?: string): Promise<void> {
 		await writeReviewDelta(ctx);
 		const exists = existsIn(ctx);
-		const kickoff = kickoffMessage(state, exists, note);
-		writeItemFile(ctx, pathsOf(state).handoff, handoffRecord(state, exists), true);
+		const io = ioOptions(cfgOf(ctx));
+		const kickoff = kickoffMessage(state, exists, note, io);
+		writeItemFile(ctx, pathsOf(state).handoff, handoffRecord(state, exists, io), true);
 		const pending = state.pendingHandoff;
 		const proc = processOf(state) ?? undefined;
 		// 新しいセッションの session_start でこのプロセス用のモデルを適用するための目印
@@ -456,6 +464,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				baseline: state.baseline,
 				flaky: state.flaky,
 				specGaps: state.specGaps,
+				adrs: state.artifacts.adrs,
 			}),
 		});
 		const args = ["pr", "create", "--base", git.baseBranch, "--head", git.branch, "--title", title, "--body", body];
@@ -856,7 +865,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const who = state.issue?.number ? `#${state.issue.number} ` : state.topic ? `${state.topic} ` : "";
 			pi.setSessionName(`[harness] ${who}${PROCESS_LABELS[proc]}`);
 		}
-		const content = buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx)));
+		const content = buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx), ioOptions(cfgOf(ctx))));
 		// セッション開始メッセージには同じ情報（入出力・次の行動）が含まれているので送らない
 		const isKickoff = event.prompt.includes(KICKOFF_MARKER);
 		if (reminderPending && !isKickoff) {
@@ -893,6 +902,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			state,
 			existsIn(ctx),
 			`${why}会話は要約されています。要約の作業状態と上記の成果物を確認し、中断したところから作業を続けてください（最初からやり直さない）。`,
+			ioOptions(cfgOf(ctx)),
 		).replace("をこの新しいセッションで開始します。", "を再開します。");
 	}
 
@@ -1063,7 +1073,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				return reply(usageMarkdown(loadUsage(ctx, state.itemDir), PROCESS_LABELS));
 			}
 			if (!isActive(state)) return reply("piHarness: 進行中のフローはありません。ユーザーの依頼に応じて harness_control で要件定義・実装・バグ修正を開始できます（開始前にユーザーの確認を取ります）。");
-			return reply(buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx))));
+			return reply(buildContext(state, cfgOf(ctx), processIO(state, existsIn(ctx), ioOptions(cfgOf(ctx)))));
 		},
 	});
 
@@ -1329,7 +1339,10 @@ export default function piHarness(pi: ExtensionAPI): void {
 				);
 			}
 			const options = ["承認する", "修正を依頼する", "却下する（フローを中止）"];
-			const title = `【${label}の承認依頼】\n${warning ? `${warning}\n` : ""}${params.summary.slice(0, 1500)}\n\n対象: ${documents.join(", ")}`;
+			const adrs = state.artifacts.adrs ?? [];
+			const title =
+				`【${label}の承認依頼】\n${warning ? `${warning}\n` : ""}${params.summary.slice(0, 1500)}\n\n対象: ${documents.join(", ")}` +
+				(adrs.length ? `\n設計判断（ADR、承認に含まれます）: ${adrs.join(", ")}` : "");
 			const choice = await ctx.ui.select(title, options);
 			if (choice === undefined) {
 				return reply(
@@ -1544,6 +1557,73 @@ export default function piHarness(pi: ExtensionAPI): void {
 				true,
 			);
 			return reply(`ユーザーが承認しました。次にロックし直すまで ${files.join(", ")} を編集できます。変更したら harness_run_tests で確認してください（変更はレビューで検証されます）。`);
+		},
+	});
+
+	pi.registerTool({
+		exposure: HARNESS_TOOL_EXPOSURE,
+		name: "harness_record_decision",
+		label: "Record Decision (ADR)",
+		description:
+			"重要な設計判断を ADR として記録する（<adrDir>/NNNN-<タイトル>.md と一覧 README.md）。" +
+			"対象: ライブラリ・フレームワーク・外部サービスの採用や変更 / データ構造・保存形式・スキーマ / モジュール境界・アーキテクチャ / 外部インターフェース（API・CLI・設定）の互換性 / " +
+			"セキュリティ・性能（Pi 5）のトレードオフ / 要件やプランからの意図的な逸脱 など、後から理由を知りたくなる・元に戻しにくい決定。命名・小さなリファクタ・明らかな一択は対象外。" +
+			"本文は項目で渡し、拡張がテンプレートで組み立てる。すべて日本語で書く。既存の ADR を変える場合は supersedes で置き換える。",
+		promptSnippet: "Record an important design decision as an ADR (template-based)",
+		parameters: Type.Object({
+			title: Type.String({ description: "決定の内容が分かる短いタイトル（例: 計測値の保存に SQLite を使う）" }),
+			context: Type.String({ description: "背景・課題: なぜ決める必要があったか、制約（Pi 5 の資源・要件 ID など）" }),
+			decision: Type.String({ description: "決定: 何をどうするか（1〜3 文）" }),
+			options: Type.Array(
+				Type.Object({
+					name: Type.String(),
+					description: Type.Optional(Type.String()),
+					pros: Type.Optional(Type.Array(Type.String())),
+					cons: Type.Optional(Type.Array(Type.String())),
+					chosen: Type.Optional(Type.Boolean({ description: "採用した案だけ true（ちょうど 1 つ）" })),
+				}),
+				{ minItems: 2, description: "検討した選択肢（採用しなかった案も。「現状維持」も選択肢）" },
+			),
+			positive: Type.Optional(Type.Array(Type.String(), { description: "良い影響" })),
+			negative: Type.Optional(Type.Array(Type.String(), { description: "悪い影響・トレードオフ・新たに生じる制約" })),
+			revisit: Type.Optional(Type.String({ description: "この決定を見直す条件（例: データが 1GB を超えたら）" })),
+			related: Type.Optional(Type.Array(Type.String(), { description: "関連（Issue 番号・要件 ID・主なファイル）" })),
+			supersedes: Type.Optional(Type.Number({ description: "置き換える既存の ADR の番号（例: 3）" })),
+		}),
+		executionMode: "sequential",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const cfg = cfgOf(ctx);
+			if (!cfg.adr) return reply("ADR の記録は無効になっています（adr: false）。判断の理由はプランや実装レポートに書いてください。");
+			const dir = join(ctx.cwd, cfg.adrDir);
+			const files = existsSync(dir) ? readdirSync(dir) : [];
+			const draft = params as AdrDraft;
+			const errors = validateAdr(draft, files);
+			if (errors.length) throw new Error(`ADR に問題があります:\n- ${errors.join("\n- ")}`);
+			const n = nextAdrNumber(files);
+			const file = adrFileName(n, draft.title);
+			const rel = join(cfg.adrDir, file);
+			const proc = processOf(state);
+			const date = new Date().toISOString().slice(0, 10);
+			const workItem = state.issue ? describeIssue(state.issue) : state.topic ? `要件定義: ${state.topic}` : state.bug ? `バグ修正: ${state.bug.description}` : undefined;
+			const superseded = draft.supersedes !== undefined ? adrFileOf(files, draft.supersedes) : undefined;
+			// プロセスの確認（記録できないプロセスなら例外）を、ファイルを書く前に行う
+			const next = recordAdr(state, rel, draft.title);
+			writeItemFile(
+				ctx,
+				rel,
+				renderNamed(ctx.cwd, cfg, "adr", adrVars(draft, { number: n, date, process: proc ? PROCESS_LABELS[proc] : "-", workItem, supersededFile: superseded })),
+			);
+			const indexRel = adrIndexPath(cfg);
+			const indexAbs = join(ctx.cwd, indexRel);
+			const index = existsSync(indexAbs) ? readFileSync(indexAbs, "utf8") : undefined;
+			writeItemFile(ctx, indexRel, updateAdrIndex(index, { number: n, file, title: draft.title, date, workItem }, draft.supersedes));
+			if (superseded && draft.supersedes !== undefined) writeItemFile(ctx, join(cfg.adrDir, superseded), supersededNote(n, file, date), true);
+			setState(next, ctx);
+			return reply(
+				`${adrId(n)} を記録しました: ${rel}（一覧: ${indexRel}）` +
+					(superseded ? `\n${adrId(draft.supersedes!)} を置き換え済みにしました。` : "") +
+					`\nプランや実装レポートの該当箇所からは ${adrId(n)} を参照してください（内容を繰り返し書かない）。`,
+			);
 		},
 	});
 
@@ -1991,7 +2071,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			try {
 				switch (sub) {
 					case "status": {
-						const body = isActive(state) ? buildContext(state, cfg, processIO(state, existsIn(ctx))) : "アクティブなフローはありません。";
+						const body = isActive(state) ? buildContext(state, cfg, processIO(state, existsIn(ctx), ioOptions(cfg))) : "アクティブなフローはありません。";
 						const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(未設定)";
 						const recent = state.log.slice(-8).map((l) => `  ${l.at.slice(11, 19)} ${l.event}`).join("\n");
 						ctx.ui.notify(`${body}\n現在のモデル: ${current}（thinking: ${pi.getThinkingLevel()}）\n\n最近のイベント:\n${recent || "  なし"}`, "info");

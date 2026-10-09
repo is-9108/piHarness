@@ -137,7 +137,13 @@ export interface ProcessIO {
 }
 
 /** 現在のプロセスの入出力。exists はファイルの存在確認（テストでは差し替える） */
-export function processIO(s: HarnessState, exists: (path: string) => boolean): ProcessIO | undefined {
+/** processIO の追加情報（設定から決まるもの） */
+export interface IOOptions {
+	/** ADR の一覧（<adrDir>/README.md）。ADR を使わない設定なら undefined */
+	adrIndex?: string;
+}
+
+export function processIO(s: HarnessState, exists: (path: string) => boolean, opts: IOOptions = {}): ProcessIO | undefined {
 	const proc = processOf(s);
 	if (!proc || !s.itemDir) return undefined;
 	const p = artifactPaths(s.itemDir);
@@ -153,6 +159,10 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 	};
 	const add = (path: string | undefined, why: string) => push(inputs, path, why);
 	const ref = (path: string | undefined, why: string) => push(references, path, why);
+	const adrIndex = (why: string) => ref(opts.adrIndex, why);
+	const adrs = (to: typeof add, why: string) => {
+		for (const a of s.artifacts.adrs ?? []) to(a, why);
+	};
 	const bugs = (to: typeof add) => {
 		for (let n = 1; n <= s.counters.bugs; n++) to(p.bug(n), `バグレポート #${n}`);
 	};
@@ -169,6 +179,7 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 			add(p.hearing, "ヒアリングで確定した仕様のまとめ");
 			for (const d of s.artifacts.docs) add(d, "作成中の要件ドキュメント");
 			ref(p.qa, "質問と回答の生ログ（根拠の確認用）");
+			adrIndex("既存の設計判断（ADR）の一覧。関連するものには従い、変えるなら置き換える ADR を記録する");
 			outputs.push({ path: "docs/requirements/<slug>.md ほか", why: "要件定義書・設計概要・Issue 分割案（承認対象）" });
 			outputs.push({ path: p.openQuestions, why: "大きな未確定事項が見つかった場合のみ。ヒアリングへ戻る前に必須" });
 			break;
@@ -179,12 +190,15 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 			break;
 		case "plan":
 			add(p.issue, "対象 Issue の本文");
+			adrIndex("既存の設計判断（ADR）の一覧。関連するものには従い、変えるなら置き換える ADR を記録する");
 			outputs.push({ path: p.plan, why: "テストプラン + 実装プラン（承認対象）" });
 			break;
 		case "implement":
 			add(p.issue, "対象 Issue の本文");
 			add(p.plan, "承認済みのテスト/実装プラン");
 			ref(p.baseline, "実装開始時点ですでに失敗しているテスト・チェック（判定から除外される）");
+			adrs(ref, "この作業で記録した ADR（プラン作成時などの設計判断）");
+			adrIndex("既存の設計判断（ADR）の一覧");
 			outputs.push({ path: p.implementation, why: "実装レポート（レビュー担当への引き継ぎ。レビューへ進む前に必須）" });
 			break;
 		case "review":
@@ -198,6 +212,7 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 				ref(p.implementation, "実装レポート");
 				ref(p.plan, "承認済みのテスト/実装プラン");
 				ref(p.issue, "対象 Issue の本文");
+				adrs(ref, "この作業で記録した ADR");
 			} else {
 				add(p.issue, "対象 Issue の本文");
 				add(p.plan, "承認済みのテスト/実装プラン");
@@ -205,6 +220,8 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 				bugs(add);
 				add(p.testChanges, "テストの削除・スキップ・アサーション減少と、その理由（妥当か必ず検証する）");
 				add(p.decisions, "仕様の確認へのユーザーの回答（この解釈を正としてレビューする。回答済みの論点は再び聞かない）");
+				adrs(add, "この作業で記録した ADR（判断の根拠が妥当か、実装が従っているかを確認する）");
+				adrIndex("既存の設計判断（ADR）の一覧（反する変更がないか確認する）");
 				for (let r = 1; r <= s.review.round; r++) {
 					ref(p.review(r), `レビュー ${r} 周目の記録`);
 					ref(p.fix(r), `レビュー ${r} 周目の指摘への対応記録`);
@@ -219,6 +236,7 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 			ref(p.plan, "承認済みのテスト/実装プラン");
 			ref(p.issue, "対象 Issue の本文");
 			for (let r = 1; r < s.review.round; r++) ref(p.fix(r), `レビュー ${r} 周目の対応記録`);
+			adrs(ref, "この作業で記録した ADR");
 			outputs.push({ path: p.fix(s.review.round), why: "指摘ごとの対応記録（レビューへ戻る前に必須）" });
 			break;
 		case "bugfix":
@@ -230,6 +248,8 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 			ref(p.plan, "承認済みのテスト/実装プラン");
 			ref(p.implementation, "実装レポート");
 			if (s.review.round > 0) ref(p.review(s.review.round), "直近のレビュー記録");
+			adrs(ref, "この作業で記録した ADR");
+			adrIndex("既存の設計判断（ADR）の一覧");
 			outputs.push({ path: p.bug(s.counters.bugs), why: "バグレポート（完了前に必須）" });
 			break;
 	}
@@ -240,8 +260,8 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean): P
 export const KICKOFF_MARKER = "[piHarness] プロセス「";
 
 /** 新しいセッションの最初のメッセージ（スキルを展開し、入力/出力の成果物を明示する） */
-export function kickoffMessage(s: HarnessState, exists: (path: string) => boolean, userNote?: string): string {
-	const io = processIO(s, exists);
+export function kickoffMessage(s: HarnessState, exists: (path: string) => boolean, userNote?: string, opts: IOOptions = {}): string {
+	const io = processIO(s, exists, opts);
 	if (!io) throw new Error("アクティブなプロセスがありません。");
 	const skill = skillFor(s, io.process);
 	const lines: string[] = [];
@@ -287,8 +307,8 @@ export function diffInstruction(s: HarnessState): string | undefined {
 }
 
 /** handoff.md に追記する 1 件分の記録 */
-export function handoffRecord(s: HarnessState, exists: (path: string) => boolean): string {
-	const io = processIO(s, exists);
+export function handoffRecord(s: HarnessState, exists: (path: string) => boolean, opts: IOOptions = {}): string {
+	const io = processIO(s, exists, opts);
 	const from = s.pendingHandoff?.from;
 	const to = io?.process;
 	return (

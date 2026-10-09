@@ -10,8 +10,8 @@ pi-coding-agent の拡張 + Skill。要件定義 → TDD 実装 → レビュー
 | `extensions/harness/index.ts` | Pi との接続だけ（ツール・コマンド・イベント）。ロジックは下の純粋モジュールへ |
 | `extensions/harness/state.ts` | 状態機械（フェーズ・承認・ループ・エスカレーション・プロセス境界）。**純粋関数** |
 | `extensions/harness/handoff.ts` | プロセス間の引き継ぎ（成果物パス・入力/参照/出力・開始メッセージ） |
-| `extensions/harness/*.ts` | guard（書き込み制限）/ git / integrity（テスト保護）/ testlock（テストのロック）/ failures（失敗の指紋・ベースライン）/ progress（Issue 進捗）/ usage / tools / compaction / dashboard（TUI 表示）/ templates（Issue・PR・レビュー記録の組み立て）/ config |
-| `templates/{issue,pr,review}.md` | 外に出す文書のテンプレート（プロジェクトの `<workDir>/templates/` で上書き可） |
+| `extensions/harness/*.ts` | guard（書き込み制限）/ git / integrity（テスト保護）/ testlock（テストのロック）/ failures（失敗の指紋・ベースライン）/ progress（Issue 進捗）/ usage / tools / compaction / dashboard（TUI 表示）/ templates（Issue・PR・レビュー記録の組み立て）/ adr（設計判断の記録と一覧）/ config |
+| `templates/{issue,pr,review,adr}.md` | 外に出す文書のテンプレート（プロジェクトの `<workDir>/templates/` で上書き可） |
 | `skills/harness-*/SKILL.md` | プロセスごとの手順（1 プロセス = 1 スキル、各 2〜3KB に保つ） |
 | `scripts/install.mjs` | 他プロジェクトへの組み込み（`.pi/piHarness` に clone して実行） |
 | `test/*.test.ts` / `test/e2e/*.ts` | ユニットテスト / 偽モデルで実際の Pi を動かす E2E（natural.ts は確認ダイアログをスクリプトで応答） |
@@ -35,7 +35,7 @@ Node 22.19+。TypeScript は型除去で直接実行（ビルドなし）。impo
 - **プロセス（= セッション）間の連携は成果物ファイルだけ**。次のプロセスが必要とする成果物が無ければ遷移を拒否する（`requiredArtifact`）。
 - **トークンを増やさない**: スキルは担当プロセスの手順だけ。ツール定義・注入する状態表示・テスト出力は最小限。状態表示は会話から削除しない（キャッシュが壊れる）。
 - 利用者に見える文言（ツール結果・通知・スキル・Issue・PR・レビュー記録）は日本語。
-- **Issue・PR・レビュー記録はテンプレートで組み立てる**: エージェントからは項目で受け取り、Markdown を自由に書かせない。項目を足すときは `templates.ts` の `*Vars` とテンプレート先頭のコメントを一緒に直す。
+- **Issue・PR・レビュー記録・ADR はテンプレートで組み立てる**: エージェントからは項目で受け取り、Markdown を自由に書かせない。項目を足すときは `templates.ts` の `*Vars` とテンプレート先頭のコメントを一緒に直す。
 
 ## 変更の手順
 

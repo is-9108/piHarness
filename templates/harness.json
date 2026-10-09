@@ -9,6 +9,7 @@
   ],
   "docsDir": "docs",
   "workDir": ".pi/harness",
+  "adr": true,
   "issueLabels": [],
   "ensureLabels": true,
   "autoHandoff": true,
