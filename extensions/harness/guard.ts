@@ -31,6 +31,11 @@ function writableRoots(phase: Phase, p: GuardPaths): string[] | undefined {
 		case "doc_outline":
 		case "doc_outline_approval":
 		case "doc_review":
+		case "cfg_plan":
+		case "cfg_plan_approval":
+			return [p.workDir];
+		// 設定変更: このほかに、承認された計画のファイル（state.changeFiles）だけは書ける
+		case "cfg_apply":
 			return [p.workDir];
 		// 完了したフェーズ（req_done・impl_done・bug_done・doc_done）は制限しない。完了後の作業を止めないため
 		// ドキュメント作成フローの執筆・修正: このほかに、どこにあってもドキュメントのファイル（isDocFile）は書ける
@@ -73,6 +78,9 @@ const WHY: Partial<Record<Phase, string>> = {
 	doc_done: "ドキュメント作成フローは完了しています。",
 	doc_write: "ドキュメント作成フローでは、ドキュメント（.md などのファイルと docs/ 配下）以外は変更できません。コードの変更が必要なら、実装フロー（Issue）で行ってください。",
 	doc_fix: "ドキュメント作成フローでは、ドキュメント（.md などのファイルと docs/ 配下）以外は変更できません。コードの変更が必要なら、実装フロー（Issue）で行ってください。",
+	cfg_plan: "設定変更の計画が承認されるまでファイルは変更できません。",
+	cfg_plan_approval: "設定変更の計画の承認待ちです。",
+	cfg_apply: "設定変更フローでは、承認された計画のファイルだけを変更できます。ほかのファイルも変える必要があれば、作業を止めてユーザーに伝えてください（計画を立て直す）。",
 };
 
 /** ドキュメントとして扱うファイルの拡張子 */
@@ -100,9 +108,11 @@ export function checkWrite(state: HarnessState, path: string | undefined, p: Gua
 	if (roots.some((r) => isInside(path, r, p.cwd))) return { block: false };
 	const docsOnly = state.phase === "doc_write" || state.phase === "doc_fix";
 	if (docsOnly && isDocFile(path, p)) return { block: false };
+	const approved = state.phase === "cfg_apply" ? (state.changeFiles ?? []) : [];
+	if (approved.some((f) => resolve(p.cwd, f) === (isAbsolute(path) ? path : resolve(p.cwd, path)))) return { block: false };
 	return {
 		block: true,
-		reason: `[piHarness] ${WHY[state.phase] ?? ""} 現在のフェーズ: ${state.phase}。書き込み可能: ${roots.join(", ")}/ 配下${docsOnly ? `と ${DOC_EXTENSIONS.join(" ")} のファイル` : ""}のみ。(対象: ${path})`,
+		reason: `[piHarness] ${WHY[state.phase] ?? ""} 現在のフェーズ: ${state.phase}。書き込み可能: ${roots.join(", ")}/ 配下${docsOnly ? `と ${DOC_EXTENSIONS.join(" ")} のファイル` : ""}${approved.length ? `と ${approved.join(", ")}` : ""}のみ。(対象: ${path})`,
 	};
 }
 

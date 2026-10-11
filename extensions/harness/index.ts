@@ -58,6 +58,7 @@ import {
 	processIO,
 	requiredArtifact,
 } from "./handoff.ts";
+import { invalidJson, outOfScope } from "./change.ts";
 import { type AdrDraft, adrFileName, adrFileOf, adrId, adrVars, nextAdrNumber, supersededNote, updateAdrIndex, validateAdr } from "./adr.ts";
 import {
 	type IssueDraft,
@@ -91,6 +92,7 @@ import {
 	canCreateIssues,
 	clearHandoff,
 	describeIssue,
+	DONE_PHASES,
 	finishFlow,
 	type HarnessState,
 	initialState,
@@ -114,6 +116,7 @@ import {
 	type ReviewFinding,
 	reviewMode,
 	startBugfix,
+	startConfigChange,
 	startDocs,
 	startImplement,
 	startRequirements,
@@ -127,7 +130,7 @@ import { slugify, tailLines, timestamp } from "./text.ts";
 import { toolsForProcess } from "./tools.ts";
 import { describeActivity, renderDashboard } from "./dashboard.ts";
 import { compactionInstructions, shouldCompact } from "./compaction.ts";
-import { DOC_REVIEW_PERSPECTIVES, docPrVars, issueVars, loadTemplate, prVars, renderTemplate, reviewVars, type TemplateName } from "./templates.ts";
+import { configPrVars, DOC_REVIEW_PERSPECTIVES, docPrVars, issueVars, loadTemplate, prVars, renderTemplate, reviewVars, type TemplateName } from "./templates.ts";
 
 const CONTEXT_MESSAGE = "harness-context";
 /** プロバイダーの利用上限の記録（作業項目をまたいで使う。workDir 直下） */
@@ -209,7 +212,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (!cfg.dashboard) {
 			const line = statusLine(state);
 			// フロー外では、話しかけて開始できることを示す
-			ctx.ui.setStatus("harness", line ? `🧭 ${line}` : "🧭 piHarness: 作りたいもの・実装したい Issue・直したい不具合・書きたいドキュメントを話しかけてください");
+			ctx.ui.setStatus("harness", line ? `🧭 ${line}` : "🧭 piHarness: 作りたいもの・実装したい Issue・直したい不具合・書きたいドキュメント・変えたい設定を話しかけてください");
 			ctx.ui.setWidget("harness", undefined);
 			return;
 		}
@@ -392,7 +395,12 @@ export default function piHarness(pi: ExtensionAPI): void {
 	/** コミットと PR のタイトル（ドキュメント作成フローは「ドキュメント: 」を付ける） */
 	function workTitle(): string {
 		const issue = state.issue;
-		const base = state.flow === "docs" ? `ドキュメント: ${issue?.title ?? state.topic ?? "piHarness"}` : (issue?.title ?? "piHarness 実装");
+		const base =
+			state.flow === "docs"
+				? `ドキュメント: ${issue?.title ?? state.topic ?? "piHarness"}`
+				: state.flow === "config"
+					? `設定変更: ${issue?.title ?? state.topic ?? "piHarness"}`
+					: (issue?.title ?? "piHarness 実装");
 		return `${base}${issue?.number ? ` (#${issue.number})` : ""}`;
 	}
 
@@ -421,7 +429,11 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (cfg.git.commit && !git.commit) {
 			try {
 				const body = [
-					state.flow === "docs" ? "piHarness ドキュメント作成フローで作成（ドキュメントのみ）" : "piHarness TDD 実装フローで作成",
+					state.flow === "docs"
+						? "piHarness ドキュメント作成フローで作成（ドキュメントのみ）"
+						: state.flow === "config"
+							? "piHarness 設定変更フローで作成（テスト・レビューなし。変更の計画はユーザーが承認）"
+							: "piHarness TDD 実装フローで作成",
 					`レビュー: ${state.review.history.length} 周（${state.review.history.map((h) => `${h.round}:${h.blocking}件`).join(", ")}）`,
 					issue?.number ? `\nCloses #${issue.number}` : "",
 				].join("\n");
@@ -440,7 +452,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 		}
 		setState({ ...state, git: next }, ctx);
 
-		const mode = opts.forcePr ? "auto" : cfg.git.pr;
+		// 設定変更フローは、変更の計画の承認に PR の作成も含める（承認ダイアログで伝えている）
+		const mode = opts.forcePr || (state.flow === "config" && cfg.git.pr === "ask") ? "auto" : cfg.git.pr;
 		if (mode === "off") {
 			lines.push("PR は作成しない設定です（git.pr: off）。");
 		} else if (next.pr?.status === "created") {
@@ -478,7 +491,18 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (push.code !== 0) return fail(`git push: ${(push.stderr || push.stdout).trim()}`);
 		const p = pathsOf(state);
 		const read = (rel: string) => (existsSync(join(ctx.cwd, rel)) ? readFileSync(join(ctx.cwd, rel), "utf8") : "");
-		const body = state.flow === "docs" ? renderNamed(ctx.cwd, cfg, "pr-docs", {
+		const body = state.flow === "config" ? renderNamed(ctx.cwd, cfg, "pr-config", {
+			title,
+			...configPrVars({
+				plan: read(p.changePlan),
+				issue: state.issue,
+				topic: state.topic,
+				approvedFiles: state.changeFiles ?? [],
+				changedFiles: await changedFiles(ctx, cfg),
+				approval: state.approvals.change,
+				usage: usageSummaryLine(ctx),
+			}),
+		}) : state.flow === "docs" ? renderNamed(ctx.cwd, cfg, "pr-docs", {
 			title,
 			...docPrVars({
 				report: read(p.docReport),
@@ -1256,25 +1280,25 @@ export default function piHarness(pi: ExtensionAPI): void {
 		description:
 			"ユーザーの自然言語の依頼から piHarness のフローを開始・操作する。実行前に必ずユーザーへ確認ダイアログを出し、承認された場合だけ実行する。" +
 			"action: start_requirements（新しい機能・アプリを作りたい、要件を固めたい）/ start_implement（Issue を実装したい。issue に番号・URL・docs/issues/*.md、指定が無ければ next = 次に着手できる Issue）/ " +
-			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ start_docs（ドキュメントだけを書きたい・直したい。README・手順書・設計書など。テストは無い。topic にテーマ、ドキュメントの Issue があれば issue）/ continue_loop（エスカレーション後にループを続けたい・一時停止を解除して再開したい）/ rejoin（バグ修正を実装フローへ合流させたい）/ " +
+			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ start_docs（ドキュメントだけを書きたい・直したい。README・手順書・設計書など。テストは無い。topic にテーマ、ドキュメントの Issue があれば issue）/ start_config（設定ファイルを変えるだけ。.pi・CI・lint・パッケージの設定値など。計画の承認後はテスト・レビューなしで PR まで。topic に変更内容、Issue があれば issue）/ continue_loop（エスカレーション後にループを続けたい・一時停止を解除して再開したい）/ rejoin（バグ修正を実装フローへ合流させたい）/ " +
 			"answer_spec_gap（仕様の確認に回答したい。回答ダイアログを出す）/ pause（フローを一時停止して、書き込みの制限やテストのロックを外したい。ユーザーが自分で直したいとき）/ abort（フローをやめたい）。" +
 			"pause はユーザーが明示的に求めたときだけ使う。制限で作業が進まないことを理由に自分から提案しない。",
 		promptSnippet: "Start or control a piHarness flow from the user's natural-language request (always confirmed by the user)",
 		promptGuidelines: [
-			"ユーザーが作りたいもの・実装したい Issue・直したい不具合・書きたいドキュメントを話したら、自分で作業を始めず harness_control で対応するフローの開始を提案する（ツールがユーザーに確認する）。",
+			"ユーザーが作りたいもの・実装したい Issue・直したい不具合・書きたいドキュメント・変えたい設定を話したら、自分で作業を始めず harness_control で対応するフローの開始を提案する（ツールがユーザーに確認する）。",
 			"依頼の意図がどのフローか曖昧なときは、harness_control を呼ぶ前にユーザーに聞く。ユーザーが取り消したら、無理に進めず意図を確認する。",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "start_docs", "continue_loop", "rejoin", "answer_spec_gap", "pause", "abort"] as const),
+			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "start_docs", "start_config", "continue_loop", "rejoin", "answer_spec_gap", "pause", "abort"] as const),
 			request: Type.String({ description: "ユーザーの依頼の要約（確認ダイアログに表示する）" }),
-			topic: Type.Optional(Type.String({ description: "start_requirements: 作りたいもののテーマ / start_docs: 書きたいドキュメントのテーマ" })),
-			issue: Type.Optional(Type.String({ description: "start_implement: Issue 番号・URL・docs/issues/*.md・next / start_docs: ドキュメントの Issue（任意）" })),
+			topic: Type.Optional(Type.String({ description: "start_requirements: 作りたいもののテーマ / start_docs: 書きたいドキュメントのテーマ / start_config: 変えたい設定の内容" })),
+			issue: Type.Optional(Type.String({ description: "start_implement: Issue 番号・URL・docs/issues/*.md・next / start_docs・start_config: 対象の Issue（任意）" })),
 			description: Type.Optional(Type.String({ description: "start_bugfix: バグの症状・再現手順" })),
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!ctx.hasUI) {
-				throw new Error("ユーザーの確認が必要なため、確認ダイアログを出せない環境では実行できません。/req・/impl・/bugfix・/doc・/harness コマンドを案内してください。");
+				throw new Error("ユーザーの確認が必要なため、確認ダイアログを出せない環境では実行できません。/req・/impl・/bugfix・/doc・/cfg・/harness コマンドを案内してください。");
 			}
 			const cfg = cfgOf(ctx);
 			if (params.action === "answer_spec_gap") {
@@ -1284,7 +1308,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				if (state.pendingHandoff) forceHandoff = true;
 				return result;
 			}
-			const inProgress = isActive(state) && !["impl_done", "req_done", "bug_done", "doc_done"].includes(state.phase);
+			const inProgress = isActive(state) && !DONE_PHASES.includes(state.phase);
 			const current = inProgress ? `${state.flow} / ${PHASE_LABELS[state.phase]}${state.issue ? `（${describeIssue(state.issue)}）` : ""}` : "";
 			let title: string;
 			const lines: string[] = [];
@@ -1320,6 +1344,20 @@ export default function piHarness(pi: ExtensionAPI): void {
 						"新しいセッションで構成案の作成から始めます（承認後に執筆 → レビュー）。ドキュメント以外は変更せず、テストは実行しません。",
 					);
 					run = async () => prepareDocs(ctx, cfg, topic, target);
+					replaces = inProgress;
+					break;
+				}
+				case "start_config": {
+					const topic = params.topic?.trim() || params.request;
+					const issueArg = params.issue?.trim();
+					const target = issueArg ? await resolveIssue(ctx, cfg, issueArg) : undefined;
+					if (issueArg && !target) return reply(`Issue を特定できませんでした: ${issueArg}（番号・URL・docs/issues/*.md で指定してください）`);
+					title = "設定変更を開始しますか？";
+					lines.push(
+						target ? `Issue: ${describeIssue(target.issue)}` : `内容: ${topic}`,
+						"新しいセッションで変更の計画（変更するファイルと内容）から始めます。計画を承認すると、そのファイルだけを変更してコミット・PR まで行います（テスト・レビューはありません）。",
+					);
+					run = async () => prepareConfigChange(ctx, cfg, topic, target);
 					replaces = inProgress;
 					break;
 				}
@@ -1448,6 +1486,25 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (state.git && files.length === 0) throw new Error("ドキュメントがまだ変更されていません。構成案どおりに書いてから doc_review へ進んでください。");
 	}
 
+	/**
+	 * 設定変更フローを完了する前に、変更したファイルが承認された範囲だけか・JSON が壊れていないかを git の差分で確かめる。
+	 */
+	async function checkChangeScope(ctx: ExtensionContext, cfg: HarnessConfig): Promise<void> {
+		const files = await changedFiles(ctx, cfg);
+		const outside = outOfScope(files, state.changeFiles ?? [], ctx.cwd);
+		if (outside.length) {
+			throw new Error(
+				`承認された計画にないファイルが変更されています: ${outside.slice(0, 10).join(", ")}${outside.length > 10 ? ` ほか ${outside.length - 10} 件` : ""}\n` +
+					`変更できるのは ${(state.changeFiles ?? []).join(", ")} だけです。元に戻してから、もう一度 cfg_done へ進んでください。ほかのファイルも変える必要があれば、作業を止めてユーザーに伝えてください。`,
+			);
+		}
+		if (state.git && files.length === 0) throw new Error("まだ何も変更されていません。計画どおりに変更してから cfg_done へ進んでください。");
+		const contents: Record<string, string> = {};
+		for (const f of files) if (existsSync(join(ctx.cwd, f))) contents[f] = readFileSync(join(ctx.cwd, f), "utf8");
+		const broken = invalidJson(contents);
+		if (broken.length) throw new Error(`JSON として読めないファイルがあります:\n${broken.map((b) => `- ${b.file}: ${b.error}`).join("\n")}\n直してから、もう一度 cfg_done へ進んでください。`);
+	}
+
 	pi.registerTool({
 		exposure: HARNESS_TOOL_EXPOSURE,
 		name: "harness_phase",
@@ -1487,6 +1544,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			if (gated) await checkTestIntegrity(ctx, cfg, params.testChangeReason);
 			if (params.to === "doc_review") await checkDocsOnly(ctx, cfg);
+			if (params.to === "cfg_done") await checkChangeScope(ctx, cfg);
 			const from = state.phase;
 			setState(next, ctx);
 
@@ -1513,6 +1571,11 @@ export default function piHarness(pi: ExtensionAPI): void {
 				const locked = await lockForReview(ctx, cfg);
 				return reply(`バグ修正完了 → 実装フロー（${describeIssue(state.issue)}）へ合流します。合流後はフルレビューから再開します。${locked}`);
 			}
+			// 設定変更: 計画が承認済みなので、テスト・レビューなしでコミット・PR まで行う
+			if (state.phase === "cfg_done") {
+				const finalized = await finalizeImplementation(ctx, cfg);
+				return reply(`設定変更フロー完了。\n${finalized}\n変更したファイルとコミット/PR の結果をユーザーに報告してください。`);
+			}
 			// レビューへ進む時点のテストをロックする（レビュー・指摘修正の間は書き換えられない）
 			const locked = state.phase === "impl_review" ? await lockForReview(ctx, cfg) : "";
 			return reply(`フェーズを ${state.phase}（${PHASE_LABELS[state.phase]}）へ遷移しました。${locked}`);
@@ -1524,28 +1587,32 @@ export default function piHarness(pi: ExtensionAPI): void {
 		name: "harness_request_approval",
 		label: "Request Approval",
 		description:
-			"人間の承認ゲート。要件定義書（kind: requirements）・テスト/実装プラン（kind: plan）・ドキュメントの構成案（kind: outline）の承認をユーザーに依頼し、結果を返す。承認されるまで次のプロセスへは進めない。",
+			"人間の承認ゲート。要件定義書（kind: requirements）・テスト/実装プラン（kind: plan）・ドキュメントの構成案（kind: outline）・設定変更の計画（kind: change。files に変更するファイル）の承認をユーザーに依頼し、結果を返す。承認されるまで次へは進めない。",
 		promptSnippet: "Ask the human to approve requirements, the test/implementation plan, or a documentation outline (hard gate)",
 		promptGuidelines: [
 			"承認待ちの間にユーザーがチャットで承認・修正を伝えたら、発言だけで承認扱いにせず harness_request_approval をもう一度呼んで確認ダイアログで確定する。",
 		],
 		parameters: Type.Object({
-			kind: StringEnum(["requirements", "plan", "outline"] as const),
+			kind: StringEnum(["requirements", "plan", "outline", "change"] as const),
 			summary: Type.String({ description: "承認者向けの要約（目的・スコープ・主要な決定事項・リスク）" }),
 			documents: Type.Array(Type.String(), { description: "レビュー対象ドキュメントのパス（cwd からの相対パス）", minItems: 1 }),
+			files: Type.Optional(
+				Type.Array(Type.String(), { description: "kind: change のときだけ: 変更するファイル（cwd からの相対パス）。承認されると、これ以外のファイルは変更できない" }),
+			),
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const kind = params.kind as ApprovalKind;
 			let documents = params.documents;
-			if (kind === "plan" || kind === "outline") {
-				const main = kind === "plan" ? pathsOf(state).plan : pathsOf(state).outline;
+			if (kind === "plan" || kind === "outline" || kind === "change") {
+				const main = kind === "plan" ? pathsOf(state).plan : kind === "outline" ? pathsOf(state).outline : pathsOf(state).changePlan;
 				if (!existsSync(join(ctx.cwd, main))) throw new Error(`${approvalLabel(kind)}は ${main} に作成してください（次のプロセスへはこのファイルが引き継がれます）。`);
 				documents = [main, ...documents.filter((d) => d !== main)];
 			}
 			const missing = documents.filter((d) => !existsSync(join(ctx.cwd, d)));
 			if (missing.length) throw new Error(`ドキュメントが見つかりません: ${missing.join(", ")}`);
-			setState(beginApproval(state, kind, documents), ctx);
+			const files = kind === "change" ? [...new Set((params.files ?? []).map((f) => toRel(f, ctx.cwd)))] : undefined;
+			setState(beginApproval(state, kind, documents, files), ctx);
 
 			const label = approvalLabel(kind);
 			const warning = kind === "plan" ? planSizeWarning(ctx, cfgOf(ctx)) : undefined;
@@ -1560,7 +1627,10 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const adrs = state.artifacts.adrs ?? [];
 			const title =
 				`【${label}の承認依頼】\n${warning ? `${warning}\n` : ""}${params.summary.slice(0, 1500)}\n\n対象: ${documents.join(", ")}` +
-				(adrs.length ? `\n設計判断（ADR、承認に含まれます）: ${adrs.join(", ")}` : "");
+				(adrs.length ? `\n設計判断（ADR、承認に含まれます）: ${adrs.join(", ")}` : "") +
+				(files
+					? `\n変更するファイル: ${files.join(", ")}\n承認すると、このファイルだけを変更してコミットし、${cfgOf(ctx).git.pr === "off" ? "" : "PR の作成まで"}確認なしで行います（テスト・レビューはありません）。`
+					: "");
 			const choice = await ctx.ui.select(title, options);
 			if (choice === undefined) {
 				return reply(
@@ -1588,9 +1658,12 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	function approvalMessage(kind: ApprovalKind, decision: ApprovalDecision, comment?: string): string {
 		const c = comment ? `\nユーザーのコメント: ${comment}` : "";
+		if (decision === "approved" && kind === "change") {
+			return `${approvalLabel(kind)}が承認されました。${c}\n承認されたファイル（${(state.changeFiles ?? []).join(", ")}）だけを計画どおりに変更し、harness_phase で cfg_done へ進んでください（拡張が範囲を確かめてコミット・PR まで行います）。`;
+		}
 		if (decision === "approved") return `${approvalLabel(kind)}が承認されました。${c}`;
 		if (decision === "revise") {
-			return `修正を依頼されました。${c}\n指摘を反映して${kind === "requirements" ? "要件定義書" : kind === "plan" ? "プラン" : "構成案"}を更新し、再度 harness_request_approval してください。不明点は harness_ask で確認すること。`;
+			return `修正を依頼されました。${c}\n指摘を反映して${kind === "requirements" ? "要件定義書" : kind === "plan" ? "プラン" : kind === "outline" ? "構成案" : "変更の計画"}を更新し、再度 harness_request_approval してください。不明点は harness_ask で確認すること。`;
 		}
 		return `却下されました。フローを中止しました。${c}\n作業を止めてください。`;
 	}
@@ -2067,7 +2140,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	async function confirmReplace(ctx: ExtensionContext, next: string): Promise<boolean> {
 		if (!isActive(state) || !ctx.hasUI) return true;
-		if (["impl_done", "req_done", "bug_done", "doc_done"].includes(state.phase) && !state.suspended) return true;
+		if (DONE_PHASES.includes(state.phase) && !state.suspended) return true;
 		return ctx.ui.confirm("進行中のフローがあります", `現在: ${state.flow} / ${PHASE_LABELS[state.phase]}\n破棄して ${next} を開始しますか？`);
 	}
 
@@ -2306,6 +2379,44 @@ export default function piHarness(pi: ExtensionAPI): void {
 		},
 	});
 
+	/**
+	 * 設定変更フローの状態を用意する。テストは無いのでベースラインは取らない。作業ブランチは config-<内容 or Issue> で作る。
+	 */
+	async function prepareConfigChange(ctx: ExtensionContext, cfg: HarnessConfig, topic: string, target?: { issue: IssueRef; body?: string }): Promise<Prepared> {
+		const issue = target?.issue;
+		const slug = slugify(topic || "config", 30);
+		const branch = await prepareWorkBranch(ctx, cfg, issue ? branchName("config-", issue) : `config-${/^[a-z0-9-]+$/.test(slug) ? slug : timestamp().slice(0, 16)}`);
+		if ("error" in branch) return { ok: false, message: branch.error };
+		const { git, pullNote } = branch;
+		const base = issue?.number ? `config-${issue.number}` : `config-${timestamp().slice(0, 10)}-${slug}`;
+		setState({ ...startConfigChange(state, topic, issue, limitsOf(cfg), newItemDir(ctx, base)), git }, ctx);
+		if (issue) {
+			saveRegistry(ctx, setStatus(loadRegistry(ctx), issue, "in_progress"));
+			writeIssueFile(ctx, issue, target?.body);
+		}
+		return {
+			ok: true,
+			message:
+				`設定変更フローを開始します（${issue ? describeIssue(issue) : `内容: ${topic || "未指定"}`}）。計画の承認後はテスト・レビューなしで PR まで行います。` +
+				`${pullNote}${git?.branch ? `作業ブランチ: ${git.branch}（差分の基準: ${git.base.slice(0, 12)}）` : ""}`,
+		};
+	}
+
+	pi.registerCommand("cfg", {
+		description: "設定変更フローを新しいセッションで開始する（変更の計画 → 承認 → 変更 → コミット・PR。テスト・レビューなし）: /cfg <変更内容 | Issue番号 | Issue URL | docs/issues/*.md>",
+		handler: async (args, ctx) => {
+			state = loadState(ctx);
+			const cfg = cfgOf(ctx);
+			let arg = args.trim();
+			if (!arg && ctx.hasUI) arg = (await ctx.ui.input("変えたい設定（内容、または Issue 番号）"))?.trim() ?? "";
+			const target = arg && (parseIssueArg(arg) || /\.md$/i.test(arg)) ? await resolveIssue(ctx, cfg, arg) : undefined;
+			if (!(await confirmReplace(ctx, "設定変更フロー"))) return;
+			const prepared = await prepareConfigChange(ctx, cfg, target ? "" : arg, target);
+			ctx.ui.notify(prepared.message, prepared.ok ? "info" : "error");
+			if (prepared.ok) await startProcessSession(ctx);
+		},
+	});
+
 	pi.registerCommand("doc", {
 		description: "ドキュメント作成フローを新しいセッションで開始する（構成案 → 承認 → 執筆 → レビュー。テストは無い）: /doc <テーマ | Issue番号 | Issue URL | docs/issues/*.md>",
 		handler: async (args, ctx) => {
@@ -2508,8 +2619,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 						return;
 					}
 					case "pr": {
-						if (state.phase !== "impl_done" && state.phase !== "doc_done") {
-							ctx.ui.notify(`PR は実装フロー・ドキュメント作成フローの完了後に作成できます（現在: ${state.phase}）`, "warning");
+						if (!["impl_done", "doc_done", "cfg_done"].includes(state.phase)) {
+							ctx.ui.notify(`PR は実装・ドキュメント作成・設定変更のフローの完了後に作成できます（現在: ${state.phase}）`, "warning");
 							return;
 						}
 						if (ctx.hasUI && cfg.git.pr !== "auto" && !(await ctx.ui.confirm("PR を作成しますか？", `ブランチ ${state.git?.branch ?? "-"} → ${state.git?.baseBranch ?? "-"}`))) return;

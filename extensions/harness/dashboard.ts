@@ -58,6 +58,12 @@ const STEPS: Record<FlowKind, Step[]> = {
 		{ label: "レビュー", phases: ["doc_review", "doc_fix"] },
 		{ label: "完了", phases: ["doc_done"] },
 	],
+	config: [
+		{ label: "計画", phases: ["cfg_plan"] },
+		{ label: "承認", phases: ["cfg_plan_approval"] },
+		{ label: "変更", phases: ["cfg_apply"] },
+		{ label: "完了（コミット・PR）", phases: ["cfg_done"] },
+	],
 };
 
 /** フェーズごとの「次にやること」の短い説明 */
@@ -85,9 +91,13 @@ const NEXT: Partial<Record<Phase, string>> = {
 	doc_review: "ドキュメントをレビューして結果を記録",
 	doc_fix: "指摘を修正 → fix レポート",
 	doc_done: "完了（コミット・PR を確認）",
+	cfg_plan: "変更するファイルと内容を計画 → 承認依頼",
+	cfg_plan_approval: "あなたの承認待ち（承認後は PR 作成まで自動）",
+	cfg_apply: "計画どおりに変更 → 完了（コミット・PR）",
+	cfg_done: "完了（PR を確認）",
 };
 
-const FLOW_LABEL: Record<FlowKind, string> = { requirements: "要件定義", implement: "TDD 実装", bugfix: "バグ修正", docs: "ドキュメント作成" };
+const FLOW_LABEL: Record<FlowKind, string> = { requirements: "要件定義", implement: "TDD 実装", bugfix: "バグ修正", docs: "ドキュメント作成", config: "設定変更" };
 
 export function formatTokens(n: number): string {
 	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -132,7 +142,7 @@ export function renderDashboard(d: DashboardInput, paint: Paint = plain): string
 
 	if (!s.flow || s.phase === "idle") {
 		lines.push(
-			[paint("accent", "🧭 piHarness"), "待機中", branch, paint("muted", "話しかけて開始: 作りたいもの / 実装したい Issue / 直したい不具合 / 書きたいドキュメント")]
+			[paint("accent", "🧭 piHarness"), "待機中", branch, paint("muted", "話しかけて開始: 作りたいもの / 実装したい Issue / 直したい不具合 / 書きたいドキュメント / 変えたい設定")]
 				.filter(Boolean)
 				.join(sep),
 		);

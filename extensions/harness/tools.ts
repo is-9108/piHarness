@@ -37,6 +37,8 @@ const PROCESS_TOOLS: Record<ProcessKind, { harness: string[]; readOnly?: boolean
 	doc_write: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_control"] },
 	doc_review: { harness: ["harness_status", "harness_record_review", "harness_control"], readOnly: true },
 	doc_fix: { harness: ["harness_status", "harness_phase", "harness_control"] },
+	// 設定変更フロー: 計画・承認・変更を 1 つのセッションで行う。テストとレビューのツールは使わない
+	config: { harness: ["harness_status", "harness_ask", "harness_phase", "harness_request_approval", "harness_control"] },
 };
 
 /**
