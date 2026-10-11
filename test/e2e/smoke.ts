@@ -321,6 +321,17 @@ assert.match(readFileSync(join(project, p("review-1.md")), "utf8"), /# レビュ
 const handoff = readFileSync(join(project, p("handoff.md")), "utf8");
 assert.equal(handoff.match(/^## /gm)?.length, 5, "handoff.md に 5 回分の引き継ぎ記録");
 
+// 完了したフローは何も制限しない: レビューのセッション（読み取り専用だった）でも、完了後は書き込みツールが戻り、テストも書き換えられる
+assert.ok(sessionsSeen[5].getActiveToolNames().includes("write"), "完了したらプロセスごとのツールの絞り込みを外す");
+r = await run("完了したので、ついでにメモを書いて", [
+	call("write", { path: "NOTES.md", content: "メモ" }),
+	call("write", { path: "test/feature.test.js", content: "it('境界値', () => {});\n" }), // レビュー時点でロックしていたテスト
+	call("bash", { command: "rm NOTES.md && git checkout -- test/feature.test.js" }),
+	done("書きました"),
+]);
+assert.deepEqual(r.filter((x) => x.includes("[ERROR]")), [], "完了後の作業はブロックされない");
+assert.equal(JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8")).testLock, undefined, "完了したらテストのロックを外す");
+
 // ---------------------------------------------------------------------------
 // エスカレーション → バグ修正（新セッション）→ 実装フローへ合流（新しいレビューセッション）
 // ---------------------------------------------------------------------------

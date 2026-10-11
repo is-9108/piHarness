@@ -21,7 +21,7 @@ export function shouldCompact(
 	compacting: boolean,
 ): boolean {
 	if (!settings.enabled || compacting || !s.flow || s.pendingHandoff) return false;
-	if (IDLE_PHASES.includes(s.phase)) return false;
+	if (IDLE_PHASES.includes(s.phase) || s.paused) return false;
 	if (!usage || usage.percent === null) return false;
 	return usage.percent >= settings.thresholdPercent;
 }

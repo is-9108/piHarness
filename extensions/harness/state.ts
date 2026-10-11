@@ -209,6 +209,11 @@ export interface HarnessState {
 	testLock?: TestLock;
 	/** レビューで見つかった仕様の曖昧さと、ユーザーの回答 */
 	specGaps?: SpecGap[];
+	/**
+	 * ユーザーがフローを一時停止した（エスカレーション後の「手動で対応」や /harness unlock）。
+	 * 一時停止中は書き込みの制限・テストのロック・ツールの絞り込みをかけない。再開は /harness resume。
+	 */
+	paused?: { at: string; reason: string };
 	/** Git 連携の情報（作業ブランチ・差分の基準・コミット・PR） */
 	git?: GitInfo;
 	/** ユーザー/エージェントが理由を記録したうえで許可したテストの変更（同じ内容を二度確認しない） */
@@ -286,6 +291,34 @@ export function flowOf(phase: Phase): FlowKind | null {
 
 export function isActive(s: HarnessState): boolean {
 	return s.flow !== null && s.phase !== "idle";
+}
+
+/** フローの作業が終わったフェーズ（状態は /harness pr や合流のために残すが、もう何も制限しない） */
+export const DONE_PHASES: Phase[] = ["req_done", "impl_done", "bug_done", "doc_done"];
+
+/**
+ * フローがエージェントの作業を制御している（書き込みの制限・テストのロック・ツールの絞り込みをかける）か。
+ * 完了したフローと、一時停止中のフローは制御しない。
+ */
+export function isWorking(s: HarnessState): boolean {
+	return isActive(s) && !DONE_PHASES.includes(s.phase) && !s.paused;
+}
+
+/** フローを一時停止する（制限をすべて外す）。状態と成果物は残し、/harness resume で再開できる */
+export function pauseFlow(prev: HarnessState, reason: string): HarnessState {
+	if (!isActive(prev)) throw new TransitionError("進行中のフローがありません。");
+	const s = clone(prev);
+	s.paused = { at: now(), reason };
+	s.pendingHandoff = undefined;
+	return withLog(s, `フローを一時停止: ${reason}`);
+}
+
+/** 一時停止を解除する（エスカレーション中なら resumeAfterEscalation を使う） */
+export function resumePaused(prev: HarnessState): HarnessState {
+	if (!prev.paused) throw new TransitionError("一時停止中ではありません。");
+	const s = clone(prev);
+	s.paused = undefined;
+	return withLog(s, "一時停止を解除して再開");
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +798,8 @@ function settleReview(s: HarnessState, blocking: number, total: number): { state
 	const docs = s.flow === "docs";
 	if (blocking === 0) {
 		s.phase = docs ? "doc_done" : "impl_done";
+		// 完了したら、テストのロックは外す（以降の作業を止めない）
+		s.testLock = undefined;
 		return {
 			state: withLog(s, `レビュー ${s.review.round} 周目: 指摘なし（ブロッキング 0 件）→ 完了`),
 			outcome: { kind: "clean", round: s.review.round, nonBlocking: total },
@@ -809,6 +844,7 @@ export function resumeAfterEscalation(prev: HarnessState, limits: Limits): Harne
 	const esc = prev.escalation;
 	s.flow = esc.flow;
 	s.escalation = undefined;
+	s.paused = undefined;
 	s.test.failures = 0;
 	s.test.failureHistory = [];
 	s.test.max = limits.maxTestLoops;
@@ -853,6 +889,8 @@ export function finishFlow(prev: HarnessState, reason: string): HarnessState {
 	s.phase = "idle";
 	s.escalation = undefined;
 	s.pendingHandoff = undefined;
+	s.paused = undefined;
+	s.testLock = undefined;
 	return withLog(s, `フロー終了: ${reason}`);
 }
 
@@ -958,6 +996,7 @@ export function statusLine(s: HarnessState): string {
 	if (s.flow === "implement" || s.flow === "docs") parts.push(`review ${s.review.round}/${s.review.max}`);
 	if (s.test.dirty) parts.push("未テスト変更あり");
 	if (s.pendingHandoff) parts.push(`次セッション待ち→${s.pendingHandoff.to}`);
+	if (s.paused) parts.push("一時停止中（/harness resume で再開）");
 	return parts.join(" | ");
 }
 

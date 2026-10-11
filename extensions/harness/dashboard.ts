@@ -143,7 +143,9 @@ export function renderDashboard(d: DashboardInput, paint: Paint = plain): string
 
 		const phase = s.phase === "escalated" ? s.escalation?.phase : s.phase;
 		const now = d.activity ?? "入力待ち";
-		if (s.phase === "escalated") {
+		if (s.paused) {
+			lines.push(paint("warning", `⏸ 一時停止中（制限なし）: ${s.paused.reason.slice(0, 50)}`) + sep + paint("muted", "「再開して」/ /harness resume ・ /harness abort"));
+		} else if (s.phase === "escalated") {
 			lines.push(paint("error", `⚠ エスカレーション中: ${(s.escalation?.detail ?? "").slice(0, 60)}`) + sep + paint("muted", "「ループを続けて」「バグ修正して」「やめたい」"));
 		} else if (s.pendingHandoff) {
 			lines.push(paint("warning", `↪ 次のセッションを開始します`));

@@ -96,6 +96,9 @@ import {
 	initialState,
 	type IssueRef,
 	isActive,
+	isWorking,
+	pauseFlow,
+	resumePaused,
 	type Limits,
 	markDirty,
 	PHASE_LABELS,
@@ -185,10 +188,13 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	/** 状態を更新して state.json に保存する。プロセス境界をまたぐ場合は新セッション待ちを記録する */
 	function setState(next: HarnessState, ctx: ExtensionContext): void {
+		const wasWorking = isWorking(state);
 		state = withHandoff(state, next);
 		const file = stateFile(ctx);
 		mkdirSync(dirname(file), { recursive: true });
 		writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`);
+		// フローが完了・一時停止・終了したら、絞っていたツールをすぐに戻す（再開したらまた絞る）
+		if (wasWorking !== isWorking(state)) applyProcessTools();
 		refreshUI(ctx);
 	}
 
@@ -671,7 +677,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	 */
 	async function enforceTestLock(ctx: ExtensionContext, cfg: HarnessConfig): Promise<void> {
 		const lock = state.testLock;
-		if (!cfg.testLock || !lock || !state.itemDir) return;
+		if (!cfg.testLock || !lock || !state.itemDir || !isWorking(state)) return;
 		const v = findViolations(ctx.cwd, lock, lock.mode === "green" ? await currentTestFiles(ctx, cfg) : []);
 		if (!hasViolations(v)) return;
 		const { restored, failed } = restoreFiles(ctx.cwd, lock, [...v.changed, ...v.deleted], pathsOf(state).testLock);
@@ -782,7 +788,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		const options = esc?.flow === "docs" ? [CONTINUE, MANUAL, ABORT] : [CONTINUE, BUGFIX, MANUAL, ABORT];
 		const choice = await ctx.ui.select(`⚠ エスカレーション: ${headline}\n${esc?.detail ?? ""}`, options);
 		if (choice === CONTINUE) {
-			setState(resumeAfterEscalation(state, limitsOf(cfg)), ctx);
+			await resumeWorkflow(ctx, cfg);
 			return reply(
 				`${detail}\n\nユーザー判断: ループを継続。カウンタをリセットしました（現在のフェーズ: ${state.phase}）。` +
 					"これまでと異なるアプローチで原因を再分析してから修正してください。",
@@ -798,10 +804,38 @@ export default function piHarness(pi: ExtensionAPI): void {
 			setState(finishFlow(state, "エスカレーション後にユーザーが中止"), ctx);
 			return reply(`${detail}\n\nユーザー判断: フローを中止しました。作業を止めてください。`, true);
 		}
+		// 手動で対応: フローを一時停止し、書き込みの制限とテストのロックを外す（ユーザーやエージェントが自由に直せるように）
+		setState(pauseFlow(state, "エスカレーション後にユーザーが手動で対応"), ctx);
 		return reply(
-			`${detail}\n\nユーザー判断: 手動で対応（フロー一時停止）。作業を止め、ここまでの状況を簡潔に報告してください。` +
-				"再開・バグ修正・中止はチャットで伝えてもらえば、確認のうえ実行します（/harness continue・/bugfix・/harness abort でも可）。",
+			`${detail}\n\nユーザー判断: 手動で対応（フローを一時停止。書き込みの制限とテストのロックは外しました）。作業を止め、ここまでの状況を簡潔に報告してください。` +
+				"ユーザーの指示があれば通常どおり作業してかまいません。再開は「再開して」と伝えるか /harness resume（その時点のテストを新しいロックとして受け入れます）、中止は /harness abort です。",
 			true,
+		);
+	}
+
+	/**
+	 * エスカレーション・一時停止から再開する。一時停止中に変わったテストは、その内容でロックし直す
+	 * （ユーザーの手動の修正を、ロック時の内容に戻してしまわないため）。戻り値はユーザー向けの報告文。
+	 */
+	async function resumeWorkflow(ctx: ExtensionContext, cfg: HarnessConfig): Promise<string> {
+		const wasPaused = !!state.paused;
+		const before = state.testLock;
+		setState(state.phase === "escalated" ? resumeAfterEscalation(state, limitsOf(cfg)) : resumePaused(state), ctx);
+		if (!wasPaused) return `再開しました（現在のフェーズ: ${PHASE_LABELS[state.phase]}）。`;
+		// 一時停止中にコードが変わっていれば、テストをやり直させる
+		if (TEST_PHASES.includes(state.phase)) setState(markDirty(state), ctx);
+		if (!before || !cfg.testLock) return `一時停止を解除しました（現在のフェーズ: ${PHASE_LABELS[state.phase]}）。`;
+		await lockTestFiles(ctx, cfg, before.mode);
+		const after = state.testLock?.files ?? {};
+		const changed = [...new Set([...Object.keys(before.files), ...Object.keys(after)])].filter((f) => before.files[f] !== after[f]).sort();
+		if (changed.length) {
+			const reason = "一時停止中にテストが変更された（ユーザーの手動対応）";
+			writeItemFile(ctx, pathsOf(state).testChanges, `\n## ${new Date().toISOString()}（${reason}）\n\n${changed.map((f) => `- ${f}`).join("\n")}\n`, true);
+			setState({ ...state, testChangeAcks: [...state.testChangeAcks, { signature: `paused:${changed.join(",")}:${Date.now()}`, reason, at: new Date().toISOString() }] }, ctx);
+		}
+		return (
+			`一時停止を解除しました（現在のフェーズ: ${PHASE_LABELS[state.phase]}）。` +
+			(changed.length ? `一時停止中に変わったテスト（${changed.join(", ")}）は、今の内容でロックし直し、test-changes.md に記録しました。` : "")
 		);
 	}
 
@@ -889,7 +923,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 	 */
 	async function handleProviderLimit(ctx: ExtensionContext): Promise<boolean> {
 		const cfg = cfgOf(ctx);
-		if (!cfg.fallback.enabled || !isActive(state) || state.pendingHandoff || !sessionProcess) return false;
+		if (!cfg.fallback.enabled || !isWorking(state) || state.pendingHandoff || !sessionProcess) return false;
 		const entries = ctx.sessionManager.getEntries() as { id?: string; type: string; message?: unknown }[];
 		const entry = [...entries].reverse().find((e) => e.type === "message" && (e.message as { role?: string } | undefined)?.role === "assistant");
 		const msg = entry?.message as { stopReason?: string; errorMessage?: string; provider?: string; model?: string } | undefined;
@@ -945,10 +979,13 @@ export default function piHarness(pi: ExtensionAPI): void {
 	}
 
 	/** 現在のプロセスに必要なツールだけを有効にする（フロー外では状態確認と自然言語からの開始だけ） */
+	/** セッション開始時に有効だったツール（プロセスごとに絞ったものを、完了・一時停止のときに戻すため） */
+	let baseTools: string[] | undefined;
+
 	function applyProcessTools(): void {
-		const proc = isActive(state) && !state.pendingHandoff ? processOf(state) : null;
+		const proc = isWorking(state) && !state.pendingHandoff ? processOf(state) : null;
 		const registered = pi.getAllTools().map((t) => t.name);
-		pi.setActiveTools(toolsForProcess(pi.getActiveTools(), registered, proc));
+		pi.setActiveTools(toolsForProcess(baseTools ?? pi.getActiveTools(), registered, proc));
 	}
 
 	pi.on("session_start", async (_e, ctx) => {
@@ -965,12 +1002,16 @@ export default function piHarness(pi: ExtensionAPI): void {
 			const applied = await applyProcessModel(ctx, proc);
 			if (applied.text) ctx.ui.notify(`piHarness: ${PROCESS_LABELS[proc]} のモデル → ${applied.text}`, "info");
 		}
+		baseTools = pi.getActiveTools();
 		applyProcessTools();
 		activity = undefined;
 		await updateBranch(ctx).catch(() => undefined);
 		refreshUI(ctx);
 		const { warnings } = loadConfig(ctx.cwd);
 		for (const w of warnings) ctx.ui.notify(`[piHarness] ${w}`, "warning");
+		if (state.paused) {
+			ctx.ui.notify(`piHarness: フローは一時停止中です（${state.paused.reason}）。制限はかかっていません。/harness resume で再開、/harness abort で中止します。`, "info");
+		}
 		if (state.pendingHandoff) {
 			ctx.ui.notify(`piHarness: 「${PROCESS_LABELS[state.pendingHandoff.to]}」の開始待ちです。/harness next で開始します。`, "info");
 		}
@@ -982,7 +1023,8 @@ export default function piHarness(pi: ExtensionAPI): void {
 	// 現在のプロセス・入出力成果物・次の行動をエージェントに伝える。
 	// プロンプトキャッシュを壊さないよう、状態が変わったときだけ追記し、過去の状態表示は削除しない。
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!isActive(state)) return;
+		// 完了・一時停止中のフローは、普段の会話に状態を差し込まない
+		if (!isWorking(state)) return;
 		const proc = processOf(state);
 		if (proc && !pi.getSessionName()) {
 			const who = state.issue?.number ? `#${state.issue.number} ` : state.topic ? `${state.topic} ` : "";
@@ -1050,7 +1092,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			customInstructions: compactionInstructions(state),
 			onComplete: () => {
 				compacting = false;
-				if (!isActive(state) || state.pendingHandoff) return;
+				if (!isWorking(state) || state.pendingHandoff) return;
 				const why = `コンテキスト使用率が ${percent}% に達したため`;
 				if (resume) {
 					pi.sendUserMessage(resumeMessage(ctx, why), { deliverAs: "followUp", expandPromptTemplates: true });
@@ -1062,7 +1104,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 				compacting = false;
 				ownCompaction = false;
 				ctx.ui.notify(`[piHarness] 圧縮に失敗しました: ${e.message}`, "warning");
-				if (resume && isActive(state)) {
+				if (resume && isWorking(state)) {
 					pi.sendUserMessage("コンテキストの圧縮に失敗しました。そのまま作業を続けてください。", { deliverAs: "followUp" });
 				}
 			},
@@ -1086,7 +1128,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			ownCompaction = false;
 			return;
 		}
-		if (!isActive(state) || state.pendingHandoff) return;
+		if (!isWorking(state) || state.pendingHandoff) return;
 		if (ctx.isIdle()) reminderPending = "Pi がコンテキストを自動圧縮したため";
 		else pi.sendUserMessage(resumeMessage(ctx, "Pi がコンテキストを自動圧縮したため"), { deliverAs: "steer", expandPromptTemplates: true });
 	});
@@ -1125,7 +1167,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 			}
 			const d = checkWrite(state, path, guardPaths(ctx, cfg));
 			if (d.block) return { block: true, reason: d.reason };
-			if (isActive(state) && state.itemDir && path) {
+			if (isWorking(state) && state.itemDir && path) {
 				if (isInside(path, pathsOf(state).testLock, ctx.cwd)) {
 					return { block: true, reason: "[piHarness] テストのロックの記録（test-lock/）は編集できません。" };
 				}
@@ -1139,7 +1181,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 		const other = checkOtherTool(state, toolMeta(event.toolName), guardPaths(ctx, cfg));
 		if (other.block) return { block: true, reason: other.reason };
 		if (!isActive(state)) return;
-		if (compactRequested && !state.pendingHandoff) {
+		if (compactRequested && !state.pendingHandoff && isWorking(state)) {
 			interruptedForCompaction = true;
 			return {
 				block: true,
@@ -1150,7 +1192,9 @@ export default function piHarness(pi: ExtensionAPI): void {
 		if (state.pendingHandoff && !event.toolName.startsWith("harness_")) {
 			return {
 				block: true,
-				reason: "[piHarness] このプロセスは完了しています。次のプロセスは新しいセッションで開始されます。作業を終了してください。",
+				reason:
+					"[piHarness] このプロセスは完了しています。次のプロセスは新しいセッションで開始されます。作業を終了してください" +
+					"（新しいセッションが始まらないときは、ユーザーが /harness next で開始できます）。",
 				terminate: true,
 			};
 		}
@@ -1162,7 +1206,7 @@ export default function piHarness(pi: ExtensionAPI): void {
 
 	// テスト合格後の変更を検知（未テストのままレビューや完了へ進ませない）
 	pi.on("tool_result", async (event, ctx) => {
-		if (!isActive(state) || event.isError) return;
+		if (!isWorking(state) || event.isError) return;
 		if (event.toolName === "edit" || event.toolName === "write") {
 			const path = (event.input as { path?: string }).path;
 			if (isHarnessFile(path, guardPaths(ctx, cfgOf(ctx)))) return;
@@ -1212,15 +1256,16 @@ export default function piHarness(pi: ExtensionAPI): void {
 		description:
 			"ユーザーの自然言語の依頼から piHarness のフローを開始・操作する。実行前に必ずユーザーへ確認ダイアログを出し、承認された場合だけ実行する。" +
 			"action: start_requirements（新しい機能・アプリを作りたい、要件を固めたい）/ start_implement（Issue を実装したい。issue に番号・URL・docs/issues/*.md、指定が無ければ next = 次に着手できる Issue）/ " +
-			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ start_docs（ドキュメントだけを書きたい・直したい。README・手順書・設計書など。テストは無い。topic にテーマ、ドキュメントの Issue があれば issue）/ continue_loop（エスカレーション後にループを続けたい）/ rejoin（バグ修正を実装フローへ合流させたい）/ " +
-			"answer_spec_gap（仕様の確認に回答したい。回答ダイアログを出す）/ abort（フローをやめたい）。",
+			"start_bugfix（不具合を直したい。実装中なら完了後に合流）/ start_docs（ドキュメントだけを書きたい・直したい。README・手順書・設計書など。テストは無い。topic にテーマ、ドキュメントの Issue があれば issue）/ continue_loop（エスカレーション後にループを続けたい・一時停止を解除して再開したい）/ rejoin（バグ修正を実装フローへ合流させたい）/ " +
+			"answer_spec_gap（仕様の確認に回答したい。回答ダイアログを出す）/ pause（フローを一時停止して、書き込みの制限やテストのロックを外したい。ユーザーが自分で直したいとき）/ abort（フローをやめたい）。" +
+			"pause はユーザーが明示的に求めたときだけ使う。制限で作業が進まないことを理由に自分から提案しない。",
 		promptSnippet: "Start or control a piHarness flow from the user's natural-language request (always confirmed by the user)",
 		promptGuidelines: [
 			"ユーザーが作りたいもの・実装したい Issue・直したい不具合・書きたいドキュメントを話したら、自分で作業を始めず harness_control で対応するフローの開始を提案する（ツールがユーザーに確認する）。",
 			"依頼の意図がどのフローか曖昧なときは、harness_control を呼ぶ前にユーザーに聞く。ユーザーが取り消したら、無理に進めず意図を確認する。",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "start_docs", "continue_loop", "rejoin", "answer_spec_gap", "abort"] as const),
+			action: StringEnum(["start_requirements", "start_implement", "start_bugfix", "start_docs", "continue_loop", "rejoin", "answer_spec_gap", "pause", "abort"] as const),
 			request: Type.String({ description: "ユーザーの依頼の要約（確認ダイアログに表示する）" }),
 			topic: Type.Optional(Type.String({ description: "start_requirements: 作りたいもののテーマ / start_docs: 書きたいドキュメントのテーマ" })),
 			issue: Type.Optional(Type.String({ description: "start_implement: Issue 番号・URL・docs/issues/*.md・next / start_docs: ドキュメントの Issue（任意）" })),
@@ -1288,18 +1333,21 @@ export default function piHarness(pi: ExtensionAPI): void {
 					break;
 				}
 				case "continue_loop": {
-					if (state.phase !== "escalated") return reply("エスカレーション中ではないため、ループの継続はできません。");
-					title = "ループを継続しますか？";
-					lines.push(state.escalation?.detail ?? "", "修正ループのカウンタをリセットして続けます。");
+					if (state.phase !== "escalated" && !state.paused) return reply("エスカレーション中・一時停止中ではないため、再開するものはありません。");
+					title = state.paused ? "一時停止を解除して再開しますか？" : "ループを継続しますか？";
+					lines.push(
+						state.escalation?.detail ?? state.paused?.reason ?? "",
+						state.phase === "escalated" ? "修正ループのカウンタをリセットして続けます。" : "書き込みの制限とテストのロックを戻して続けます。",
+					);
 					run = async () => {
-						setState(resumeAfterEscalation(state, limitsOf(cfg)), ctx);
+						const resumed = await resumeWorkflow(ctx, cfg);
 						if (sessionProcess !== processOf(state)) {
 							// 別のセッションから再開する場合は、そのプロセスを新しいセッションで開き直す
 							const proc = processOf(state);
 							if (proc) setState({ ...state, pendingHandoff: { from: proc, to: proc, at: new Date().toISOString() } }, ctx);
-							return { ok: true, message: "ループを継続します。" };
+							return { ok: true, message: resumed };
 						}
-						return { ok: true, message: "ループを継続します（カウンタをリセット）。これまでと異なるアプローチで原因を再分析してから修正してください。" };
+						return { ok: true, message: `${resumed}これまでと異なるアプローチで原因を再分析してから進めてください。` };
 					};
 					break;
 				}
@@ -1311,6 +1359,19 @@ export default function piHarness(pi: ExtensionAPI): void {
 						setState(rejoinImplement(state, limitsOf(cfg)), ctx);
 						await lockForReview(ctx, cfg);
 						return { ok: true, message: "実装フローへ合流します。" };
+					};
+					break;
+				}
+				case "pause": {
+					if (!isWorking(state)) return reply(state.paused ? "すでに一時停止中です。" : "制限をかけている進行中のフローはありません。");
+					title = "フローを一時停止して制限を外しますか？";
+					lines.push(
+						`対象: ${current}`,
+						"書き込みの制限・テストのロック・ツールの絞り込みを外します。フローの状態と成果物は残り、「再開して」（/harness resume）で再開できます。",
+					);
+					run = async () => {
+						setState(pauseFlow(state, `ユーザーが一時停止（${params.request}）`), ctx);
+						return { ok: true, message: "フローを一時停止し、制限を外しました。ユーザーの指示に従って作業してください。再開はユーザーが「再開して」と伝えるか /harness resume です。" };
 					};
 					break;
 				}
@@ -2295,11 +2356,11 @@ export default function piHarness(pi: ExtensionAPI): void {
 		},
 	});
 
-	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "answer", "continue", "rejoin", "abort", "pr", "issues", "usage", "models", "config"];
+	const SUBCOMMANDS = ["status", "next", "approve", "revise", "reject", "answer", "continue", "unlock", "resume", "rejoin", "abort", "pr", "issues", "usage", "models", "config"];
 
 	pi.registerCommand("harness", {
 		description:
-			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | answer [仕様の確認への回答] | continue [指示] | rejoin | abort | pr | issues | usage [作業ディレクトリ] | models | config",
+			"piHarness の操作: status | next | approve [コメント] | revise <修正内容> | reject | answer [仕様の確認への回答] | continue [指示] | unlock [理由] | resume [指示] | rejoin | abort | pr | issues | usage [作業ディレクトリ] | models | config",
 		getArgumentCompletions: (prefix) => SUBCOMMANDS.filter((s) => s.startsWith(prefix.trim())).map((s) => ({ value: s, label: s })),
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = args.trim().split(/\s+/);
@@ -2323,6 +2384,10 @@ export default function piHarness(pi: ExtensionAPI): void {
 						}
 						if (state.phase === "escalated") {
 							ctx.ui.notify("エスカレーション中です。/harness continue, /bugfix, /harness abort のいずれかを選んでください。", "warning");
+							return;
+						}
+						if (state.paused) {
+							ctx.ui.notify("フローは一時停止中です。/harness resume で再開してください。", "warning");
 							return;
 						}
 						await startProcessSession(ctx, text || undefined);
@@ -2349,12 +2414,59 @@ export default function piHarness(pi: ExtensionAPI): void {
 						else ctx.ui.notify("却下しました。フローを中止しました。", "info");
 						return;
 					}
-					case "continue": {
-						setState(resumeAfterEscalation(state, limitsOf(cfg)), ctx);
+					case "continue":
+					case "resume": {
+						if (state.phase !== "escalated" && !state.paused) {
+							ctx.ui.notify("エスカレーション中・一時停止中ではないため、再開するものはありません。", "warning");
+							return;
+						}
+						const paused = !!state.paused;
+						const resumed = await resumeWorkflow(ctx, cfg);
+						ctx.ui.notify(resumed, "info");
+						// 一時停止中はユーザーが手で変更しているかもしれないので、それを確かめさせる（エスカレーションからの一時停止も含む）
 						await startProcessSession(
 							ctx,
-							`エスカレーション後にユーザーがループ継続を選択しました（カウンタはリセット済み）。エスカレーション記録を読み、これまでと異なるアプローチで原因を再分析してください。${text ? ` ${text}` : ""}`,
+							paused
+								? `ユーザーが一時停止を解除しました。${resumed} 一時停止中にユーザーが手で変更した可能性があるので、成果物と git status で状態を確かめてから続けてください。${text ? ` ${text}` : ""}`
+								: `エスカレーション後にユーザーがループ継続を選択しました（カウンタはリセット済み）。エスカレーション記録を読み、これまでと異なるアプローチで原因を再分析してください。${text ? ` ${text}` : ""}`,
 						);
+						return;
+					}
+					case "unlock": {
+						compactRequested = false;
+						interruptedForCompaction = false;
+						if (!isActive(state)) {
+							applyProcessTools();
+							ctx.ui.notify("進行中のフローはありません。piHarness の制限はかかっていません。", "info");
+							return;
+						}
+						if (!isWorking(state)) {
+							applyProcessTools();
+							ctx.ui.notify(
+								state.paused
+									? "すでに一時停止中です。制限はかかっていません（再開は /harness resume）。"
+									: `フローは完了しています（${PHASE_LABELS[state.phase]}）。制限はかかっていません。`,
+								"info",
+							);
+							return;
+						}
+						const locks = [
+							`- フェーズ「${PHASE_LABELS[state.phase]}」の書き込みの制限`,
+							state.testLock ? `- テストのロック（${Object.keys(state.testLock.files).length} ファイル）` : "",
+							state.pendingHandoff ? `- 次のプロセス「${PROCESS_LABELS[state.pendingHandoff.to]}」の開始待ち（作業がブロックされる）` : "",
+							"- プロセスごとのツールの絞り込み",
+						].filter(Boolean);
+						if (
+							ctx.hasUI &&
+							!(await ctx.ui.confirm(
+								"フローを一時停止して制限を外しますか？",
+								`${locks.join("\n")}\n\nフローの状態と成果物は残ります。/harness resume で再開できます（そのときのテストを新しいロックとして受け入れます）。`,
+							))
+						) {
+							return;
+						}
+						setState(pauseFlow(state, text || "ユーザーが /harness unlock"), ctx);
+						ctx.ui.notify(`フローを一時停止し、制限を外しました:\n${locks.join("\n")}\n\n再開: /harness resume ／ 中止: /harness abort`, "info");
 						return;
 					}
 					case "rejoin": {

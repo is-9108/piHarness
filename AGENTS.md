@@ -46,6 +46,7 @@ Node 22.19+。TypeScript は型除去で直接実行（ビルドなし）。impo
 
 ## Pi の落とし穴（実装で確認済み）
 
+- 制限（書き込み・テストのロック・ツールの絞り込み・状態の差し込み）は `isWorking(state)` の間だけかける。完了したフェーズや一時停止中にかけると、フローが終わったあとも作業がブロックされたままになる（以前は完了後の新しいセッションで `edit` / `write` が消えていた）。新しい制限を足すときもこれに従い、ユーザーが `/harness unlock` で外せることを確かめる。
 - pi は利用枠の上限（`GoUsageLimitError`・`insufficient_quota` など）を再試行しない → 最後のアシスタントメッセージの `errorMessage` を `agent_settled` で読んで切り替える（`quota.ts`）。仮想モデルの `route()` は再試行のときしか失敗を受け取れないので、この用途には使えない。
 - pi 0.99 以降、MCP ツールは既定で codemode のスクリプトから（有効なツールの設定に関係なく）呼べる → ツールを絞るだけでは書き込みを防げない。`tool_call` で `checkOtherTool` を通す。新しい harness ツールは `exposure: HARNESS_TOOL_EXPOSURE`（`model-only`）で登録する。
 - `/skill:<名前>` はスキル名の後ろが**空白**でないと展開されない（改行は不可）。

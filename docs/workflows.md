@@ -95,7 +95,7 @@ flowchart LR
 | `req_document` | 要件定義書作成 | `hearing.md` から要件定義書・設計概要・Issue 分割案を作成 | 同上 | `harness_request_approval (requirements)`／大きな未確定事項は `open-questions.md` を書いて `req_clarify` へ差し戻し（新セッション） |
 | `req_approval` | 要件定義書作成 | **人間の承認ゲート** | 同上 | 承認ダイアログ または `/harness approve / revise / reject` |
 | `req_issues` | Issue 登録 | 機能単位の小さな Issue を登録（受け入れ条件必須・依存関係付き。本文はテンプレートで組み立て） | 同上 | `harness_create_issues` |
-| `req_done` | Issue 登録 | 完了報告 | 同上 | — |
+| `req_done` | Issue 登録 | 完了報告 | 制限なし | — |
 
 - ヒアリングと要件定義書作成を分けているのは、質問の繰り返しでターン数が多くなる工程に安価なモデルを、
   ドキュメント作成に高性能なモデルを割り当てられるようにするためです（`models.hearing` / `models.requirements`）。
@@ -115,7 +115,7 @@ flowchart LR
 | `impl_review` | 多角的コードレビュー（1 周目フル / 2 周目以降軽量） | `.pi/harness/` のみ | `harness_record_review` |
 | `impl_spec_gap` | **仕様の確認**（ユーザーの回答待ち） | `.pi/harness/` のみ | 回答ダイアログ・`harness_control (answer_spec_gap)`・`/harness answer` |
 | `impl_fix_review` | ブロッキング指摘の修正 | 制限なし | 全テスト green かつ未テスト変更なしで `harness_phase → impl_review` |
-| `impl_done` | 完了（Issue を完了にし、コミット、設定に応じて PR） | `.pi/harness/` のみ | — |
+| `impl_done` | 完了（Issue を完了にし、コミット、設定に応じて PR） | 制限なし（完了後の作業を止めない） | — |
 
 `/impl` の開始時に開始元ブランチ（`main` など）を origin から pull し（`git.pullBase`、早送りのみ）、そこから作業ブランチを作成して、開始時点のコミットを差分の基準として記録します（git リポジトリの場合）。
 レビュー通過時に拡張がコミットし、`git.pr` に従って PR を作成します（既定は確認してから作成）。
@@ -156,10 +156,26 @@ PR 本文・Issue 本文・レビュー記録は日本語のテンプレート�
 |------|------|
 | ループを継続する | カウンタをリセットして元のフェーズへ戻る（レビューループの場合は修正フェーズから、追加で `maxReviewLoops` 周を許可） |
 | 独立したバグ修正フローで対応する | 実装フローを退避して `/bugfix` と同じフローを開始 |
-| 手動で対応する | フローを一時停止。後で `/harness continue` や `/bugfix` で再開 |
+| 手動で対応する | フローを**一時停止**（下記）。書き込みの制限とテストのロックを外すので、ユーザーやエージェントが自由に直せる。後で `/harness resume`（`/harness continue`）や `/bugfix` で再開 |
 | フローを中止する | フロー終了 |
 
 UI がない場合（RPC/print モード）は停止してユーザーに報告し、コマンドでの判断を待ちます。
+
+## 完了と一時停止（制限がかからない状態）
+
+フローが**完了**したフェーズ（`req_done`・`impl_done`・`bug_done`・`doc_done`）と、**一時停止**中のフローは、エージェントの作業を制御しません。
+状態は残すので `/harness status`・`/harness pr`・合流（`/harness rejoin`）は使えますが、書き込みの制限・テストのロック・プロセスごとのツールの絞り込み・状態の差し込みはかけません。
+完了したあとに同じプロジェクトで普段の作業をしても、ブロックされません。
+
+一時停止は、想定外のことが起きて作業が進まなくなったときの逃げ道です。
+
+| 操作 | 内容 |
+|---|---|
+| エスカレーションで「手動で対応する」を選ぶ / `/harness unlock [理由]` / 「一時停止して」 | フローを一時停止する。次のセッション待ち（`pendingHandoff`）と圧縮の予約も取り消す |
+| `/harness resume [指示]` / 「再開して」 | 一時停止を解除する（エスカレーション中ならループの継続も兼ねる）。一時停止中に変わったテストは、ロック時の内容に戻さず**今の内容でロックし直し**、`test-changes.md` に記録してレビューで検証する。コードが変わっている可能性があるので「未テストの変更あり」にし、新しいセッションで再開する |
+| `/harness abort` | フローを中止する（ロックも消える） |
+
+一時停止はユーザーの操作でだけ行います（エージェントは自分からは一時停止を提案しないよう指示しています）。
 
 ## 3. バグ修正フロー
 
@@ -168,7 +184,7 @@ UI がない場合（RPC/print モード）は停止してユーザーに報告�
 | `bug_reproduce` | バグを再現するテストを書き、red を確認 | 制限なし | `harness_phase → bug_analyze` |
 | `bug_analyze` | 根本原因分析、バグレポート作成 | `.pi/harness/` のみ | `harness_phase → bug_fix`（再現が不十分なら `bug_reproduce` へ） |
 | `bug_fix` | 最小修正、全テスト green | 制限なし | 全テスト green かつ未テスト変更なしで `harness_phase → bug_done`（再分析なら `bug_analyze` へ） |
-| `bug_done` | 完了 → 合流 | `.pi/harness/` のみ | 合流先があれば確認後 `impl_review` へ |
+| `bug_done` | 完了 → 合流 | 制限なし | 合流先があれば確認後 `impl_review` へ |
 
 - 実装フロー中（エスカレーション中を含む）に起動すると、その Issue とフェーズを退避し、完了後に **`impl_review` から** 合流します。
   バグ修正でコードが変わっているため、レビューカウンタをリセットしてフルレビューから行います（テストは bug_fix の最後で合格済み）。
@@ -186,7 +202,7 @@ UI がない場合（RPC/print モード）は停止してユーザーに報告�
 | `doc_write` | 構成案どおりに執筆、`doc-report.md` を作成 | ドキュメントのみ（`.md` 等と `docsDir` 配下） | `doc-report.md` があり、開始時点からの変更がドキュメントだけで `harness_phase → doc_review` |
 | `doc_review` | ドキュメントの観点でレビュー（1 周目フル / 2 周目以降は差分だけ） | `.pi/harness/` のみ | `harness_record_review` |
 | `doc_fix` | ブロッキング指摘の修正、`fix-N.md` を作成 | ドキュメントのみ | `fix-N.md` があり、変更がドキュメントだけで `harness_phase → doc_review` |
-| `doc_done` | 完了（ドキュメントをコミット、設定に応じて PR） | `.pi/harness/` のみ | — |
+| `doc_done` | 完了（ドキュメントをコミット、設定に応じて PR） | 制限なし | — |
 
 - 「変更がドキュメントだけ」は、エージェントの申告ではなく `git diff <基準>`（未追跡ファイルを含む）で判定します。bash でコードを変えていれば遷移を拒否します。
 - テストのツールは有効にしません。`harness_record_review` は使えますが、仕様の確認（specGaps）は使いません。
