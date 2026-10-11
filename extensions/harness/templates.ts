@@ -9,8 +9,8 @@ import { join } from "node:path";
 import type { IssueDraft } from "./issues.ts";
 import type { Baseline, FlakyRecord, ReviewFinding, ReviewRound, SpecGap } from "./state.ts";
 
-export type TemplateName = "issue" | "pr" | "review" | "adr" | "pr-docs";
-export const TEMPLATE_NAMES: TemplateName[] = ["issue", "pr", "review", "adr", "pr-docs"];
+export type TemplateName = "issue" | "pr" | "review" | "adr" | "pr-docs" | "pr-config";
+export const TEMPLATE_NAMES: TemplateName[] = ["issue", "pr", "review", "adr", "pr-docs", "pr-config"];
 
 const NONE = "なし";
 
@@ -323,6 +323,36 @@ export function docPrVars(args: {
 		reviews: reviewHistoryMarkdown(args.history, args.remaining),
 		reviewFocus: extractSection(args.report, "レビューで特に見てほしい点") ?? NONE,
 		limitations: extractSection(args.report, "未確定") ?? NONE,
+		usage: args.usage ?? "",
+		closes: args.issue?.number ? `Closes #${args.issue.number}` : "",
+	};
+}
+
+/**
+ * 設定変更フローの PR 本文（templates/pr-config.md）の値。
+ * 目的・変更内容・影響範囲・戻し方は変更の計画（change-plan.md）の同名の見出しから取る。
+ */
+export function configPrVars(args: {
+	plan: string;
+	issue?: { number?: number; title: string; url?: string };
+	topic?: string;
+	approvedFiles: string[];
+	changedFiles: string[];
+	approval?: { decision: string; comment?: string; at: string };
+	usage?: string;
+}): Record<string, string> {
+	const section = (h: string) => extractSection(args.plan, h) ?? "（変更の計画に記載なし）";
+	return {
+		summary: section("目的"),
+		issue: args.issue ? issueLine(args.issue) : (args.topic ?? NONE),
+		changes: section("変更内容"),
+		approvedFiles: bullets(args.approvedFiles.map((f) => `\`${f}\``)),
+		changedFiles: bullets(args.changedFiles.map((f) => `\`${f}\``)),
+		impact: section("影響範囲"),
+		rollback: section("戻し方"),
+		approval: args.approval
+			? `${args.approval.at} にユーザーが承認${args.approval.comment ? `（コメント: ${args.approval.comment}）` : ""}`
+			: NONE,
 		usage: args.usage ?? "",
 		closes: args.issue?.number ? `Closes #${args.issue.number}` : "",
 	};

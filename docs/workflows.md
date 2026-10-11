@@ -1,6 +1,6 @@
 # ワークフロー仕様
 
-piHarness が制御する 4 つのフローの仕様です。フェーズ遷移はすべて `extensions/harness/state.ts` の状態機械で検証され、
+piHarness が制御する 5 つのフローの仕様です。フェーズ遷移はすべて `extensions/harness/state.ts` の状態機械で検証され、
 エージェントは `harness_*` ツール経由でしか進められません。
 
 ## セッションと成果物
@@ -21,6 +21,7 @@ piHarness が制御する 4 つのフローの仕様です。フェーズ遷移�
 | ドキュメント執筆 | doc_write | `outline.md`, `issue.md` | ドキュメント, `doc-report.md` |
 | ドキュメントレビュー（周回ごと） | doc_review | `outline.md`, `doc-report.md`（2 周目以降は `review-N.md`, `fix-N.md`, `delta-N.diff`） | `review-N.md` |
 | ドキュメントの指摘修正（周回ごと） | doc_fix | `review-N.md`, `doc-report.md`, `outline.md` | ドキュメント, `fix-N.md` |
+| 設定変更（計画と変更を 1 セッション） | cfg_plan → cfg_plan_approval → cfg_apply | 依頼の内容, `issue.md`（Issue のとき） | `change-plan.md`（承認対象）, 承認したファイル |
 
 成果物は作業項目ごとのディレクトリに置かれます（Issue 登録先の要件定義書は `docs/`）。
 
@@ -56,7 +57,7 @@ piHarness が制御する 4 つのフローの仕様です。フェーズ遷移�
 5. 新しいセッションの開始時に、`.pi/harness.json` の `models` からそのプロセス用のモデル・思考レベルを適用します（例: レビューだけ高性能モデル）。
 
 次のプロセスへ進む前に出力成果物が必須です（`implementation.md` / `fix-N.md` / `bug-N.md` / `plan.md` / `outline.md` / `doc-report.md` が無いと遷移を拒否）。
-`/req`, `/impl`, `/bugfix`, `/doc` もそれぞれ新しいセッションで開始します。pi を再起動した場合は `/harness next` で現在のプロセスを新しいセッションとして再開できます。
+`/req`, `/impl`, `/bugfix`, `/doc`, `/cfg` もそれぞれ新しいセッションで開始します。pi を再起動した場合は `/harness next` で現在のプロセスを新しいセッションとして再開できます。
 
 エスカレーション中の判断（ループ継続を選んだ場合）は同じセッションで続けます。後から `/harness continue` で継続した場合は、
 `escalation-N.md` を入力とする新しいセッションで再開します。
@@ -208,6 +209,22 @@ UI がない場合（RPC/print モード）は停止してユーザーに報告�
 - テストのツールは有効にしません。`harness_record_review` は使えますが、仕様の確認（specGaps）は使いません。
 - レビューループの上限でエスカレーションした場合の選択肢は、継続 / 手動対応 / 中止です（バグ修正フローは選べません）。継続すると `doc_fix` から再開します。
 - 完了時のコミットの件名は `ドキュメント: <テーマ>`（Issue なら `(#N)` と `Closes #N`）。PR の本文は `templates/pr-docs.md` で組み立てます。
+
+## 5. 設定変更フロー
+
+設定ファイルを変えるだけのフローです。テストもレビューも無く、変更の計画の承認だけで、コミット・PR まで進めます。
+
+| フェーズ | 内容 | 書き込み可能 | 次へ進む方法 |
+|---------|------|-------------|-------------|
+| `cfg_plan` | 変更の計画 `change-plan.md` を作成 | `.pi/harness/` のみ | `harness_request_approval (change, files)` |
+| `cfg_plan_approval` | **人間の承認ゲート**（変更するファイルもここで確定） | `.pi/harness/` のみ | 承認ダイアログ または `/harness approve` |
+| `cfg_apply` | 承認したファイルを計画どおりに変更 | 承認したファイルのみ | 変更が承認したファイルだけで、`.json` が読めれば `harness_phase → cfg_done` |
+| `cfg_done` | 完了（コミット・PR） | 制限なし | — |
+
+- 計画・承認・変更は同じプロセス（セッション）です。`/harness approve` で承認した場合は、新しいセッションで変更から始めます。
+- 範囲の確認は、エージェントの申告ではなく `git diff <基準>`（未追跡ファイルを含む）で行います。
+- `git.pr: ask` でも PR の作成は確認しません（承認ダイアログで「PR の作成まで行う」と伝えて承認を得ている）。`off` なら作りません。
+- ループが無いのでエスカレーションはありません。やめるときは「やめたい」（`/harness abort`）。
 
 ## 状態の永続化
 

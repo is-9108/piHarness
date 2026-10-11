@@ -45,6 +45,12 @@ const NEXT: Record<Phase, string> = {
 		"開始時のスキルに従ってドキュメントをレビューし（正確さはコードや情報源で確かめる）、harness_record_review で結果を記録する。レビュー中はファイルを変更しない。",
 	doc_fix: "ブロッキング指摘を修正し、指摘ごとの対応を fix-<周回>.md に書いてから harness_phase で doc_review へ戻る。",
 	doc_done: "ドキュメント作成フロー完了。作成・更新したドキュメント・レビュー結果・コミット/PR をユーザーに報告する。",
+	cfg_plan:
+		"skill harness-config に従い、変更する設定ファイルと内容を change-plan.md に書き、harness_request_approval (kind: change、files に変更するファイル) で承認を得る。まだファイルは変更しない。",
+	cfg_plan_approval: "設定変更の計画の承認待ち。承認されるまでファイルを変更しない。",
+	cfg_apply:
+		"承認された計画のファイルだけを計画どおりに変更する（ほかのファイルは変更できない。テスト・レビューは無い）。終わったら harness_phase で cfg_done へ（拡張が範囲を確かめてコミット・PR まで行う）。",
+	cfg_done: "設定変更フロー完了。変更したファイル・コミット/PR をユーザーに報告する。",
 	escalated: "ユーザーへエスカレーション中。自分で作業を続けず、状況と選択肢を報告してユーザーの判断を待つ。",
 };
 
@@ -89,6 +95,9 @@ export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO
 		}
 	}
 	if (s.flow === "docs") lines.push("ドキュメント作成フロー: 変更できるのはドキュメント（.md など）だけ。テストは実行しない。");
+	if (s.flow === "config") {
+		lines.push(`設定変更フロー: テスト・レビューは無い。${s.changeFiles?.length ? `変更できるのは承認されたファイルだけ: ${s.changeFiles.join(", ")}` : "変更するファイルは計画の承認で決まる"}`);
+	}
 	if (s.flow === "implement" || s.flow === "docs") {
 		lines.push(`レビューループ: ${s.review.round}/${s.review.max} 周実施済み（次回: ${reviewMode(s) === "full" ? "フルレビュー" : "軽量レビュー"}）`);
 	}

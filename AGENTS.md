@@ -1,6 +1,6 @@
 # AGENTS.md — piHarness の開発ガイド
 
-pi-coding-agent の拡張 + Skill。要件定義 → TDD 実装 → レビュー（＋バグ修正、ドキュメントだけの作成）を**状態機械とゲートで強制**する。
+pi-coding-agent の拡張 + Skill。要件定義 → TDD 実装 → レビュー（＋バグ修正、ドキュメントだけの作成、設定だけの変更）を**状態機械とゲートで強制**する。
 利用者向けの説明は README.md、仕様は docs/workflows.md、設計の理由は docs/architecture.md。
 
 ## 構成
@@ -11,7 +11,7 @@ pi-coding-agent の拡張 + Skill。要件定義 → TDD 実装 → レビュー
 | `extensions/harness/state.ts` | 状態機械（フェーズ・承認・ループ・エスカレーション・プロセス境界）。**純粋関数** |
 | `extensions/harness/handoff.ts` | プロセス間の引き継ぎ（成果物パス・入力/参照/出力・開始メッセージ） |
 | `extensions/harness/*.ts` | guard（書き込み制限）/ git / integrity（テスト保護）/ testlock（テストのロック）/ failures（失敗の指紋・ベースライン）/ progress（Issue 進捗）/ usage / tools / compaction / dashboard（TUI 表示）/ templates（Issue・PR・レビュー記録の組み立て）/ adr（設計判断の記録と一覧）/ config |
-| `templates/{issue,pr,review,adr}.md` | 外に出す文書のテンプレート（プロジェクトの `<workDir>/templates/` で上書き可） |
+| `templates/{issue,pr,pr-docs,pr-config,review,adr}.md` | 外に出す文書のテンプレート（プロジェクトの `<workDir>/templates/` で上書き可） |
 | `skills/harness-*/SKILL.md` | プロセスごとの手順（1 プロセス = 1 スキル、各 2〜3KB に保つ） |
 | `scripts/install.mjs` | 全プロジェクト共通の登録（`pi install`）と、プロジェクトの設定（`.pi/harness.json`・`.gitignore`）の用意 |
 | `test/*.test.ts` / `test/e2e/*.ts` | ユニットテスト / 偽モデルで実際の Pi を動かす E2E（natural.ts は確認ダイアログをスクリプトで応答） |

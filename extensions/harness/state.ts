@@ -6,9 +6,10 @@
  *   2. implement   : Issue/コード読込 → テスト・実装プラン → 承認 → TDD → テストループ → レビューループ
  *   3. bugfix      : エスカレーション時にユーザー判断で起動する独立したバグ修正フロー（完了後 implement へ合流）
  *   4. docs        : ドキュメントだけを作る・直すフロー（構成案 → 承認 → 執筆 → レビューループ。テストは無い）
+ *   5. config      : 設定ファイルを変えるだけのフロー（変更計画 → 承認 → 変更 → コミット・PR。テストもレビューも無い）
  */
 
-export type FlowKind = "requirements" | "implement" | "bugfix" | "docs";
+export type FlowKind = "requirements" | "implement" | "bugfix" | "docs" | "config";
 
 export type Phase =
 	| "idle"
@@ -39,10 +40,15 @@ export type Phase =
 	| "doc_review"
 	| "doc_fix"
 	| "doc_done"
+	// config（設定変更。承認した計画のファイルだけを変え、テスト・レビューなしでコミット・PR まで行う）
+	| "cfg_plan"
+	| "cfg_plan_approval"
+	| "cfg_apply"
+	| "cfg_done"
 	// 共通
 	| "escalated";
 
-export type ApprovalKind = "requirements" | "plan" | "outline";
+export type ApprovalKind = "requirements" | "plan" | "outline" | "change";
 export type ApprovalDecision = "approved" | "revise" | "rejected";
 
 export interface ApprovalRecord {
@@ -162,7 +168,8 @@ export type ProcessKind =
 	| "doc_plan"
 	| "doc_write"
 	| "doc_review"
-	| "doc_fix";
+	| "doc_fix"
+	| "config";
 
 export interface PendingHandoff {
 	from: ProcessKind | null;
@@ -214,6 +221,8 @@ export interface HarnessState {
 	 * 一時停止中は書き込みの制限・テストのロック・ツールの絞り込みをかけない。再開は /harness resume。
 	 */
 	paused?: { at: string; reason: string };
+	/** 設定変更フローで、承認された計画が変えてよいとしたファイル（cwd からの相対パス）。これ以外は変更できない */
+	changeFiles?: string[];
 	/** Git 連携の情報（作業ブランチ・差分の基準・コミット・PR） */
 	git?: GitInfo;
 	/** ユーザー/エージェントが理由を記録したうえで許可したテストの変更（同じ内容を二度確認しない） */
@@ -286,6 +295,7 @@ export function flowOf(phase: Phase): FlowKind | null {
 	if (phase.startsWith("impl_")) return "implement";
 	if (phase.startsWith("bug_")) return "bugfix";
 	if (phase.startsWith("doc_")) return "docs";
+	if (phase.startsWith("cfg_")) return "config";
 	return null;
 }
 
@@ -294,7 +304,7 @@ export function isActive(s: HarnessState): boolean {
 }
 
 /** フローの作業が終わったフェーズ（状態は /harness pr や合流のために残すが、もう何も制限しない） */
-export const DONE_PHASES: Phase[] = ["req_done", "impl_done", "bug_done", "doc_done"];
+export const DONE_PHASES: Phase[] = ["req_done", "impl_done", "bug_done", "doc_done", "cfg_done"];
 
 /**
  * フローがエージェントの作業を制御している（書き込みの制限・テストのロック・ツールの絞り込みをかける）か。
@@ -357,6 +367,18 @@ export function startDocs(prev: HarnessState, topic: string, issue: IssueRef | u
 	return withLog(s, `ドキュメント作成フロー開始: ${issue ? describeIssue(issue) : topic || "(テーマ未指定)"}`);
 }
 
+/** 設定変更フローを開始する。Issue が対象なら issue に、内容だけなら topic に入れる */
+export function startConfigChange(prev: HarnessState, topic: string, issue: IssueRef | undefined, limits: Limits, itemDir: string): HarnessState {
+	const s = initialState(limits);
+	s.itemDir = itemDir;
+	s.flow = "config";
+	s.phase = "cfg_plan";
+	s.topic = topic || issue?.title;
+	s.issue = issue;
+	s.log = prev.log.slice();
+	return withLog(s, `設定変更フロー開始: ${issue ? describeIssue(issue) : topic || "(内容未指定)"}`);
+}
+
 /**
  * バグ修正フローを開始する。実装フロー中（エスカレーション含む）であれば、その状態を退避し完了後に合流する。
  */
@@ -407,6 +429,8 @@ const FREE_TRANSITIONS: Partial<Record<Phase, Phase[]>> = {
 	// ドキュメントにはテストが無いので、執筆・修正からレビューへは成果物（doc-report.md / fix-N.md）だけを条件に進める
 	doc_write: ["doc_review"],
 	doc_fix: ["doc_review"],
+	// 設定変更: テストもレビューも無い。変更したファイルが承認した範囲かどうかは拡張が git の差分で確かめる
+	cfg_apply: ["cfg_done"],
 };
 
 /** テスト合格（かつ未変更）を条件に許可される遷移 */
@@ -464,6 +488,7 @@ const APPROVAL_GATES: Record<ApprovalKind, { label: string; draft: Phase; waitin
 	requirements: { label: "要件定義", draft: "req_document", waiting: "req_approval", approved: "req_issues" },
 	plan: { label: "テスト/実装プラン", draft: "impl_plan", waiting: "impl_plan_approval", approved: "impl_tdd" },
 	outline: { label: "ドキュメントの構成案", draft: "doc_outline", waiting: "doc_outline_approval", approved: "doc_write" },
+	change: { label: "設定変更の計画", draft: "cfg_plan", waiting: "cfg_plan_approval", approved: "cfg_apply" },
 };
 
 export function approvalLabel(kind: ApprovalKind): string {
@@ -475,12 +500,17 @@ export function approvalKindFor(phase: Phase): ApprovalKind | undefined {
 	return (Object.keys(APPROVAL_GATES) as ApprovalKind[]).find((k) => [APPROVAL_GATES[k].draft, APPROVAL_GATES[k].waiting].includes(phase));
 }
 
-export function beginApproval(prev: HarnessState, kind: ApprovalKind, documents: string[]): HarnessState {
+/** files: 設定変更の計画（kind: change）で、変えてよいファイル。承認されるとこれ以外は変更できない */
+export function beginApproval(prev: HarnessState, kind: ApprovalKind, documents: string[], files?: string[]): HarnessState {
 	const gate = APPROVAL_GATES[kind];
 	if (![gate.draft, gate.waiting].includes(prev.phase)) {
 		throw new TransitionError(`${gate.label}の承認は ${gate.draft} フェーズでのみ依頼できます（現在: ${prev.phase}）。`);
 	}
 	const s = clone(prev);
+	if (kind === "change") {
+		if (!files?.length) throw new TransitionError("設定変更の計画には、変更するファイル（files）を 1 つ以上指定してください。");
+		s.changeFiles = unique(files);
+	}
 	s.phase = gate.waiting;
 	if (kind === "requirements") s.artifacts.docs = unique([...s.artifacts.docs, ...documents]);
 	else if (documents[0]) s.artifacts.plan = documents[0];
@@ -922,6 +952,10 @@ const PROCESS_OF: Record<Exclude<Phase, "idle" | "escalated">, ProcessKind> = {
 	doc_review: "doc_review",
 	doc_fix: "doc_fix",
 	doc_done: "doc_review",
+	cfg_plan: "config",
+	cfg_plan_approval: "config",
+	cfg_apply: "config",
+	cfg_done: "config",
 };
 
 /** フェーズが属するプロセス。エスカレーション中はエスカレーション元のプロセスに留まる */
@@ -986,6 +1020,10 @@ export const PHASE_LABELS: Record<Phase, string> = {
 	doc_review: "ドキュメントレビュー",
 	doc_fix: "レビュー指摘修正（ドキュメント）",
 	doc_done: "ドキュメント作成完了",
+	cfg_plan: "設定変更の計画",
+	cfg_plan_approval: "設定変更の承認待ち",
+	cfg_apply: "設定変更",
+	cfg_done: "設定変更完了",
 	escalated: "エスカレーション中",
 };
 

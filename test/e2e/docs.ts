@@ -2,6 +2,7 @@
  * E2E: ドキュメント作成フロー。実際の Pi セッションランタイムに piHarness を読み込み、偽モデルで
  * 構成案 → 承認 → 執筆 → レビュー → 指摘修正 → 軽量レビュー → コミット までを通す。
  * テストのツールは使わず、ドキュメント以外の変更はブロックされ、レビュー前に git の差分でも確かめられることを検証する。
+ * 続けて設定変更フロー（計画 → 承認 → 承認したファイルだけを変更 → テスト・レビューなしでコミット・PR）も通す。
  *
  *   npm run test:e2e
  */
@@ -42,6 +43,7 @@ writeFileSync(join(project, ".gitignore"), ".pi/harness/state.json\n.pi/harness/
 mkdirSync(join(project, "src"));
 writeFileSync(join(project, "src/app.js"), "// --port で待ち受けポートを指定する\n");
 writeFileSync(join(project, "README.md"), "# demo\n");
+writeFileSync(join(project, "config.json"), '{ "port": 8080 }\n');
 
 const faux = fauxProvider({ models: [{ id: "worker" }, { id: "reviewer", reasoning: true }, { id: "cheap" }] });
 // プロセスごとのモデル設定: レビューだけ別モデル + 高い思考レベル、それ以外は default
@@ -241,6 +243,54 @@ assert.equal(state.test.runs, 0, "テストは一度も実行しない");
 assert.match(git("log", "-1", "--format=%B"), /^ドキュメント: 導入手順[\s\S]*ドキュメント作成フローで作成/);
 assert.deepEqual(git("show", "--name-only", "--format=", "HEAD").split("\n").sort(), ["README.md", "docs/setup.md"]);
 assert.ok(r.some((x) => /^6:harness_record_review: .*ドキュメント作成フロー完了/.test(x)));
+
+// ---------------------------------------------------------------------------
+// 設定変更フロー: 計画 → 承認 → 変更 → コミット・PR（テスト・レビューなし。承認したファイルだけ変更できる）
+// ---------------------------------------------------------------------------
+const cfgItem = `.pi/harness/config-${new Date().toISOString().slice(0, 10)}-ポートを9090に変更`;
+const c = (f: string) => `${cfgItem}/${f}`;
+r = await run("/cfg ポートを9090に変更", [
+	call("write", { path: "config.json", content: "{}" }), // 計画の承認前 → ブロック
+	call("write", { path: c("change-plan.md"), content: "# 計画\n\n## 目的\n\n既定のポートを変える。\n\n## 変更内容\n\n- `config.json` の `port`: 8080 → 9090\n\n## 影響範囲\n\n- src/app.js\n\n## 戻し方\n\n- revert する\n" }),
+	call("harness_request_approval", { kind: "change", summary: "port を 9090 にする", documents: [c("change-plan.md")] }), // files が無い → 拒否
+	call("harness_request_approval", { kind: "change", summary: "port を 9090 にする", documents: [c("change-plan.md")], files: ["config.json"] }),
+]);
+for (const x of r) console.log("  ", x);
+const cfgSession = sessionNo;
+assert.match(firstUserText(runtime.session), /<skill name="harness-config"/);
+assert.match(git("rev-parse", "--abbrev-ref", "HEAD"), /^config-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}$/);
+assert.match(errorsOf(r, cfgSession)[0], /計画が承認されるまでファイルは変更できません/);
+assert.match(errorsOf(r, cfgSession)[1], /変更するファイル（files）/);
+assert.ok(!toolsOf(cfgSession).includes("harness_run_tests") && !toolsOf(cfgSession).includes("harness_record_review"));
+
+r = await run("/harness approve", [
+	call("write", { path: "src/app.js", content: "x" }), // 承認していないファイル → ブロック
+	call("write", { path: "config.json", content: '{ "port": 9090' }),
+	call("harness_phase", { to: "cfg_done" }), // JSON が壊れている → 拒否
+	call("write", { path: "config.json", content: '{\n  // 既定のポート\n  "port": 9090,\n}\n' }), // コメント・末尾のカンマは許す
+	call("bash", { command: "echo '// bash で変更' >> src/app.js" }),
+	call("harness_phase", { to: "cfg_done" }), // 承認していないファイルが変わっている → 拒否
+	call("bash", { command: "git checkout -- src/app.js" }),
+	call("harness_phase", { to: "cfg_done" }),
+	done("完了"),
+]);
+for (const x of r) console.log("  ", x);
+const applySession = sessionNo;
+const ea = errorsOf(r, applySession);
+assert.equal(ea.length, 3);
+assert.match(ea[0], /承認された計画のファイルだけを変更できます.*対象: src\/app\.js/);
+assert.match(toolTexts[toolResults.indexOf(ea[1])], /JSON として読めないファイル[\s\S]*- config\.json:/);
+assert.match(ea[2], /承認された計画にないファイルが変更されています: src\/app\.js/);
+const finished = r.find((x) => x.startsWith(`${applySession}:harness_phase: 設定変更フロー完了`));
+assert.ok(finished, "承認後はテスト・レビューなしで完了する");
+const finishedText = toolTexts[toolResults.indexOf(finished!)];
+assert.match(finishedText, /PR を作成できませんでした: git push/, "PR は確認ダイアログなしで作成しようとする（このテストには origin が無いので push で失敗する）");
+const cfgState = JSON.parse(readFileSync(join(project, ".pi/harness/state.json"), "utf8"));
+assert.equal(cfgState.phase, "cfg_done");
+assert.deepEqual(cfgState.changeFiles, ["config.json"]);
+assert.equal(cfgState.test.runs, 0);
+assert.match(git("log", "-1", "--format=%B"), /^設定変更: ポートを9090に変更[\s\S]*設定変更フローで作成/);
+assert.deepEqual(git("show", "--name-only", "--format=", "HEAD").split("\n"), ["config.json"]);
 
 await runtime.dispose();
 console.log(`E2E docs: OK (${sessionNo} sessions)`);

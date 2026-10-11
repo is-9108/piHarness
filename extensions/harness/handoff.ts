@@ -46,6 +46,8 @@ export interface ArtifactPaths {
 	outline: string;
 	/** ドキュメントの執筆レポート（レビュー担当への引き継ぎ） */
 	docReport: string;
+	/** 設定変更の計画（承認対象。PR 本文にも使う） */
+	changePlan: string;
 }
 
 export function artifactPaths(itemDir: string): ArtifactPaths {
@@ -72,6 +74,7 @@ export function artifactPaths(itemDir: string): ArtifactPaths {
 		testLock: join(itemDir, "test-lock"),
 		outline: join(itemDir, "outline.md"),
 		docReport: join(itemDir, "doc-report.md"),
+		changePlan: join(itemDir, "change-plan.md"),
 	};
 }
 
@@ -123,6 +126,7 @@ export const PROCESS_LABELS: Record<ProcessKind, string> = {
 	doc_write: "ドキュメント執筆",
 	doc_review: "ドキュメントレビュー",
 	doc_fix: "ドキュメントのレビュー指摘修正",
+	config: "設定変更",
 };
 
 const SKILL_OF: Record<ProcessKind, string> = {
@@ -138,6 +142,7 @@ const SKILL_OF: Record<ProcessKind, string> = {
 	doc_write: "harness-doc-write",
 	doc_review: "harness-doc-review",
 	doc_fix: "harness-doc-fix",
+	config: "harness-config",
 };
 
 /** プロセスに対応するスキル。レビューは 1 周目（フル）と 2 周目以降（軽量）で別のスキルにして読み込み量を減らす */
@@ -296,6 +301,12 @@ export function processIO(s: HarnessState, exists: (path: string) => boolean, op
 			for (let r = 1; r < s.review.round; r++) ref(p.fix(r), `レビュー ${r} 周目の対応記録`);
 			outputs.push({ path: p.fix(s.review.round), why: "指摘ごとの対応記録（レビューへ戻る前に必須）" });
 			break;
+		case "config":
+			add(p.issue, "対象 Issue の本文");
+			add(p.changePlan, "設定変更の計画（承認後はこのとおりに変更する）");
+			outputs.push({ path: p.changePlan, why: "設定変更の計画（承認対象。変更するファイルは承認時に files で指定する）" });
+			outputs.push({ path: "計画に書いた設定ファイル", why: "承認後に変更する（承認したファイル以外は変更できない）" });
+			break;
 		case "bugfix":
 			add(p.escalation(s.counters.escalations), `エスカレーション記録 #${s.counters.escalations}`);
 			add(s.test.lastLog, "直近のテストログ");
@@ -359,7 +370,7 @@ export function kickoffMessage(s: HarnessState, exists: (path: string) => boolea
 /** コードを扱うプロセスで、どこからの差分を見るべきかの案内 */
 export function diffInstruction(s: HarnessState): string | undefined {
 	const proc = processOf(s);
-	if (!s.git?.base || !proc || !["implement", "review", "fix", "bugfix", "doc_write", "doc_review", "doc_fix"].includes(proc)) return undefined;
+	if (!s.git?.base || !proc || !["implement", "review", "fix", "bugfix", "doc_write", "doc_review", "doc_fix", "config"].includes(proc)) return undefined;
 	const short = s.git.base.slice(0, 12);
 	return `変更の差分: \`git diff ${short}\`（実装開始時点 ${short} からの変更。未コミット分を含む）と \`git status\`（新規ファイル）${s.git.branch ? `／作業ブランチ: ${s.git.branch}` : ""}`;
 }
