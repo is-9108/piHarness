@@ -130,6 +130,20 @@ describe("guard", () => {
 		assert.equal(checkOtherTool(initialState(), { name: "mcp__fs__write_file" }, paths).block, false, "フロー外では制限しない");
 	});
 
+	it("完了したフロー・一時停止中のフローは書き込みを制限しない（状態ファイルの保護は続ける）", () => {
+		const base = startImplement(initialState(), { title: "x" }, DEFAULT_LIMITS, ".pi/harness/issue-1");
+		for (const phase of ["impl_done", "req_done", "bug_done", "doc_done"] as const) {
+			assert.equal(checkWrite({ ...base, phase }, "src/a.ts", paths).block, false, phase);
+			assert.equal(checkOtherTool({ ...base, phase }, { name: "mcp__fs__write_file" }, paths).block, false, phase);
+		}
+		const paused = { ...transition(base, "impl_plan"), paused: { at: "", reason: "手で直す" } };
+		assert.equal(checkWrite(paused, "src/a.ts", paths).block, false);
+		assert.equal(checkWrite(paused, "docs/adr/0001-x.md", { ...paths, adrDir: "docs/adr" }).block, false);
+		assert.equal(checkOtherTool(paused, { name: "mcp__fs__write_file" }, paths).block, false);
+		assert.equal(checkWrite(paused, ".pi/harness/state.json", paths).block, true, "状態ファイルは一時停止中も直接編集させない");
+		assert.equal(checkWrite({ ...paused, paused: undefined }, "src/a.ts", paths).block, true, "再開したら制限が戻る");
+	});
+
 	it("作業ファイル判定", () => {
 		assert.equal(isHarnessFile(".pi/harness/logs/a.log", paths), true);
 		assert.equal(isHarnessFile("src/a.ts", paths), false);

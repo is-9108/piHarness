@@ -95,6 +95,7 @@ export function buildContext(s: HarnessState, cfg: HarnessConfig, io?: ProcessIO
 	if (s.bug) lines.push(`バグ: ${s.bug.description}`);
 	if (s.suspended) lines.push(`合流予定の実装フロー: ${describeIssue(s.suspended.issue)}（退避フェーズ ${s.suspended.phase}）`);
 	if (s.escalation) lines.push(`エスカレーション理由: ${s.escalation.detail}`);
+	if (s.paused) lines.push(`一時停止中（${s.paused.reason}）: 書き込みの制限・テストのロックはかかっていない。ユーザーの指示に従って作業し、再開はユーザーが /harness resume で行う。`);
 	const pending = (s.specGaps ?? []).filter((g) => !g.answer);
 	if (s.phase === "impl_spec_gap" && pending.length) {
 		lines.push("ユーザーの回答待ちの仕様の確認:");

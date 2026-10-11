@@ -28,6 +28,10 @@ import {
 	processOf,
 	recordFlaky,
 	withHandoff,
+	finishFlow,
+	isWorking,
+	pauseFlow,
+	resumePaused,
 } from "../extensions/harness/state.ts";
 
 const L = DEFAULT_LIMITS;
@@ -387,5 +391,41 @@ describe("仕様の確認（spec_gap）", () => {
 	it("解釈が 1 つしかないものは質問にしない", () => {
 		const r = recordReview(toReview(), [], "s", undefined, [{ ...gap, interpretations: ["一つだけ"] }]);
 		assert.equal(r.outcome.kind, "clean");
+	});
+});
+
+describe("完了・一時停止したフローは作業を制御しない", () => {
+	it("レビューを通って完了したら、制御をやめてテストのロックも外す（状態は /harness pr のために残す）", () => {
+		let s = lockTests(toReview(), "review", { "a.test.ts": "h" });
+		assert.equal(isWorking(s), true);
+		s = recordReview(s, [nit], "ok").state;
+		assert.equal(s.phase, "impl_done");
+		assert.equal(isWorking(s), false);
+		assert.equal(s.testLock, undefined);
+		assert.equal(s.flow, "implement", "フローの状態は残る");
+	});
+
+	it("一時停止すると制御をやめ、再開で元に戻る。次のセッション待ちも解除する", () => {
+		let s = withHandoff(toTdd(), transition(recordTestRun(toTdd(), "green", true).state, "impl_review"));
+		assert.ok(s.pendingHandoff);
+		s = pauseFlow(s, "手で直す");
+		assert.equal(isWorking(s), false);
+		assert.equal(s.pendingHandoff, undefined);
+		assert.equal(s.paused?.reason, "手で直す");
+		s = resumePaused(s);
+		assert.equal(isWorking(s), true);
+		assert.throws(() => resumePaused(s), /一時停止中ではありません/);
+		assert.throws(() => pauseFlow(initialState(), "x"), /進行中のフローがありません/);
+	});
+
+	it("エスカレーション中の一時停止は、ループの継続で解除される。中止でロックと一時停止も消える", () => {
+		let s = pauseFlow(escalate(lockTests(toTdd(), "green", { "a.test.ts": "h" }), "manual", "x"), "手で直す");
+		assert.equal(isWorking(s), false);
+		const resumed = resumeAfterEscalation(s, L);
+		assert.equal(resumed.paused, undefined);
+		assert.equal(isWorking(resumed), true);
+		s = finishFlow(s, "中止");
+		assert.equal(s.paused, undefined);
+		assert.equal(s.testLock, undefined);
 	});
 });

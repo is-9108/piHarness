@@ -242,14 +242,45 @@ assert.match(results.at(-2) ?? "", /^5:harness_request_test_change: ユーザー
 assert.match(results.at(-1) ?? "", /^5:write: Successfully/);
 assert.match(readFileSync(join(project, item, "test-changes.md"), "utf8"), /ユーザーが承認[\s\S]*test\/login\.test\.js[\s\S]*\[AC-1\] Q1 の回答で 401/);
 
-// 7) 「やめたい」→ 確認 → 中止
+// 7) 想定外の事態で止まった（エスカレーション中は書き込みもテストも止まる）→ ユーザーが一時停止して手で直す → 再開
+const fixedHash = createHash("sha256").update(readFileSync(join(project, "test/login.test.js"))).digest("hex");
+writeState({
+	phase: "escalated",
+	escalation: { reason: "test_loop", flow: "implement", phase: "impl_fix_review", detail: "テストが直らない", at: "" },
+	testLock: { mode: "review", at: "", files: { "test/login.test.js": fixedHash }, allowed: [] },
+});
+await talk("/harness status", []); // state.json を読み直す
+await talk("src を直して", [call("write", { path: "src/login.js", content: "x" }), say("エスカレーション中のため書けません。")]);
+assert.match(results.at(-1) ?? "", /^5:write \[ERROR\]: .*エスカレーション中/);
+confirmAnswers.push(true);
+await talk("/harness unlock 自分で直す", []);
+assert.match(confirms.at(-1)!.title, /フローを一時停止して制限を外しますか/);
+assert.match(confirms.at(-1)!.message, /テストのロック（1 ファイル）/);
+assert.equal(state().paused.reason, "自分で直す");
+assert.match(widget[2] ?? "", /⏸ 一時停止中（制限なし）/);
+await talk("直して", [
+	call("write", { path: "src/login.js", content: "module.exports = 401;\n" }),
+	call("write", { path: "test/login.test.js", content: "expect(status).toBe(401); // 手で直した\n" }),
+	say("直しました。"),
+]);
+assert.deepEqual(results.slice(-2).map((x) => x.replace(/: .*/, "")), ["5:write", "5:write"], "一時停止中は書き込みもテストの変更もブロックしない");
+await talk("/harness resume", [say("再開します。")]);
+assert.equal(sessions.length, 6, "再開は新しいセッションで行う");
+assert.equal(state().paused, undefined);
+assert.equal(state().phase, "impl_fix_review", "エスカレーション元のフェーズへ戻る");
+const relocked = createHash("sha256").update(readFileSync(join(project, "test/login.test.js"))).digest("hex");
+assert.equal(state().testLock.files["test/login.test.js"], relocked, "手で直したテストは、元に戻さずに今の内容でロックし直す");
+assert.match(readFileSync(join(project, item, "test-changes.md"), "utf8"), /一時停止中にテストが変更された[\s\S]*test\/login\.test\.js/);
+assert.match(userText(sessions[5]), /ユーザーが一時停止を解除しました/);
+
+// 8) 「やめたい」→ 確認 → 中止
 confirmAnswers.push(true);
 // 中止は作業を止めるためターンを終える（続けて作業しない）
 await talk("やっぱりやめたい", [call("harness_control", { action: "abort", request: "作業をやめたい" })]);
 assert.match(results.at(-1) ?? "", /フローを中止しました/);
 assert.match(confirms.at(-1)!.title, /フローを中止しますか/);
 assert.equal(state().phase, "idle");
-assert.equal(confirms.length, 4, "開始・操作のたびに必ず確認している");
+assert.equal(confirms.length, 5, "開始・操作のたびに必ず確認している");
 
 await runtime.dispose();
 console.log(`E2E natural: OK (${sessions.length} sessions, ${confirms.length} confirmations)`);

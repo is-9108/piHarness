@@ -3,7 +3,7 @@
  * 承認ゲートを通過する前にプロダクションコードを書き換えることを防ぐ。
  */
 import { isAbsolute, relative, resolve } from "node:path";
-import type { HarnessState, Phase } from "./state.ts";
+import { type HarnessState, isWorking, type Phase } from "./state.ts";
 
 export interface GuardPaths {
 	cwd: string;
@@ -20,22 +20,19 @@ function writableRoots(phase: Phase, p: GuardPaths): string[] | undefined {
 		case "req_document":
 		case "req_approval":
 		case "req_issues":
-		case "req_done":
 			return [p.docsDir, p.workDir];
 		case "impl_context":
 		case "impl_plan":
 		case "impl_plan_approval":
 		case "impl_review":
 		case "impl_spec_gap":
-		case "impl_done":
 		case "escalated":
 		case "bug_analyze":
-		case "bug_done":
 		case "doc_outline":
 		case "doc_outline_approval":
 		case "doc_review":
-		case "doc_done":
 			return [p.workDir];
+		// 完了したフェーズ（req_done・impl_done・bug_done・doc_done）は制限しない。完了後の作業を止めないため
 		// ドキュメント作成フローの執筆・修正: このほかに、どこにあってもドキュメントのファイル（isDocFile）は書ける
 		case "doc_write":
 		case "doc_fix":
@@ -93,7 +90,8 @@ export function checkWrite(state: HarnessState, path: string | undefined, p: Gua
 	if (path && isInside(path, `${p.workDir}/${STATE_FILE}`, p.cwd)) {
 		return { block: true, reason: "[piHarness] ワークフロー状態ファイルは直接編集できません。harness_* ツールを使用してください。" };
 	}
-	if (!state.flow || state.phase === "idle" || !path) return { block: false };
+	// 完了したフロー・一時停止中のフローは制限しない（状態ファイルの保護だけは続ける）
+	if (!isWorking(state) || !path) return { block: false };
 	if (p.adrDir && isInside(path, p.adrDir, p.cwd)) {
 		return { block: true, reason: `[piHarness] ADR（${p.adrDir}/）は harness_record_decision で記録してください（テンプレートで形を揃え、一覧も更新するため）。` };
 	}
@@ -142,7 +140,7 @@ export function mayModify(tool: ToolMeta): boolean {
  * MCP ツールは既定で codemode のスクリプトからいつでも呼べるため、有効なツールを絞るだけでは防げない。
  */
 export function checkOtherTool(state: HarnessState, tool: ToolMeta, p: GuardPaths): GuardDecision {
-	if (!state.flow || state.phase === "idle" || !mayModify(tool)) return { block: false };
+	if (!isWorking(state) || !mayModify(tool)) return { block: false };
 	const roots = writableRoots(state.phase, p);
 	if (!roots) return { block: false };
 	return {
